@@ -6,7 +6,7 @@
   "seed": 0,
   "num_calib_samples": 128,
   "calib_dataset": "wikitext2",
-  "calib_shrinkage": 0.4,
+  "calib_shrinkage": 0.2,
   "calib_strategy": "online",
   "curvature": "kron",
   "kron_nkp_iters": 3,
