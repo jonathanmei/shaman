@@ -17,7 +17,7 @@ dependencies = [
     "lm_eval>=0.4.9",
     "loguru>=0.7.0",
     "optimum>=1.27.0",
-    "torch>=2.6.0",
+    "torch>=2.6.0,<2.9",
     "tqdm>=4.60.0",
     "transformers==4.51.3",
     "zeus-ml",

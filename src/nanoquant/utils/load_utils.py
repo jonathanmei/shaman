@@ -18,7 +18,7 @@ from ..utils.utils import cleanup_memory, get_decoder_layers
 def load_model(model_id, seqlen=2048, device_map="cpu"):
     """
     Loads a pretrained model from the Hugging Face Hub and resizes positional embeddings if needed.
-    
+
     For large models (>70B), use device_map="auto" with max_memory for GPU+CPU offloading.
     """
     def skip(*args, **kwargs):
@@ -36,15 +36,15 @@ def load_model(model_id, seqlen=2048, device_map="cpu"):
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         config.share_embedding = False
 
-    # load model with device_map
+    # load model with device_map (`torch_dtype` is the keyword accepted by the pinned transformers 4.51.x)
     if device_map == "cpu":
         # Default: load to CPU for calibration and training
-        model = AutoModelForCausalLM.from_pretrained(model_id, config=config, dtype=torch.bfloat16,
+        model = AutoModelForCausalLM.from_pretrained(model_id, config=config, torch_dtype=torch.bfloat16,
                                                      attn_implementation="sdpa", low_cpu_mem_usage=True,
                                                      trust_remote_code=True, device_map={'': 'cpu'})
     else:
         # For large models: load with specified device_map (e.g., "auto" for GPU+CPU offloading)
-        model = AutoModelForCausalLM.from_pretrained(model_id, config=config, dtype=torch.bfloat16,
+        model = AutoModelForCausalLM.from_pretrained(model_id, config=config, torch_dtype=torch.bfloat16,
                                                      attn_implementation="sdpa", low_cpu_mem_usage=True,
                                                      trust_remote_code=True, device_map=device_map,
                                                      max_memory={0: '80GiB'})
