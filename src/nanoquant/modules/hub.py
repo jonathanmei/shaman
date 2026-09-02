@@ -389,7 +389,7 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
         quant_config: NanoQuantConfigDataclass,
         device_map: str,
         dtype: torch.dtype,
-    ) -> "NanoQuantModel":
+    ) -> torch.nn.Module:
         """
         Load a quantized model from checkpoint file.
 
@@ -400,13 +400,12 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
             dtype: Torch dtype
 
         Returns:
-            NanoQuantModel instance
+            The underlying quantized PyTorch model (the caller wraps it in ``NanoQuantModel``).
         """
         quant_dict = quant_config.to_dict()
-        model = load_compressed_model(model_name_or_path=quant_dict['model_id'], checkpoint_path=qmodel_path,
-                                      seqlen=quant_dict['seqlen'], has_mid_scale=has_mid_scale(quant_dict),
-                                      device=device_map, dtype=dtype)
-        return cls(model, quant_config, base_model_id=quant_dict['model_id'])
+        return load_compressed_model(model_name_or_path=quant_dict['model_id'], checkpoint_path=qmodel_path,
+                                     seqlen=quant_dict['seqlen'], has_mid_scale=has_mid_scale(quant_dict),
+                                     device=device_map, dtype=dtype)
 
     @classmethod
     def _save_checkpoint(cls, model: torch.nn.Module, qmodel_path: str):
