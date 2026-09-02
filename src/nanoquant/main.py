@@ -74,7 +74,7 @@ class QuantArguments:
     )
     kron_nkp_iters: int = field(default=3, metadata={"help": "Calibration passes (ALS iterations) for curvature=kron"})
     kron_stats_device: str = field(default="cpu",
-                                   metadata={"help": "Device holding the dense Kronecker factors during calibration"})
+                                   metadata={"help": "Device holding the dense Kronecker factors between passes"})
     kron_eigh_dtype: str = field(
         default="float64",
         metadata={
@@ -82,6 +82,10 @@ class QuantArguments:
             "choices": ["float64", "float32"],
         },
     )
+    kron_gpu_budget_gb: float = field(
+        default=0.0,
+        metadata={"help": ">0: accumulate the dense Kronecker factors on the GPU for groups of layers fitting this "
+                          "budget, one calibration pass per group (0 = stream every contribution to kron_stats_device)"})
     cache_dir: str = field(
         default="cache",
         metadata={"help": "Stage-level artifact cache / resume directory ('' disables)"},
@@ -221,6 +225,7 @@ def main():
         kron_nkp_iters=quant_args.kron_nkp_iters,
         kron_stats_device=quant_args.kron_stats_device,
         kron_eigh_dtype=quant_args.kron_eigh_dtype,
+        kron_gpu_budget_gb=quant_args.kron_gpu_budget_gb,
         seqlen=model_args.seqlen,
         device_map=model_args.device_map,
         cache_dir=quant_args.cache_dir,

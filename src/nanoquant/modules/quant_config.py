@@ -17,6 +17,8 @@ def NanoQuantConfig(
     kron_nkp_iters: int = 3,
     kron_stats_device: str = "cpu",
     kron_eigh_dtype: str = "float64",
+    # >0: accumulate the dense factors on the GPU for groups of layers fitting this budget (one pass per group)
+    kron_gpu_budget_gb: float = 0.0,
     seqlen: int = 2048,
     device_map: str = "cpu",
     # stage-level artifact cache / resume ("" disables)
@@ -69,6 +71,7 @@ def NanoQuantConfig(
         "kron_nkp_iters": kron_nkp_iters,
         "kron_stats_device": kron_stats_device,
         "kron_eigh_dtype": kron_eigh_dtype,
+        "kron_gpu_budget_gb": kron_gpu_budget_gb,
         "seqlen": seqlen,
         "device_map": device_map,
         # cache / resume

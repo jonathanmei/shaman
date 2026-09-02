@@ -237,7 +237,43 @@ def nkp_fit(x: torch.Tensor, delta: torch.Tensor, num_iters: int = 3) -> tuple[t
     return L_prev, R_prev
 
 
-def _kron_clip(x: torch.Tensor, layer_name: str, side: str, clip_state, acc: dict, stats_device) -> torch.Tensor:
+def _factor_bytes(m: nn.Linear) -> int:
+    """fp32 bytes of one layer's Kronecker factors for the accumulator *and* the previous-pass copy."""
+    return 4 * 2 * (m.in_features**2 + m.out_features**2)
+
+
+def _partition_layers(linear_layers: dict[str, nn.Linear], budget_bytes: int) -> list[list[str]]:
+    """Greedy contiguous grouping of layers so that each group's factors fit within ``budget_bytes``.
+
+    A layer larger than the budget forms its own group. Layer order is preserved.
+
+    Parameters
+    ----------
+    linear_layers : dict
+        ``name -> nn.Linear`` in model order.
+    budget_bytes : int
+        Memory budget for one group's accumulators plus previous-pass factors.
+
+    Returns
+    -------
+    list of list of str
+    """
+    groups: list[list[str]] = []
+    cur: list[str] = []
+    cur_bytes = 0
+    for n, m in linear_layers.items():
+        b = _factor_bytes(m)
+        if cur and cur_bytes + b > budget_bytes:
+            groups.append(cur)
+            cur, cur_bytes = [], 0
+        cur.append(n)
+        cur_bytes += b
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _kron_clip(x: torch.Tensor, layer_name: str, side: str, clip_state, acc: dict) -> torch.Tensor:
     """Robust per-token clipping for the Kronecker path.
 
     Pass 1 behaves like the ``online`` strategy (running robust max with retroactive rescaling of the
@@ -255,15 +291,15 @@ def _kron_clip(x: torch.Tensor, layer_name: str, side: str, clip_state, acc: dic
     if gmax is None:
         gmax = tau
     elif tau > gmax:
-        correction = (tau / (gmax + 1e-8)).square().to(stats_device)
-        acc["i_cov"][layer_name].mul_(correction)
-        acc["o_cov"][layer_name].mul_(correction)
+        correction = (tau / (gmax + 1e-8)).square()
+        for key in ("i_cov", "o_cov"):
+            acc[key][layer_name].mul_(correction.to(acc[key][layer_name].device))
         gmax = tau
     state["global_max"] = gmax
     return _clip_tokens(x, gmax)
 
 
-def _kron_forward_hook(module, inputs, outputs, layer_name, run_states, clip_state, acc, stats_device):
+def _kron_forward_hook(module, inputs, outputs, layer_name, run_states, clip_state, acc):
     """Stash the (clipped) layer input for the matching backward hook.
 
     Only runs when autograd is enabled, i.e. in the gradient-checkpoint recompute that immediately
@@ -273,25 +309,26 @@ def _kron_forward_hook(module, inputs, outputs, layer_name, run_states, clip_sta
     if not torch.is_grad_enabled():
         return
     x = inputs[0].detach().flatten(0, -2).float()
-    x = _kron_clip(x, layer_name, "i", clip_state, acc, stats_device)
+    x = _kron_clip(x, layer_name, "i", clip_state, acc)
     run_states[layer_name]["x"] = x
 
 
-def _kron_backward_hook(module, grad_input, grad_output, layer_name, run_states, clip_state, acc, prev, sq_sums,
-                        stats_device):
+def _kron_backward_hook(module, grad_input, grad_output, layer_name, run_states, clip_state, acc, prev, sq_sums):
     """Accumulate one Jacobi ALS contribution ``nkp_update(x, delta, L_prev, R_prev)`` for this layer."""
     x = run_states[layer_name].pop("x", None)
     if x is None:
         return
     delta = grad_output[0].detach().flatten(0, -2).float() * GRAD_SCALE_FACTOR
-    delta = _kron_clip(delta, layer_name, "o", clip_state, acc, stats_device)
+    delta = _kron_clip(delta, layer_name, "o", clip_state, acc)
 
     L_prev = prev["o_cov"].get(layer_name)
     R_prev = prev["i_cov"].get(layer_name)
     L, R = nkp_update(x, delta, L_prev, R_prev)
 
-    acc["o_cov"][layer_name].add_(L.to(stats_device))
-    acc["i_cov"][layer_name].add_(R.to(stats_device))
+    acc_L = acc["o_cov"][layer_name]
+    acc_R = acc["i_cov"][layer_name]
+    acc_L.add_(L.to(acc_L.device))
+    acc_R.add_(R.to(acc_R.device))
     # running mean-square statistics used to put the factors on the legacy i_norm / o_norm scale
     sq_sums[layer_name]["i"] += x.square().mean().item()
     sq_sums[layer_name]["o"] += delta.square().mean().item() / GRAD_SCALE_FACTOR
@@ -299,13 +336,23 @@ def _kron_backward_hook(module, grad_input, grad_output, layer_name, run_states,
 
 
 def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Linear], strategy: str, nkp_iters: int,
-                        stats_device: str, use_truefisher: bool, model_offload: bool) -> dict:
+                        stats_device: str, use_truefisher: bool, model_offload: bool,
+                        gpu_budget_gb: float = 0.0) -> dict:
     """Multi-pass streaming estimate of the nearest Kronecker product of the per-token empirical Fisher.
 
-    Every pass re-runs the calibration loop and updates **both** factors of every layer from the
-    previous pass's (unit-Frobenius-norm) factors; pass 1 starts from identity. After the final pass
-    the factors are rescaled so that their mean diagonals match the legacy per-token second moments,
-    which keeps ``i_norm``/``o_norm`` (their diagonals) on the familiar scale for downstream users.
+    Every ALS iteration updates **both** factors of every layer from the previous iteration's
+    (unit-Frobenius-norm) factors; iteration 1 starts from identity. After the final iteration the
+    factors are rescaled so that their mean diagonals match the legacy per-token second moments, which
+    keeps ``i_norm``/``o_norm`` (their diagonals) on the familiar scale for downstream users.
+
+    Memory/traffic strategy. With ``gpu_budget_gb <= 0`` every layer's accumulator lives on
+    ``stats_device`` (CPU) and each token batch's contribution is transferred there per hook call — for
+    large models this moves tens of GB per calibration sample and dominates run time. With a positive
+    budget the layers are partitioned into groups whose accumulators and previous-pass factors fit within
+    the budget on the compute device; each iteration then runs one calibration pass **per group** with
+    everything resident on ``dev`` and flushes the finished factors to ``stats_device``. Because the
+    previous-pass factors are fixed within an iteration, the result is identical to the single-pass
+    computation.
     """
     if nkp_iters < 1:
         raise ValueError("nkp_iters must be >= 1")
@@ -316,46 +363,67 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
             "o": {"global_max": None, "frozen": False},
         })
 
+    if gpu_budget_gb > 0:
+        groups = _partition_layers(linear_layers, int(gpu_budget_gb * 1e9))
+        acc_device = dev
+    else:
+        groups = [list(linear_layers)]
+        acc_device = stats_device
+
     prev = {"i_cov": {}, "o_cov": {}}
     sq_sums = None
     for it in range(nkp_iters):
-        print(f">>> Kronecker curvature: NKP pass {it + 1}/{nkp_iters}")
-        acc = {
-            "i_cov": {
-                n: torch.zeros(m.in_features, m.in_features, dtype=torch.float32, device=stats_device)
-                for n, m in linear_layers.items()
-            },
-            "o_cov": {
-                n: torch.zeros(m.out_features, m.out_features, dtype=torch.float32, device=stats_device)
-                for n, m in linear_layers.items()
-            },
-        }
-        run_states = defaultdict(dict)
         sq_sums = defaultdict(lambda: {"i": 0.0, "o": 0.0, "n": 0})
-        handles = []
-        for n, m in linear_layers.items():
-            handles.append(
-                m.register_forward_hook(
-                    partial(_kron_forward_hook, layer_name=n, run_states=run_states, clip_state=clip_state, acc=acc,
-                            stats_device=stats_device)))
-            handles.append(
-                m.register_full_backward_hook(
-                    partial(_kron_backward_hook, layer_name=n, run_states=run_states, clip_state=clip_state, acc=acc,
-                            prev=prev, sq_sums=sq_sums, stats_device=stats_device)))
+        new = {"i_cov": {}, "o_cov": {}}
+        for g, names in enumerate(groups):
+            group_bytes = sum(_factor_bytes(linear_layers[n]) for n in names)
+            print(f">>> Kronecker curvature: NKP pass {it + 1}/{nkp_iters}, layer group {g + 1}/{len(groups)} "
+                  f"({len(names)} layers, {group_bytes / 2**30:.1f} GiB on {acc_device})")
+            acc = {
+                "i_cov": {
+                    n: torch.zeros(linear_layers[n].in_features, linear_layers[n].in_features, dtype=torch.float32,
+                                   device=acc_device)
+                    for n in names
+                },
+                "o_cov": {
+                    n: torch.zeros(linear_layers[n].out_features, linear_layers[n].out_features,
+                                   dtype=torch.float32, device=acc_device)
+                    for n in names
+                },
+            }
+            prev_group = {
+                key: {n: prev[key][n].to(acc_device) for n in names if n in prev[key]}
+                for key in ("i_cov", "o_cov")
+            }
+            run_states = defaultdict(dict)
+            handles = []
+            for n in names:
+                m = linear_layers[n]
+                handles.append(
+                    m.register_forward_hook(
+                        partial(_kron_forward_hook, layer_name=n, run_states=run_states, clip_state=clip_state,
+                                acc=acc)))
+                handles.append(
+                    m.register_full_backward_hook(
+                        partial(_kron_backward_hook, layer_name=n, run_states=run_states, clip_state=clip_state,
+                                acc=acc, prev=prev_group, sq_sums=sq_sums)))
 
-        _run_calibration_loop(dataloader, model, dev, model_offload, use_truefisher)
+            _run_calibration_loop(dataloader, model, dev, model_offload, use_truefisher)
 
-        for h in handles:
-            h.remove()
+            for h in handles:
+                h.remove()
+            for key in ("i_cov", "o_cov"):
+                for n in names:
+                    new[key][n] = _frobenius_normalize(acc[key][n]).to(stats_device)
+            del acc, prev_group
+            if torch.cuda.is_available():
+                cleanup_memory()
+
         if clip_state is not None:
             for states in clip_state.values():
                 states["i"]["frozen"] = True
                 states["o"]["frozen"] = True
-
-        prev = {key: {n: _frobenius_normalize(M) for n, M in acc[key].items()} for key in ("i_cov", "o_cov")}
-        del acc
-        if torch.cuda.is_available():
-            cleanup_memory()
+        prev = new
 
     # Put the final (unit-norm) factors on the legacy scale: mean diag(R) = E_t[x^2], mean diag(L) = E_t[delta^2]
     for n in linear_layers:
@@ -535,7 +603,7 @@ def register_stats(model, stats: dict):
 # MAIN CALIBRATION FUNCTION
 # -----------------------------------------------------------------------------
 def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=False, vram_limit_gb=50, save_plots=False,
-                  strategy='online', curvature='diag', nkp_iters=3, stats_device=None):
+                  strategy='online', curvature='diag', nkp_iters=3, stats_device=None, gpu_budget_gb=0.0):
     """
     Main entry point for NanoQuant calibration statistics collection.
     Collects raw calibration statistics without applying shrinkage.
@@ -549,10 +617,14 @@ def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=Fa
         ``nkp_iters`` alternating passes over the calibration data; ``i_norm``/``o_norm`` are then
         their diagonals. The clipping behaviour follows ``strategy`` (``"dbf"`` = no clipping).
     nkp_iters : int
-        Number of calibration passes (ALS iterations) for ``curvature="kron"``.
+        Number of ALS iterations for ``curvature="kron"``.
     stats_device : str, optional
-        Where accumulators live. Defaults to ``dev`` (or CPU when offloading); the dense ``kron``
-        statistics default to CPU because they are large.
+        Where the returned statistics live. Defaults to ``dev`` (or CPU when offloading); the dense
+        ``kron`` statistics default to CPU because they are large.
+    gpu_budget_gb : float
+        For ``curvature="kron"``: accumulate on ``dev`` for groups of layers whose factors fit within
+        this budget (one calibration pass per group and iteration), instead of streaming every
+        contribution to ``stats_device``. ``0`` keeps the legacy per-hook CPU accumulation.
     """
     if curvature not in CURVATURE_TYPES:
         raise ValueError(f"Unknown curvature '{curvature}'. Choose from {CURVATURE_TYPES}.")
@@ -592,7 +664,7 @@ def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=Fa
         if strategy not in ('online', 'two_phase', 'dbf'):
             raise ValueError(f"Unknown strategy: {strategy}")
         factors = _collect_kron_stats(model, dataloader, dev, linear_layers, strategy, nkp_iters, stats_device,
-                                      use_truefisher, model_offload)
+                                      use_truefisher, model_offload, gpu_budget_gb=gpu_budget_gb)
         raw_stats = {
             'i_norm': {n: factors['i_cov'][n].diagonal().clone() for n in linear_layers},
             'o_norm': {n: factors['o_cov'][n].diagonal().clone() for n in linear_layers},
