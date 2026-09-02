@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import torch
 
-from ..utils.cache import ArtifactCache, chain_keys, stats_key
+from ..utils.bits import format_accounting, model_accounting, static_accounting
+from ..utils.cache import ArtifactCache, atomic_save, chain_keys, stats_key
 from ..utils.data_utils import get_calib_loader, prepare_dataset
 from ..utils.load_utils import load_compressed_model, load_model, load_tokenizer
-from ..utils.utils import cleanup_memory, get_decoder_layers, has_mid_scale
+from ..utils.utils import cleanup_memory, get_decoder_layers, get_layers_to_factorize, has_mid_scale
 from .compress_model import compress_block_recon, compress_model_recon
 from .importance import collect_stats, get_shrunk_stats, register_stats
 from .resume import compressed_state_dict
@@ -55,6 +56,8 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
        the fully reconstructed pre-KD model is stored as a ``model`` artifact;
     3. model-level KD – per-epoch checkpoints; skipped when ``tune_model`` is false.
 
+    The predicted (rank-budget) and actual bits-per-weight accounting are printed.
+
     Parameters
     ----------
     model_id : str
@@ -78,6 +81,8 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
     dataloader = get_calib_loader(data, tokenizer, quant_config['num_calib_samples'], quant_config['seed'],
                                   quant_config['seqlen'])
     n_blocks = len(get_decoder_layers(fp_model))
+    print(format_accounting(static_accounting(fp_model, get_layers_to_factorize(fp_model.config.model_type),
+                                              quant_config), title="bpw budget"))
 
     pre_kd_key = chain_keys(quant_config, n_blocks)[-1]
     if cache.exists(PRE_KD_KIND, pre_kd_key):
@@ -102,10 +107,12 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
         # 2) block-wise reconstruction (resumable)
         model = compress_block_recon(model, fp_model, dataloader, quant_config, cache=cache)
         if cache.enabled:
-            torch.save(compressed_state_dict(model), cache.path(PRE_KD_KIND, pre_kd_key))
+            atomic_save(compressed_state_dict(model), cache.path(PRE_KD_KIND, pre_kd_key))
             print(f"[cache] saved {PRE_KD_KIND} {pre_kd_key[:12]}")
 
     # 3) model-level KD (scale-only reconstruction)
     if quant_config.get('tune_model', True):
         model = compress_model_recon(model, fp_model, dataloader, quant_config, dev=dev, cache=cache)
+
+    print(format_accounting(model_accounting(model), title="bpw actual"))
     return model

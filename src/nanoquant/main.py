@@ -26,6 +26,7 @@ import torch
 from transformers import HfArgumentParser
 
 from .modules.hub import NanoQuantConfigDataclass, NanoQuantModel
+from .utils.bits import format_accounting, model_accounting
 from .utils.cache import append_ledger
 from .utils.eval_utils import evaluate_model
 from .utils.load_utils import load_tokenizer
@@ -260,6 +261,9 @@ def main():
         nanoquant_model._save_checkpoint(model, model_args.qmodel_path)
         logger.info(f"Saved quantized model to {model_args.qmodel_path}")
 
+    accounting = model_accounting(model)
+    logger.info(format_accounting(accounting, title="bpw"))
+
     model.eval()
     if not loaded_from_hub:
         model = model.cuda()
@@ -287,6 +291,7 @@ def main():
             "eval": {"ppl_task": eval_args.ppl_task, "zeroshot_task": eval_args.zeroshot_task,
                      "num_fewshot": eval_args.num_fewshot, "limit": eval_args.limit},
             "qmodel_path": model_args.qmodel_path,
+            "bpw": {k: v for k, v in accounting.items() if k != "layers"},
             "results": results,
         })
         logger.info(f"Appended results to {ledger}")
