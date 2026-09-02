@@ -5,11 +5,10 @@ import gc
 import inspect
 import os
 import random
-from typing import List
 
 import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 def set_seed(seed, use_deterministic=False):
@@ -114,7 +113,7 @@ def get_decoder_layers(model):
     raise AttributeError(f"Could not find decoder layers for model architecture '{model_type}'.")
 
 
-def get_decoder_layer_cls_name(model: nn.Module) -> List[str]:
+def get_decoder_layer_cls_name(model: nn.Module) -> list[str]:
     """Helper to get the class name of the decoder blocks (to prevent accelerate from splitting blocks)."""
     try:
         layers = get_decoder_layers(model)
@@ -123,6 +122,22 @@ def get_decoder_layer_cls_name(model: nn.Module) -> List[str]:
     except AttributeError:
         pass
     return []
+
+
+def has_mid_scale(quant_config) -> bool:
+    """Whether the factorisation exports a per-rank middle scale (``scale_mid``).
+
+    Parameters
+    ----------
+    quant_config : dict
+        Quantisation configuration. The ``dbf`` ADMM always has a middle scale; the ``nanoquant``
+        ADMM has one when ``admm_mid_scale`` is set. Configs predating the flag are treated as ``False``.
+
+    Returns
+    -------
+    bool
+    """
+    return quant_config.get('admm_type') == 'dbf' or bool(quant_config.get('admm_mid_scale', False))
 
 
 def calculate_ranks(model, layers_to_analyze, quant_config):
@@ -166,7 +181,7 @@ def calculate_ranks(model, layers_to_analyze, quant_config):
             return min(in_features, out_features)
         return rank
 
-    num_scales = 3 if quant_config['admm_type'] == 'dbf' else 2
+    num_scales = 3 if has_mid_scale(quant_config) else 2
 
     print(f"Rank calculation: Bits = ({quant_config['bits']:.2f}), Scales: {num_scales}")
     ranks = {}

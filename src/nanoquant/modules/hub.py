@@ -37,9 +37,11 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from ..core.compress_model import compress_block_recon, compress_model_recon
 from ..core.importance import collect_stats, get_shrunk_stats, register_stats
+from ..modules.auto_model import collect_stats_kwargs
 from ..modules.linear import NanoQuantLinear
 from ..utils.data_utils import get_calib_loader, prepare_dataset
 from ..utils.load_utils import (get_compressed_state_dict, load_compressed_model, load_model, load_tokenizer)
+from ..utils.utils import has_mid_scale
 
 
 @dataclass
@@ -55,6 +57,11 @@ class NanoQuantConfigDataclass:
     calib_dataset: str = "wikitext2"
     calib_shrinkage: float = 0.4
     calib_strategy: str = "online"
+    # curvature estimate: "diag" (legacy per-feature second moments) or "kron" (nearest Kronecker product)
+    curvature: str = "diag"
+    kron_nkp_iters: int = 3
+    kron_stats_device: str = "cpu"
+    kron_eigh_dtype: str = "float64"
     seqlen: int = 2048
     device_map: str = "cpu"
     # tune_nonfact
@@ -69,6 +76,7 @@ class NanoQuantConfigDataclass:
     admm_reg: float = 3e-2
     admm_penalty_scheduler: str = "linear"
     admm_print_steps: bool = False
+    admm_mid_scale: bool = False
     # tune_fact
     tune_fact: bool = True
     fact_binary_lr: float = 1e-5
@@ -95,26 +103,26 @@ class NanoQuantConfigDataclass:
 class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
     """
     NanoQuant model wrapper with native HuggingFace Hub support.
-    
-    This class wraps a quantized model and provides native `from_pretrained()` and 
+
+    This class wraps a quantized model and provides native `from_pretrained()` and
     `push_to_hub()` methods. It also supports `AutoModelForCausalLM.from_pretrained()`
     when the model has proper `auto_map` configuration in `config.json`.
 
     Usage:
         >>> from ..modules.hub import NanoQuantModel
-        >>> 
+        >>>
         >>> # Load from Hub
         >>> model = NanoQuantModel.from_pretrained(
         ...     "username/nanoquant-llama-7b-1bpw",
         ...     dtype=torch.bfloat16
         ... )
-        >>> 
+        >>>
         >>> # Or via AutoModel (requires auto_map in config.json)
         >>> from transformers import AutoModelForCausalLM
         >>> model = AutoModelForCausalLM.from_pretrained(
         ...     "username/nanoquant-llama-7b-1bpw"
         ... )
-        >>> 
+        >>>
         >>> # Push to Hub
         >>> model.push_to_hub("username/my-nanoquant-model")
     """
@@ -126,7 +134,7 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
     ):
         """
         Initialize the NanoQuant wrapper.
-        
+
         Args:
             model: The underlying quantized PyTorch model
             config: NanoQuant quantization configuration
@@ -150,7 +158,7 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
     def _save_pretrained(self, save_directory: Path, **kwargs):
         """
         Save the model to a local directory.
-        
+
         Saves:
             - nanoquant_config.json: Quantization parameters
             - config.json: Model config with auto_map for AutoModel support
@@ -292,7 +300,7 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
             # This appears to be a quantized model, load accordingly
             model = load_compressed_model(model_name_or_path=config.model_id, checkpoint_path=local_path,
                                           seqlen=config.seqlen, device=device_map,
-                                          has_mid_scale=(config.admm_type == 'dbf'), dtype=dtype)
+                                          has_mid_scale=has_mid_scale(config.to_dict()), dtype=dtype)
         else:
             # This is likely a base model, load normally
             model = load_model(config.model_id, config.seqlen, device_map=device_map)
@@ -314,14 +322,14 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
     def quantize_model(cls, model_id: str, quant_config: NanoQuantConfigDataclass) -> torch.nn.Module:
         """
         Quantize a model using NanoQuant pipeline.
-        
+
         This method implements the complete quantization process from AutoNQModel,
         including calibration, importance collection, and block reconstruction.
-        
+
         Args:
             model_id: The model identifier (e.g., "meta-llama/Llama-2-7b-hf")
             quant_config: Quantization configuration parameters
-            
+
         Returns:
             Quantized PyTorch model
         """
@@ -339,14 +347,15 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
         dataloader = get_calib_loader(data, tokenizer, quant_dict['num_calib_samples'], quant_dict['seed'],
                                       quant_dict['seqlen'])
 
-        # Get importance via calibration
-        raw_stats = collect_stats(model, dataloader, "cuda", strategy=quant_dict['calib_strategy'])
+        # Get importance via calibration (diagonal or Kronecker-factored curvature)
+        raw_stats = collect_stats(model, dataloader, "cuda", **collect_stats_kwargs(quant_dict))
         shrunk_stats = get_shrunk_stats(raw_stats, shrinkage=quant_dict['calib_shrinkage'])
         model = register_stats(model, shrunk_stats)
+        del raw_stats, shrunk_stats
 
         # Compress the model
         model = compress_block_recon(model, fp_model, dataloader, quant_dict)
-        
+
         # Model-level KD tuning (only if enabled)
         if quant_config.tune_model:
             logger.info("Performing model-level KD tuning...")
@@ -366,10 +375,10 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
     ) -> "NanoQuantModel":
         """
         Load quantized checkpoint if exists, otherwise quantize the model.
-        
+
         This method provides the same functionality as AutoNQModel.from_pretrained,
         allowing seamless loading of pre-quantized models or on-the-fly quantization.
-        
+
         Args:
             model_id: Model identifier (e.g., "meta-llama/Llama-2-7b-hf")
             qmodel_path: Path to save/load quantized model checkpoint
@@ -377,7 +386,7 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
             dtype: Torch dtype for model loading
             device_map: Device map for model placement
             **kwargs: Additional arguments for from_pretrained
-            
+
         Returns:
             NanoQuantModel instance
         """
@@ -420,19 +429,19 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
     ) -> "NanoQuantModel":
         """
         Load a quantized model from checkpoint file.
-        
+
         Args:
             qmodel_path: Path to the checkpoint file
             quant_config: Quantization configuration
             device_map: Device map for model placement
             dtype: Torch dtype
-            
+
         Returns:
             NanoQuantModel instance
         """
         quant_dict = quant_config.to_dict()
         model = load_compressed_model(model_name_or_path=quant_dict['model_id'], checkpoint_path=qmodel_path,
-                                      seqlen=quant_dict['seqlen'], has_mid_scale=(quant_dict['admm_type'] == 'dbf'),
+                                      seqlen=quant_dict['seqlen'], has_mid_scale=has_mid_scale(quant_dict),
                                       device=device_map, dtype=dtype)
         return cls(model, quant_config, base_model_id=quant_dict['model_id'])
 
@@ -440,7 +449,7 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
     def _save_checkpoint(cls, model: torch.nn.Module, qmodel_path: str):
         """
         Save quantized model to checkpoint file.
-        
+
         Args:
             model: The quantized PyTorch model
             qmodel_path: Path where the checkpoint should be saved
@@ -476,8 +485,10 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
                 f"- **Sequence Length**: {self._nanoquant_config.seqlen}",
                 f"- **Calibration Dataset**: {self._nanoquant_config.calib_dataset}",
                 f"- **Calibration Strategy**: {self._nanoquant_config.calib_strategy}",
+                f"- **Curvature**: {self._nanoquant_config.curvature}",
                 f"- **ADMM Type**: {self._nanoquant_config.admm_type}",
                 f"- **ADMM Reg**: {self._nanoquant_config.admm_reg}",
+                f"- **Middle Scale**: {has_mid_scale(self._nanoquant_config.to_dict())}",
             ]) + "\n",
 
             # Usage
@@ -525,7 +536,7 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
     ) -> str:
         """
         Push the model to HuggingFace Hub.
-        
+
         Automatically saves quantization config and model weights, then pushes
         to the Hub with appropriate metadata.
 
@@ -619,22 +630,3 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
     def children(self):
         """Iterate over child modules."""
         return self.model.children()
-
-    def __getattr__(self, name: str):
-        """Delegate attribute access to underlying model.
-        
-        This allows the wrapper to be used transparently with
-        model methods like .generate(), .forward(), etc.
-        """
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.model, name)
-
-    def forward(self, *args, **kwargs):
-        """Delegate forward pass to underlying model."""
-        return self.model.forward(*args, **kwargs)
-
-    def generate(self, *args, **kwargs):
-        """Delegate generate() to underlying model."""
-        return self.model.generate(*args, **kwargs)

@@ -10,6 +10,29 @@ from ..core.compress_model import compress_block_recon, compress_model_recon
 from ..core.importance import collect_stats, get_shrunk_stats, register_stats
 from ..utils.data_utils import get_calib_loader, prepare_dataset
 from ..utils.load_utils import (get_compressed_state_dict, load_compressed_model, load_model, load_tokenizer)
+from ..utils.utils import has_mid_scale
+
+
+def collect_stats_kwargs(quant_config: dict) -> dict:
+    """Keyword arguments for :func:`collect_stats` derived from the quantisation config.
+
+    Parameters
+    ----------
+    quant_config : dict
+        Quantisation configuration (``calib_strategy``, ``curvature``, ``kron_*`` keys; missing keys
+        fall back to the legacy diagonal behaviour).
+
+    Returns
+    -------
+    dict
+    """
+    curvature = quant_config.get('curvature', 'diag')
+    return {
+        'strategy': quant_config['calib_strategy'],
+        'curvature': curvature,
+        'nkp_iters': quant_config.get('kron_nkp_iters', 3),
+        'stats_device': quant_config.get('kron_stats_device', 'cpu') if curvature == 'kron' else None,
+    }
 
 
 class AutoNQModel():
@@ -56,7 +79,7 @@ class AutoNQModel():
                                       quant_config['seqlen'])
 
         # get importance via calibration
-        raw_stats = collect_stats(model, dataloader, "cuda", strategy=quant_config['calib_strategy'])
+        raw_stats = collect_stats(model, dataloader, "cuda", **collect_stats_kwargs(quant_config))
         shrunk_stats = get_shrunk_stats(raw_stats, shrinkage=quant_config['calib_shrinkage'])
         model = register_stats(model, shrunk_stats)
 
@@ -70,7 +93,7 @@ class AutoNQModel():
         Load quantized model.
         """
         return load_compressed_model(model_name_or_path=model_id, checkpoint_path=qmodel_path,
-                                     seqlen=quant_config['seqlen'], has_mid_scale=(quant_config['admm_type'] == 'dbf'),
+                                     seqlen=quant_config['seqlen'], has_mid_scale=has_mid_scale(quant_config),
                                      device=device_map, dtype=dtype)
 
     def save_model(self, model, qmodel_path):

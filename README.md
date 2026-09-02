@@ -79,6 +79,29 @@ python -m nanoquant.main \
     --ppl_task "wikitext2"
 ```
 
+All arguments can also be supplied from a single JSON file (keys are the CLI flag names), which is how the
+experiments in `configs/` are documented:
+
+```bash
+nanoquant configs/qwen3_0p6b_kron.json
+```
+
+### Kronecker-Factored Curvature and Middle Scale (experimental)
+
+By default NanoQuant preconditions each weight with diagonal curvature statistics (`i_norm`/`o_norm`).
+Two optional extensions are available:
+
+* `--curvature kron` estimates a dense Kronecker-factored curvature `L ⊗ R` as the nearest Kronecker
+  product of the per-token empirical Fisher (alternating least squares over `--kron_nkp_iters` calibration
+  passes, default 3). Shrinkage is applied toward a scaled identity, the weight is preconditioned with the
+  diagonal of the shrunk factors (so the sign projection is unchanged), and the ADMM data term becomes the
+  corresponding Mahalanobis distance while the penalty and the SVID projection stay Euclidean. The dense
+  factors are kept in fp32 on `--kron_stats_device` (default `cpu`) and the eigendecompositions run in
+  `--kron_eigh_dtype` (default `float64`).
+* `--admm_mid_scale` exports an explicit per-rank middle scale for `--admm_type nanoquant`
+  (Scale-Binary-Scale-Binary-Scale, as the `dbf` ADMM does), so the deployed form equals the ADMM solution
+  exactly. The rank budget accounts for the extra 16-bit scale automatically.
+
 ### Very Large Models (>70B)
 
 For models that may not fit in CPU memory, use `--device_map auto` to enable GPU+CPU offloading:
@@ -102,6 +125,13 @@ Run custom CUDA kernels for GEMV and GEMM decode-stage benchmarking. Save a 1-bi
 # Run benchmark
 cd src/nanoquant/kernel
 bash bench_decode.sh
+```
+
+### Tests
+
+```bash
+PYTHONPATH=src uv run --no-project --with pytest --with numpy --with tqdm \
+  --with torch --index https://download.pytorch.org/whl/cpu pytest tests/ -q
 ```
 
 ---

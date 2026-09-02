@@ -1,0 +1,21 @@
+# objob per-project configuration.
+# Run `objob submit` from anywhere inside this repo to run [slurm].command
+# on the obsidian cluster at the current commit.
+
+[remote]
+host = "ob"          # ssh alias for the cluster login node (~/.ssh/config)
+base_dir = "~/code"  # remote parent dir; project checks out to base_dir/<repo>
+
+[slurm]
+# Command the job runs, from the project root on the cluster.
+# Default: Qwen3-0.6B smoke test with Kronecker curvature + middle scale (fits the 30-min `short` partition).
+# Override per submission with `objob submit -- uv run nanoquant configs/<experiment>.json`.
+command = "uv run nanoquant configs/qwen3_0p6b_smoke_kron.json"
+partition = "short"   # short (30 min) | cpus / gpus / cgpus (4 h) | notebooks
+time = "00:30:00"     # walltime; must fit the partition limit
+cpus_per_task = 8
+mem = "64G"
+nodes = 1
+gres = "gpu:a100:1"
+job_name = "nanoquant-kron"
+log_dir = ".objob/logs"

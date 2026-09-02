@@ -117,17 +117,31 @@ def factorize_and_replace(layer, name, rank, quant_config):
     admm_time = time.time()
     # Select factorization function based on type
     is_transpose = W_res.shape[0] < W_res.shape[1]
+    # Dense Kronecker curvature factors are present only when calibrated with curvature='kron'
+    i_cov = getattr(lx_orig, 'i_cov', None)
+    o_cov = getattr(lx_orig, 'o_cov', None)
     if quant_config['admm_type'] == 'dbf':
+        if i_cov is not None or o_cov is not None:
+            raise ValueError("curvature='kron' is only supported with admm_type='nanoquant'")
         factor_results = factorize_admm_dbf(W_res.to(device), lx_orig.i_norm.to(device), lx_orig.o_norm.to(device),
                                             mid_rank=rank, iters=quant_config['admm_outer_iters'],
                                             is_transpose=is_transpose)
     elif quant_config['admm_type'] == 'nanoquant':
+        eigh_dtype = getattr(torch, quant_config.get('kron_eigh_dtype', 'float64'))
         factor_results = factorize_admm_nanoquant(
             W_res.to(device), lx_orig.i_norm.to(device), lx_orig.o_norm.to(device), mid_rank=rank,
             outer_iters=quant_config['admm_outer_iters'], inner_iters=quant_config['admm_inner_iters'],
             is_transpose=is_transpose, rho_scheduler=quant_config['admm_penalty_scheduler'],
-            print_admm_steps=quant_config['admm_print_steps'])
+            print_admm_steps=quant_config['admm_print_steps'],
+            i_cov=None if i_cov is None else i_cov.to(device),
+            o_cov=None if o_cov is None else o_cov.to(device),
+            eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)))
     admm_time = time.time() - admm_time
+    # The dense factors are no longer needed for this layer: free the memory.
+    for buf_name in ('i_cov', 'o_cov'):
+        if hasattr(lx_orig, buf_name):
+            delattr(lx_orig, buf_name)
+    del i_cov, o_cov
 
     # Assemble final factorization results
     final_factor_results = argparse.Namespace(**factor_results)

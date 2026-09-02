@@ -6,14 +6,16 @@
 Usage:
     python -m nanoquant.main --model_id meta-llama/Llama-2-7b-hf --qmodel_path output.pt
     nanoquant --model_id meta-llama/Llama-2-7b-hf --qmodel_path output.pt
+    nanoquant configs/experiment.json          # all arguments from a JSON config file
 """
+
+from __future__ import annotations
 
 import json
 import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Union
 
 try:
     from loguru import logger
@@ -36,10 +38,10 @@ class ModelArguments:
         metadata={"help": "Model identifier or local path"},
     )
     seqlen: int = field(default=2048, metadata={"help": "Sequence length"})
-    qmodel_path: Optional[str] = field(default=None, metadata={"help": "Path to save/load quantized model checkpoint"})
+    qmodel_path: str | None = field(default=None, metadata={"help": "Path to save/load quantized model checkpoint"})
     from_hub: bool = field(default=False, metadata={"help": "Load pre-quantized model from HuggingFace Hub"})
-    hub_model_id: Optional[str] = field(default=None,
-                                        metadata={"help": "HuggingFace Hub model ID (defaults to model_id)"})
+    hub_model_id: str | None = field(default=None,
+                                     metadata={"help": "HuggingFace Hub model ID (defaults to model_id)"})
     device_map: str = field(
         default="cpu",
         metadata={"help": "Device map for model loading ('cpu' or 'auto')"},
@@ -58,6 +60,24 @@ class QuantArguments:
         metadata={
             "help": "Calibration strategy",
             "choices": ["online", "two_phase", "dbf", "none"],
+        },
+    )
+    curvature: str = field(
+        default="diag",
+        metadata={
+            "help": "Curvature estimate: 'diag' (per-feature second moments) or 'kron' "
+                    "(nearest Kronecker product of the per-token empirical Fisher)",
+            "choices": ["diag", "kron"],
+        },
+    )
+    kron_nkp_iters: int = field(default=3, metadata={"help": "Calibration passes (ALS iterations) for curvature=kron"})
+    kron_stats_device: str = field(default="cpu",
+                                   metadata={"help": "Device holding the dense Kronecker factors during calibration"})
+    kron_eigh_dtype: str = field(
+        default="float64",
+        metadata={
+            "help": "Precision of the eigendecompositions in the Mahalanobis ADMM",
+            "choices": ["float64", "float32"],
         },
     )
 
@@ -86,6 +106,9 @@ class TuneArguments:
         },
     )
     admm_print_steps: bool = field(default=False, metadata={"help": "Print ADMM optimization steps"})
+    admm_mid_scale: bool = field(
+        default=False,
+        metadata={"help": "Export an explicit per-rank middle scale (Scale-Binary-Scale-Binary-Scale) for admm_type=nanoquant"})
     tune_fact: bool = field(default=True, metadata={"help": "Tune factorized layers"})
     fact_binary_lr: float = field(default=1e-5, metadata={"help": "LR for factorized binary parameters"})
     fact_scale_lr: float = field(default=1e-5, metadata={"help": "LR for factorized scale parameters"})
@@ -112,7 +135,7 @@ class EvalArguments:
     limit: int = field(default=-1, metadata={"help": "Sample limit for zero-shot (-1 = all)"})
 
 
-def init_logging(log_level: str = "INFO", log_file: Optional[str] = None):
+def init_logging(log_level: str = "INFO", log_file: str | None = None):
     if hasattr(logger, "remove"):
         try:
             logger.remove()
@@ -131,9 +154,29 @@ def init_logging(log_level: str = "INFO", log_file: Optional[str] = None):
         logger.basicConfig(level=getattr(logger, log_level, logger.INFO))
 
 
-def main():
+def parse_arguments(argv: list[str] | None = None):
+    """Parse CLI flags, or a single JSON config file path, into the argument dataclasses.
+
+    Parameters
+    ----------
+    argv : list of str, optional
+        Arguments to parse (defaults to ``sys.argv[1:]``). If it consists of exactly one path ending in
+        ``.json``, every field is read from that file instead (unknown keys raise an error).
+
+    Returns
+    -------
+    tuple
+        ``(ModelArguments, QuantArguments, TuneArguments, EvalArguments)``.
+    """
     parser = HfArgumentParser((ModelArguments, QuantArguments, TuneArguments, EvalArguments))
-    model_args, quant_args, tune_args, eval_args = parser.parse_args_into_dataclasses()
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) == 1 and argv[0].endswith(".json"):
+        return parser.parse_json_file(json_file=os.path.abspath(argv[0]))
+    return parser.parse_args_into_dataclasses(args=argv)
+
+
+def main():
+    model_args, quant_args, tune_args, eval_args = parse_arguments()
 
     init_logging()
 
@@ -146,6 +189,10 @@ def main():
         calib_dataset=quant_args.calib_dataset,
         calib_shrinkage=quant_args.calib_shrinkage,
         calib_strategy=quant_args.calib_strategy,
+        curvature=quant_args.curvature,
+        kron_nkp_iters=quant_args.kron_nkp_iters,
+        kron_stats_device=quant_args.kron_stats_device,
+        kron_eigh_dtype=quant_args.kron_eigh_dtype,
         seqlen=model_args.seqlen,
         device_map=model_args.device_map,
         tune_nonfact=tune_args.tune_nonfact,
@@ -158,6 +205,7 @@ def main():
         admm_reg=tune_args.admm_reg,
         admm_penalty_scheduler=tune_args.admm_penalty_scheduler,
         admm_print_steps=tune_args.admm_print_steps,
+        admm_mid_scale=tune_args.admm_mid_scale,
         tune_fact=tune_args.tune_fact,
         fact_binary_lr=tune_args.fact_binary_lr,
         fact_scale_lr=tune_args.fact_scale_lr,
@@ -168,6 +216,7 @@ def main():
         model_kd_lr=tune_args.model_kd_lr,
         model_kd_batch_size=tune_args.model_kd_batch_size,
     )
+    logger.info(f"Quantization config:\n{json.dumps(quant_config.to_dict(), indent=2)}")
 
     if model_args.from_hub:
         hub_id = model_args.hub_model_id or model_args.model_id

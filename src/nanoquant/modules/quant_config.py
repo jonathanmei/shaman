@@ -12,6 +12,11 @@ def NanoQuantConfig(
     calib_dataset: str = "wikitext2",
     calib_shrinkage: float = 0.4,
     calib_strategy: str = "online",
+    # curvature estimate: "diag" (legacy per-feature second moments) or "kron" (nearest Kronecker product)
+    curvature: str = "diag",
+    kron_nkp_iters: int = 3,
+    kron_stats_device: str = "cpu",
+    kron_eigh_dtype: str = "float64",
     seqlen: int = 2048,
     device_map: str = "cpu",
     # tune_nonfact
@@ -26,6 +31,7 @@ def NanoQuantConfig(
     admm_reg: float = 3e-2,
     admm_penalty_scheduler: str = "linear",
     admm_print_steps: bool = False,
+    admm_mid_scale: bool = False,
     # tune_fact
     tune_fact: bool = True,
     fact_binary_lr: float = 1e-5,
@@ -50,6 +56,10 @@ def NanoQuantConfig(
         "calib_dataset": calib_dataset,
         "calib_shrinkage": calib_shrinkage,
         "calib_strategy": calib_strategy,
+        "curvature": curvature,
+        "kron_nkp_iters": kron_nkp_iters,
+        "kron_stats_device": kron_stats_device,
+        "kron_eigh_dtype": kron_eigh_dtype,
         "seqlen": seqlen,
         "device_map": device_map,
         # tune_nonfact
@@ -64,6 +74,7 @@ def NanoQuantConfig(
         "admm_reg": admm_reg,
         "admm_penalty_scheduler": admm_penalty_scheduler,
         'admm_print_steps': admm_print_steps,
+        "admm_mid_scale": admm_mid_scale,
         # tune_fact
         "tune_fact": tune_fact,
         "fact_binary_lr": fact_binary_lr,
