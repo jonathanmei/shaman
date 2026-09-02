@@ -8,7 +8,8 @@ seed 0, shrinkage 0.2, 400 linear-schedule ADMM steps, stage learning rates 1e-4
 
 Curvature: `diag` is the released method (per-feature second moments); `kron` is the iterative nearest-Kronecker-product
 estimate of the per-token empirical Fisher (3 alternating passes) with the Mahalanobis ADMM data term. Scales: 2 =
-paper-faithful (`scale_pre`, `scale_post`); 3 = explicit per-rank middle scale (`admm_mid_scale=true`).
+paper-faithful (`scale_pre`, `scale_post`); 3 = explicit per-rank middle scale (`admm_mid_scale=true`), exported either
+with SVID triples (`svid`, the original export) or `balanced` (see [Scale magnitude allocation](#scale-magnitude-allocation)).
 
 Bit budget: the rank rule floors ranks to multiples of 32, so "1.0 bpw" is 0.973 (0.6B, 2 scales), 0.977 (0.6B, 3
 scales), 0.986 (1.7B and 4B) actual bpw over the factorised layers, by the paper's own definition (Appendix F, Eq. 60).
@@ -16,20 +17,22 @@ The actual bit counter of every run matched these predictions.
 
 ## Summary (WikiText-2 perplexity, lower is better)
 
-| model | actual bpw | paper (Table 2) | diag, 2 scales (paper-faithful) | kron, 2 scales | diag, 3 scales | kron, 3 scales |
-|---|---|---|---|---|---|---|
-| Qwen3-0.6B-Base | 0.973 / 0.977 | 27.56 | 29.21 | **25.82** | 34.18 | 29.29 |
-| Qwen3-1.7B-Base | 0.986 | 19.21 | **18.76** | 19.21 | – | – |
-| Qwen3-4B-Base | 0.986 | 14.29 | 14.86 | running (job 5606588) | – | – |
+| model | actual bpw | paper (Table 2) | diag, 2 scales (paper-faithful) | kron, 2 scales | diag, 3 scales (svid) | kron, 3 scales (svid) | diag, 3 scales (balanced) | kron, 3 scales (balanced) |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3-0.6B-Base | 0.973 / 0.977 | 27.56 | 29.21 | 25.82 | 34.18 | 29.29 | 31.90 | **25.44** |
+| Qwen3-1.7B-Base | 0.986 | 19.21 | **18.76** | 19.21 | – | – | – | – |
+| Qwen3-4B-Base | 0.986 | 14.29 | 14.86 | running (job 5606588) | – | – | – | – |
 
 ## Qwen3-0.6B-Base (2026-09-02)
 
 | arm | job | block-27 PPL before KD | KD loss ep1 → ep8 | **WikiText-2 PPL** | zero-shot mean | wall-clock |
 |---|---|---|---|---|---|---|
 | diag, 2 scales (paper-faithful) | 5606323 | 32.7 | 2.957 → 2.899 | 29.21 | 0.387 | ~1 h 20 |
-| **kron, 2 scales** | 5606324 | 27.8 | 2.883 → 2.845 | **25.82** | 0.406 | 1 h 52 |
-| diag, 3 scales | 5606092 | 37.8 | 3.008 → 2.941 | 34.18 | 0.408 | 1 h 09 |
-| kron, 3 scales | 5606093 | 30.8 | 2.910 → 2.880 | 29.29 | 0.414 | 1 h 52 |
+| kron, 2 scales | 5606324 | 27.8 | 2.883 → 2.845 | 25.82 | 0.406 | 1 h 52 |
+| diag, 3 scales (svid) | 5606092 | 37.8 | 3.008 → 2.941 | 34.18 | 0.408 | 1 h 09 |
+| kron, 3 scales (svid) | 5606093 | 30.8 | 2.910 → 2.880 | 29.29 | 0.414 | 1 h 52 |
+| diag, 3 scales (balanced) | 5606570 | 36.2 | 2.959 → 2.900 | 31.90 | 0.415 | 1 h 13 |
+| **kron, 3 scales (balanced)** | 5606569 | 27.4 | 2.886 → 2.847 | **25.44** | 0.410 | 1 h 33 |
 
 Zero-shot accuracy (lm_eval 0.4.9, 0-shot):
 
@@ -37,8 +40,10 @@ Zero-shot accuracy (lm_eval 0.4.9, 0-shot):
 |---|---|---|---|---|---|---|---|
 | diag, 2 scales | 0.535 | 0.528 | 0.279 | 0.500 | 0.273 | 0.206 | 0.387 |
 | kron, 2 scales | 0.558 | 0.576 | 0.284 | 0.493 | 0.326 | 0.196 | 0.406 |
-| diag, 3 scales | 0.564 | 0.573 | 0.282 | 0.508 | 0.346 | 0.175 | 0.408 |
-| kron, 3 scales | 0.578 | 0.574 | 0.284 | 0.521 | 0.346 | 0.183 | 0.414 |
+| diag, 3 scales (svid) | 0.564 | 0.573 | 0.282 | 0.508 | 0.346 | 0.175 | 0.408 |
+| kron, 3 scales (svid) | 0.578 | 0.574 | 0.284 | 0.521 | 0.346 | 0.183 | 0.414 |
+| diag, 3 scales (balanced) | 0.598 | 0.567 | 0.277 | 0.517 | 0.339 | 0.193 | 0.415 |
+| kron, 3 scales (balanced) | 0.565 | 0.570 | 0.283 | 0.522 | 0.328 | 0.195 | 0.410 |
 
 ## Qwen3-1.7B-Base (2026-09-02, 2 scales)
 
@@ -72,7 +77,12 @@ Zero-shot accuracy (lm_eval 0.4.9, 0-shot):
   the lower pre-KD block perplexity (20.19 vs 20.35) and the lower KD loss (2.471 vs 2.496), yet the higher final
   perplexity, which points to run-to-run noise of the order of ±0.5 PPL at this size rather than a systematic effect.
   A second seed for each arm would settle it.
-- **Middle scale** hurts both arms at 0.6B (diag 34.18 vs 29.21; kron 29.29 vs 25.82) despite costing no rank.
+- **Middle scale:** with the original SVID export it hurts both arms at 0.6B (diag 34.18 vs 29.21; kron 29.29 vs 25.82)
+  despite costing no rank. With the `balanced` export the kron deficit disappears entirely (25.44 vs 25.82, within seed
+  noise; pre-KD 27.4 vs 27.8 and KD loss 2.847 vs 2.845 are indistinguishable) and the diag deficit halves (31.90 vs
+  29.21; pre-KD 36.2 vs 32.7 while the KD loss matches, 2.900 vs 2.899). The SVID penalty was therefore the magnitude
+  allocation, not the middle scale itself; the residual diag gap sits in the block stage and needs a second seed to be
+  called real (diag pre-KD perplexities have varied by ~2 between identical runs).
 - **Reproduction of the paper (diag, 2 scales):** 0.6B +6 % (29.21 vs 27.56), 1.7B −2 % (18.76 vs 19.21), 4B +4 %
   (14.86 vs 14.29). The sign flips across sizes, consistent with seed variance plus the unstated hyperparameters listed in
   `unstated_hyperparameters.md` (top suspects: per-layer vs per-block tuning schedule of Algorithm 1; seeds).
@@ -104,6 +114,9 @@ are bit-for-bit the 2-scale values, and the middle scale's relative step is simp
 (`fact_mid_scale_lr`, `model_kd_mid_scale_lr`; default = the scale learning rate, i.e. ~10× smaller relative steps than
 the outer scales, whose entries are ~0.1).
 
+Outcome on Qwen3-0.6B (jobs 5606569 / 5606570, mid-scale LRs at their defaults): kron 29.29 → **25.44** (2-scale: 25.82),
+diag 34.18 → 31.90 (2-scale: 29.21). See the 0.6B tables above.
+
 ## Infrastructure notes
 
 - The KD stage's `ram` teacher mode holds ~0.62 GB of bf16 logits per 2048-token sample (80 GB for 128 samples);
@@ -115,7 +128,5 @@ the outer scales, whose entries are ~0.1).
 
 ## Pending
 
-- Qwen3-0.6B-Base, 3 scales with the `balanced` export, diag vs kron (`configs/qwen3_0p6b_{diag,kron}_midbal.json`,
-  0.9774 bpw; jobs 5606570 / 5606569). Baselines: the SVID 3-scale rows (34.18 / 29.29); target: the 2-scale rows
-  (29.21 / 25.82). A result within seed noise of 2-scale would attribute the 3-scale deficit to the allocation; a
-  follow-up sweep of `fact_mid_scale_lr` (1e-6, 1e-7) then probes the soft-freeze direction.
+- Second seeds for the 0.6B diag arms (2 scales vs 3 scales balanced) to decide whether the residual 2.7-PPL diag gap is
+  real; a middle-scale learning-rate sweep with the `balanced` export.
