@@ -47,6 +47,28 @@ Observations:
 
 Cost: kron adds ~30 min of 3-pass calibration and raises the per-block time from ~110–140 s to ~150–190 s on 0.6B.
 
+## Scale magnitude allocation (why the 3-scale export is not a fair comparison)
+
+The 3-scale deficit is fully present before KD (block-27 PPL 37.8 vs 32.7 diag, 30.8 vs 27.8 kron), i.e. it arises in
+the block-level STE stage. The ADMM factors have exactly rank-1 magnitude, $|A| = a \otimes \alpha$ and
+$|B| = \beta \otimes b$, so both exports agree on the signs and on the deployed weight and differ only in how the
+shared magnitude is split between the scale vectors (verified on a synthetic layer: $\beta$ had a CV of 2 % and the two
+deployed reconstructions matched to four digits):
+
+| export | `scale_pre` | `scale_mid` | `scale_post` |
+|---|---|---|---|
+| mean-magnitude (2 scales) | $\bar\beta\, q$ | – | $p/\|a\|$ (lossless: all columns of $|A|$ are identical after the per-rank normaliser) |
+| SVID (`admm_mid_scale_export: svid`) | $q/\|q\|$ (unit norm) | $\propto \beta$ | $\|\alpha\|\, p$ (carries the singular value of $|A|$) |
+| balanced (`admm_mid_scale_export: balanced`) | $\bar\beta\, q$ (= 2-scale) | $\beta/\bar\beta$ (mean 1) | $p/\|a\|$ (= 2-scale) |
+
+Adam's per-entry step is ≈ lr in absolute terms, so the relative step of a scale entry is lr/|entry|. Under the SVID
+allocation `scale_post` was ~26× larger than in the 2-scale export on the synthetic layer (hence ~26× smaller relative
+steps at the shared `fact_scale_lr`), the middle scale moved as fast as `scale_pre`, and the split also drifts with the
+arbitrary magnitude of the calibration statistics. The `balanced` export removes the confounder: `scale_pre`/`scale_post`
+are bit-for-bit the 2-scale values, and the middle scale's relative step is simply its own learning rate
+(`fact_mid_scale_lr`, `model_kd_mid_scale_lr`; default = the scale learning rate, i.e. ~10× smaller relative steps than
+the outer scales, whose entries are ~0.1).
+
 ## Infrastructure notes
 
 - The KD stage's `ram` teacher mode holds ~0.62 GB of bf16 logits per 2048-token sample (80 GB for 128 samples);
@@ -58,3 +80,7 @@ Cost: kron adds ~30 min of 3-pass calibration and raises the per-block time from
 ## Pending
 
 - Qwen3-1.7B-Base and Qwen3-4B-Base, 2 scales, diag vs kron (`configs/qwen3_{1p7b,4b}_{diag,kron}_2scale.json`).
+- Qwen3-0.6B-Base, 3 scales with the `balanced` export, diag vs kron (`configs/qwen3_0p6b_{diag,kron}_midbal.json`,
+  0.9774 bpw). Baselines: the SVID 3-scale rows (34.18 / 29.29); target: the 2-scale rows (29.21 / 25.82). A result
+  within seed noise of 2-scale would attribute the 3-scale deficit to the allocation; a follow-up sweep of
+  `fact_mid_scale_lr` (1e-6, 1e-7) then probes the soft-freeze direction.

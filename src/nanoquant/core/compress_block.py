@@ -20,12 +20,28 @@ def fused_weighted_mse(pred, tgt, importance):
     return ((pred.float() - tgt.float()).square() * importance).sum()
 
 
-def get_param_group_config(target_module, binary_lr=1e-5, scale_lr=1e-5, bias_lr=1e-5):
+def get_param_group_config(target_module, binary_lr=1e-5, scale_lr=1e-5, bias_lr=1e-5, mid_scale_lr=None):
+    """Build the optimizer parameter groups of a block from the ``optim_group`` tags of its parameters.
+
+    Parameters
+    ----------
+    target_module : nn.Module
+        Block whose trainable parameters are collected.
+    binary_lr, scale_lr, bias_lr : float
+        Learning rates of the latent binaries, the outer scales (``scale_pre``/``scale_post``) and the biases.
+    mid_scale_lr : float, optional
+        Learning rate of the per-rank middle scale (``scale_mid``); defaults to ``scale_lr``.
+
+    Returns
+    -------
+    list of dict
+        ``[{'params': [...], 'lr': lr}, ...]`` for the non-empty groups, in the order binary, scale,
+        scale_mid, bias.
     """
-    Get the parameter group config for the optimizer.
-    """
-    # create param groups
-    groups = {'binary': [], 'scale': [], 'bias': []}
+    if mid_scale_lr is None:
+        mid_scale_lr = scale_lr
+    lrs = {'binary': binary_lr, 'scale': scale_lr, 'scale_mid': mid_scale_lr, 'bias': bias_lr}
+    groups = {key: [] for key in lrs}
     # collect params
     for module in target_module.modules():
         for name, param in module.named_parameters(recurse=False):
@@ -42,11 +58,7 @@ def get_param_group_config(target_module, binary_lr=1e-5, scale_lr=1e-5, bias_lr
             if tag in groups:
                 groups[tag].append(param)
     # collect and return param groups with respective lr
-    configs = []
-    for key, lr in zip(groups.keys(), [binary_lr, scale_lr, bias_lr]):
-        if groups[key]:
-            configs.append({'params': groups[key], 'lr': lr})
-    return configs
+    return [{'params': params, 'lr': lrs[key]} for key, params in groups.items() if params]
 
 
 @torch.enable_grad()
@@ -155,7 +167,8 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
                 print_admm_steps=quant_config['admm_print_steps'],
                 i_cov=None if i_cov is None else i_cov.to(device),
                 o_cov=None if o_cov is None else o_cov.to(device),
-                eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)))
+                eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)),
+                mid_scale_export=quant_config.get('admm_mid_scale_export', 'svid'))
         else:
             raise ValueError(f"Unknown admm_type: {quant_config['admm_type']}")
         if memo_key is not None:
@@ -210,8 +223,9 @@ def tune_fact(block, target_linear, block_inputs, block_target_outputs, importan
     binary_lr = quant_config['fact_binary_lr']
     scale_lr = quant_config['fact_scale_lr']
     bias_lr = quant_config['fact_bias_lr']
-    # get optimizer and lr_scheduler
-    param_config = get_param_group_config(block, binary_lr=binary_lr, scale_lr=scale_lr, bias_lr=bias_lr)
+    # get optimizer and lr_scheduler (the middle scale may have its own learning rate)
+    param_config = get_param_group_config(block, binary_lr=binary_lr, scale_lr=scale_lr, bias_lr=bias_lr,
+                                          mid_scale_lr=quant_config.get('fact_mid_scale_lr'))
     optimizer = AdamW(param_config, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-4 * scale_lr)
     # optimization loop

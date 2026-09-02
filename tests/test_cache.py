@@ -51,13 +51,16 @@ def test_chain_keys_track_block_level_fields_and_are_chained():
     assert keys[:2] == C.chain_keys(base, 2)  # prefix stability
     assert keys == C.chain_keys(_cfg(model_kd_lr=1.0, tune_model=False, ppl_task="x"), 3)  # KD/eval irrelevant
     for field, value in (("calib_shrinkage", 0.9), ("bits", 0.8), ("admm_outer_iters", 7), ("admm_mid_scale", True),
-                         ("fact_epochs", 1), ("tune_nonfact", False), ("curvature", "kron")):
+                         ("admm_mid_scale_export", "balanced"), ("fact_mid_scale_lr", 1e-7), ("fact_epochs", 1),
+                         ("tune_nonfact", False), ("curvature", "kron")):
         assert keys[0] != C.chain_keys(_cfg(**{field: value}), 3)[0], field
+    assert keys == C.chain_keys(_cfg(model_kd_mid_scale_lr=1e-7), 3)  # KD-only knob
 
 
 def test_kd_and_teacher_keys():
     base = _cfg()
     assert C.kd_key(base, 3) != C.kd_key(_cfg(model_kd_lr=1.0), 3)
+    assert C.kd_key(base, 3) != C.kd_key(_cfg(model_kd_mid_scale_lr=1e-7), 3)
     assert C.kd_key(base, 3) != C.kd_key(_cfg(admm_outer_iters=7), 3)  # depends on the chain
     assert C.teacher_key(base) == C.teacher_key(_cfg(admm_outer_iters=7, calib_shrinkage=0.9, curvature="kron"))
     assert C.teacher_key(base) != C.teacher_key(_cfg(num_calib_samples=8))
@@ -76,7 +79,10 @@ def test_admm_key_is_content_addressed():
     assert k != C.admm_key(W, i_n, o_n, None, None, 8, base)
     assert k != C.admm_key(W, i_n, o_n, torch.eye(6), torch.eye(8), 4, base)
     assert k != C.admm_key(W, i_n, o_n, None, None, 4, _cfg(admm_mid_scale=True))
+    assert k != C.admm_key(W, i_n, o_n, None, None, 4, _cfg(admm_mid_scale=True, admm_mid_scale_export="balanced"))
     assert k != C.admm_key(W, i_n, o_n, None, None, 4, _cfg(admm_outer_iters=7))
+    # the export is stored in the memo, the tuning learning rates are not
+    assert k == C.admm_key(W, i_n, o_n, None, None, 4, _cfg(fact_mid_scale_lr=1e-7, model_kd_mid_scale_lr=1e-7))
 
 
 # ---------------------------------------------------------------- storage

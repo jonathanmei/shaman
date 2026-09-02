@@ -233,22 +233,29 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
         model.model.gradient_checkpointing_enable()
     model.cuda()
 
-    params_to_tune = []
+    outer_scales, mid_scales = [], []
     for module in model.modules():
         if isinstance(module, NanoQuantLinear):
-            module.do_train = True
-            for name, param in module.named_parameters():
-                if 'scale' in name:
-                    param.requires_grad = True
-                    params_to_tune.append(param)
+            outer, mid = module.scale_params()
+            outer_scales += outer
+            mid_scales += mid
+    # flat, ordered list used positionally by the KD checkpoint / resume below
+    params_to_tune = outer_scales + mid_scales
 
-    print(f"Total number of scale parameters to tune: {len(params_to_tune)}")
+    print(f"Total number of scale parameters to tune: {len(params_to_tune)} "
+          f"({len(outer_scales)} outer, {len(mid_scales)} middle)")
     if not params_to_tune:
         print("No scales found to tune. Returning original model.")
         model.eval()
         return model
 
-    optimizer = AdamW(params_to_tune, lr=quant_config['model_kd_lr'])
+    kd_lr = quant_config['model_kd_lr']
+    mid_lr = quant_config.get('model_kd_mid_scale_lr')
+    param_groups = [{'params': outer_scales, 'lr': kd_lr}]
+    if mid_scales:
+        param_groups.append({'params': mid_scales, 'lr': kd_lr if mid_lr is None else mid_lr})
+        print(f"Middle-scale KD learning rate: {param_groups[-1]['lr']:.2e} (outer scales: {kd_lr:.2e})")
+    optimizer = AdamW(param_groups)
     epochs = quant_config["model_kd_epochs"]
     total_steps = epochs * len(dataloader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)

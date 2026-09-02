@@ -35,16 +35,20 @@ def NanoQuantConfig(
     admm_penalty_scheduler: str = "linear",
     admm_print_steps: bool = False,
     admm_mid_scale: bool = False,
+    # magnitude allocation of the mid-scale export: "svid" (legacy) or "balanced" (2-scale outer scales, mean-1 mid)
+    admm_mid_scale_export: str = "svid",
     # tune_fact
     tune_fact: bool = True,
     fact_binary_lr: float = 1e-5,
     fact_scale_lr: float = 1e-5,
+    fact_mid_scale_lr: float | None = None,  # None -> fact_scale_lr
     fact_bias_lr: float = 1e-5,
     fact_batch_size: int = 1,
     fact_epochs: int = 8,
     # tune_model
     tune_model: bool = True,
     model_kd_lr: float = 1e-5,
+    model_kd_mid_scale_lr: float | None = None,  # None -> model_kd_lr
     model_kd_batch_size: int = 1,
     model_kd_epochs: int = 8,
     # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)
@@ -83,16 +87,19 @@ def NanoQuantConfig(
         "admm_penalty_scheduler": admm_penalty_scheduler,
         'admm_print_steps': admm_print_steps,
         "admm_mid_scale": admm_mid_scale,
+        "admm_mid_scale_export": admm_mid_scale_export,
         # tune_fact
         "tune_fact": tune_fact,
         "fact_binary_lr": fact_binary_lr,
         "fact_scale_lr": fact_scale_lr,
+        "fact_mid_scale_lr": fact_mid_scale_lr,
         "fact_bias_lr": fact_bias_lr,
         "fact_batch_size": fact_batch_size,
         "fact_epochs": fact_epochs,
         # tune_model
         "tune_model": tune_model,
         "model_kd_lr": model_kd_lr,
+        "model_kd_mid_scale_lr": model_kd_mid_scale_lr,
         "model_kd_batch_size": model_kd_batch_size,
         "model_kd_epochs": model_kd_epochs,
         "model_kd_teacher": model_kd_teacher,

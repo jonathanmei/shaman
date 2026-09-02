@@ -101,6 +101,14 @@ Two optional extensions are available:
 * `--admm_mid_scale` exports an explicit per-rank middle scale for `--admm_type nanoquant`
   (Scale-Binary-Scale-Binary-Scale, as the `dbf` ADMM does), so the deployed form equals the ADMM solution
   exactly. The rank budget accounts for the extra 16-bit scale automatically.
+* `--admm_mid_scale_export` chooses how the magnitude of that solution is split between the three scales:
+  `svid` (default; SVID triples, unit-norm `scale_pre`) or `balanced` (`scale_pre`/`scale_post` identical to the
+  2-scale export, so a shared scale learning rate gives them the same effective step sizes, and a dimensionless
+  `scale_mid` with mean one). The deployed weights are the same for both.
+* `--fact_mid_scale_lr` / `--model_kd_mid_scale_lr` give the middle scale its own learning rate in the
+  block-level and model-level tuning stages (default: the respective scale learning rate). With the `balanced`
+  export the middle scale has entries near one, so its learning rate is directly its relative step size; a very
+  small value acts as a soft freeze.
 
 ### Caching and Resuming
 

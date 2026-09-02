@@ -116,14 +116,26 @@ class TuneArguments:
     admm_mid_scale: bool = field(
         default=False,
         metadata={"help": "Export an explicit per-rank middle scale (Scale-Binary-Scale-Binary-Scale) for admm_type=nanoquant"})
+    admm_mid_scale_export: str = field(
+        default="svid",
+        metadata={
+            "help": "Magnitude allocation of the mid-scale export: 'svid' (SVID triples; unit-norm scale_pre) or "
+                    "'balanced' (scale_pre/scale_post identical to the 2-scale export, scale_mid with mean one)",
+            "choices": ["svid", "balanced"],
+        },
+    )
     tune_fact: bool = field(default=True, metadata={"help": "Tune factorized layers"})
     fact_binary_lr: float = field(default=1e-5, metadata={"help": "LR for factorized binary parameters"})
     fact_scale_lr: float = field(default=1e-5, metadata={"help": "LR for factorized scale parameters"})
+    fact_mid_scale_lr: float | None = field(
+        default=None, metadata={"help": "LR for the per-rank middle scale in factorized tuning (default: fact_scale_lr)"})
     fact_bias_lr: float = field(default=1e-5, metadata={"help": "LR for factorized bias parameters"})
     fact_batch_size: int = field(default=1, metadata={"help": "Batch size for factorized tuning"})
     fact_epochs: int = field(default=8, metadata={"help": "Epochs for factorized tuning"})
     tune_model: bool = field(default=True, metadata={"help": "Perform model-level KD tuning"})
     model_kd_lr: float = field(default=1e-5, metadata={"help": "LR for model knowledge distillation"})
+    model_kd_mid_scale_lr: float | None = field(
+        default=None, metadata={"help": "LR for the per-rank middle scale in model KD (default: model_kd_lr)"})
     model_kd_batch_size: int = field(default=1, metadata={"help": "Batch size for model KD"})
     model_kd_epochs: int = field(default=8, metadata={"help": "Epochs for model KD"})
     model_kd_teacher: str = field(
@@ -224,14 +236,17 @@ def main():
         admm_penalty_scheduler=tune_args.admm_penalty_scheduler,
         admm_print_steps=tune_args.admm_print_steps,
         admm_mid_scale=tune_args.admm_mid_scale,
+        admm_mid_scale_export=tune_args.admm_mid_scale_export,
         tune_fact=tune_args.tune_fact,
         fact_binary_lr=tune_args.fact_binary_lr,
         fact_scale_lr=tune_args.fact_scale_lr,
+        fact_mid_scale_lr=tune_args.fact_mid_scale_lr,
         fact_bias_lr=tune_args.fact_bias_lr,
         fact_batch_size=tune_args.fact_batch_size,
         fact_epochs=tune_args.fact_epochs,
         tune_model=tune_args.tune_model,
         model_kd_lr=tune_args.model_kd_lr,
+        model_kd_mid_scale_lr=tune_args.model_kd_mid_scale_lr,
         model_kd_batch_size=tune_args.model_kd_batch_size,
         model_kd_epochs=tune_args.model_kd_epochs,
         model_kd_teacher=tune_args.model_kd_teacher,

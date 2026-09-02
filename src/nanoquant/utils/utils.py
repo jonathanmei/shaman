@@ -140,6 +140,34 @@ def has_mid_scale(quant_config) -> bool:
     return quant_config.get('admm_type') == 'dbf' or bool(quant_config.get('admm_mid_scale', False))
 
 
+def validate_quant_config(quant_config) -> None:
+    """Fail fast on inconsistent middle-scale settings instead of after calibration.
+
+    Parameters
+    ----------
+    quant_config : dict
+        Quantisation configuration. Keys predating the middle-scale options may be absent.
+
+    Raises
+    ------
+    ValueError
+        If ``admm_mid_scale_export`` is unknown, or if a non-default export / a middle-scale learning rate
+        (``fact_mid_scale_lr``, ``model_kd_mid_scale_lr``) is requested without a middle scale.
+    """
+    from ..core.admm_nq import MID_SCALE_EXPORTS
+
+    export = quant_config.get('admm_mid_scale_export', 'svid')
+    if export not in MID_SCALE_EXPORTS:
+        raise ValueError(f"admm_mid_scale_export must be one of {MID_SCALE_EXPORTS}, got {export!r}")
+    if not has_mid_scale(quant_config):
+        offending = [k for k in ('fact_mid_scale_lr', 'model_kd_mid_scale_lr') if quant_config.get(k) is not None]
+        if export != 'svid':
+            offending.insert(0, 'admm_mid_scale_export')
+        if offending:
+            raise ValueError("a middle scale (admm_mid_scale=true or admm_type=dbf) is required by: "
+                             + ", ".join(offending))
+
+
 def calculate_ranks(model, layers_to_analyze, quant_config):
     """
     Unified entry point for bit allocation.

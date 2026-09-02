@@ -88,8 +88,9 @@ stage epoch counts (8/8/8); $\tau$, $\lambda$, $\epsilon$ and the $\rho$ range a
 
 ## Not in the paper at all (our extensions, default off)
 
-`curvature=kron` (+ `kron_nkp_iters`, `kron_stats_device`, `kron_eigh_dtype`), `admm_mid_scale`, `cache_dir`,
-`checkpoint_every_blocks`, `model_kd_teacher`.
+`curvature=kron` (+ `kron_nkp_iters`, `kron_stats_device`, `kron_eigh_dtype`), `admm_mid_scale`
+(+ `admm_mid_scale_export`, `fact_mid_scale_lr`, `model_kd_mid_scale_lr`), `cache_dir`, `checkpoint_every_blocks`,
+`model_kd_teacher`.
 
 ## Most likely contributors to the 27.56 → 29.21 gap (ordered by prior)
 

@@ -76,12 +76,32 @@ class NanoQuantLinear(nn.Module):
             param = nn.Parameter(tensor.to(self.dtype), requires_grad=requires_grad)
 
             if self.do_train:
-                if "scale" in name:
+                if name == "scale_mid":
+                    param.optim_group = "scale_mid"
+                elif "scale" in name:
                     param.optim_group = "scale"
                 elif "latent" in name:
                     param.optim_group = "binary"
 
             setattr(self, name, param)
+
+    def scale_params(self) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+        """Enable scale-only tuning (model-level KD) and return the tunable scales.
+
+        The binaries stay frozen; only the scale vectors get ``requires_grad``.
+
+        Returns
+        -------
+        tuple of list of nn.Parameter
+            ``(outer, mid)``: ``[scale_pre, scale_post]`` and ``[scale_mid]`` (empty when the layer has no
+            middle scale), so callers can give the middle scale its own learning rate.
+        """
+        self.do_train = True
+        outer = [self.scale_pre, self.scale_post]
+        mid = [self.scale_mid] if getattr(self, "scale_mid", None) is not None else []
+        for param in outer + mid:
+            param.requires_grad = True
+        return outer, mid
 
     def init_for_inference(self, rank, has_scale_mid=False):
         self.rank = rank

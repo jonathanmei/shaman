@@ -15,7 +15,8 @@ from ..utils.bits import format_accounting, model_accounting, static_accounting
 from ..utils.cache import ArtifactCache, atomic_save, chain_keys, stats_key
 from ..utils.data_utils import get_calib_loader, prepare_dataset
 from ..utils.load_utils import load_compressed_model, load_model, load_tokenizer
-from ..utils.utils import cleanup_memory, get_decoder_layers, get_layers_to_factorize, has_mid_scale
+from ..utils.utils import (cleanup_memory, get_decoder_layers, get_layers_to_factorize, has_mid_scale,
+                           validate_quant_config)
 from .compress_model import compress_block_recon, compress_model_recon
 from .importance import collect_stats, get_shrunk_stats, register_stats
 from .resume import compressed_state_dict
@@ -72,6 +73,7 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
     torch.nn.Module
         The quantised model (on CPU/GPU as left by the last stage).
     """
+    validate_quant_config(quant_config)
     cache = ArtifactCache(quant_config.get("cache_dir", ""))
     device_map = quant_config.get('device_map', 'cpu')
 

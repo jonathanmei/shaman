@@ -72,16 +72,20 @@ class NanoQuantConfigDataclass:
     admm_penalty_scheduler: str = "linear"
     admm_print_steps: bool = False
     admm_mid_scale: bool = False
+    # magnitude allocation of the mid-scale export: "svid" (legacy) or "balanced" (2-scale outer scales, mean-1 mid)
+    admm_mid_scale_export: str = "svid"
     # tune_fact
     tune_fact: bool = True
     fact_binary_lr: float = 1e-5
     fact_scale_lr: float = 1e-5
+    fact_mid_scale_lr: float | None = None  # None -> fact_scale_lr
     fact_bias_lr: float = 1e-5
     fact_batch_size: int = 1
     fact_epochs: int = 8
     # tune_model
     tune_model: bool = True
     model_kd_lr: float = 1e-5
+    model_kd_mid_scale_lr: float | None = None  # None -> model_kd_lr
     model_kd_batch_size: int = 1
     model_kd_epochs: int = 8
     # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)

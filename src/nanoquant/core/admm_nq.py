@@ -14,6 +14,17 @@ if torch.cuda.is_available():
 # Local registry for rho schedulers
 RHO_SCHEDULER_REGISTRY = {}
 
+# How the magnitude of the ADMM solution is split into scale_post / scale_mid / scale_pre when mid_scale=True.
+MID_SCALE_EXPORTS: tuple[str, ...] = ("svid", "balanced")
+
+
+@torch.no_grad()
+def _sign(W: torch.Tensor) -> torch.Tensor:
+    """Sign matrix of ``W`` with ``sign(0) := 1``."""
+    Sg = W.sign()
+    Sg[Sg == 0] = 1
+    return Sg
+
 
 @torch.no_grad()
 def power_iteration(A, num_iters=5):
@@ -44,8 +55,7 @@ def svid(W, inner_iters=5, eps=1e-12):
     Sign-Value-Independent Decomposition (SVID).
     Returns u, v, Sg where Sg is sign matrix of W.
     """
-    Sg = W.sign()
-    Sg[Sg == 0] = 1
+    Sg = _sign(W)
     u, s, v = power_iteration(W.abs(), inner_iters)
     u = u * s
     return u, v, Sg
@@ -204,15 +214,23 @@ def factorize_admm_nanoquant(
     o_cov: torch.Tensor | None = None,
     eigh_dtype: torch.dtype = torch.float64,
     mid_scale: bool = False,
+    mid_scale_export: str = "svid",
 ):
     """
     Decomposes the weight matrix W into two binary matrices A and B using ADMM.
     Assumes W has the shape (out_features, in_features).
 
     Post-processing extracts scales and binary-compatible matrices either by mean-magnitude
-    extraction (Scale-Binary-Binary-Scale, ``mid_scale=False``) or, with ``mid_scale=True``, by the exact
-    SVID triple of each factor (Scale-Binary-Scale-Binary-Scale, i.e. an explicit per-rank middle scale so
-    the deployed form equals what ADMM converged to).
+    extraction (Scale-Binary-Binary-Scale, ``mid_scale=False``) or, with ``mid_scale=True``, exactly
+    (Scale-Binary-Scale-Binary-Scale, i.e. an explicit per-rank middle scale so the deployed form equals what
+    ADMM converged to). Both mid-scale exports represent the same product and differ only in how its magnitude
+    is split between the three scale vectors:
+
+    * ``"svid"``: SVID triple of each factor; ``scale_pre`` is unit-norm, ``scale_post`` carries the singular
+      value of |A| and ``scale_mid`` is proportional to the per-rank magnitude of B.
+    * ``"balanced"``: ``scale_pre``/``scale_post`` are identical to the mean-magnitude (2-scale) export, so a
+      shared scale learning rate gives them the same effective step sizes as in the 2-scale method, and
+      ``scale_mid`` is the dimensionless per-rank magnitude of B divided by its mean (mean one).
 
     Args:
         W: Weight matrix to decompose
@@ -234,11 +252,15 @@ def factorize_admm_nanoquant(
                rho penalty and the SVID projection stay Euclidean.
         eigh_dtype: Precision of the eigendecompositions used by the Mahalanobis solver.
         mid_scale: Export an explicit per-rank ``scale_mid`` (see above).
+        mid_scale_export: Magnitude allocation of the mid-scale export, ``"svid"`` or ``"balanced"`` (see above).
     """
+    if mid_scale_export not in MID_SCALE_EXPORTS:
+        raise ValueError(f"mid_scale_export must be one of {MID_SCALE_EXPORTS}, got {mid_scale_export!r}")
     if is_transpose:
         results = factorize_admm_nanoquant(W.mT, o_norm, i_norm, mid_rank, outer_iters, inner_iters, reg, False, eps,
                                            rho_scheduler, print_admm_steps, i_cov=o_cov, o_cov=i_cov,
-                                           eigh_dtype=eigh_dtype, mid_scale=mid_scale)
+                                           eigh_dtype=eigh_dtype, mid_scale=mid_scale,
+                                           mid_scale_export=mid_scale_export)
         swapped = {
             "W_final": results["W_final"].mT,
             "A": results["B"],
@@ -383,14 +405,28 @@ def factorize_admm_nanoquant(
 
     if mid_scale:
         # Exact Scale-Binary-Scale-Binary-Scale export: both factors have rank-1 magnitude by construction
-        # (SVID projection), so their SVID triples recover them exactly.
-        mid = scale_factor if torch.is_tensor(scale_factor) else torch.ones(mid_rank, device=device)
-        u_A, v_A, S_A = _svid_nonneg(A_final.to(torch.float32), inner_iters, eps)  # (out,), (mid,), (out, mid)
-        u_B, v_B, S_B = _svid_nonneg(B_final.to(torch.float32), inner_iters, eps)  # (mid,), (in,), (mid, in)
+        # (SVID projection), so the product below equals the ADMM solution for either allocation.
+        if mid_scale_export == "svid":
+            # SVID triples: all of |A|'s singular value goes to scale_post, scale_pre is unit-norm.
+            mid = scale_factor if torch.is_tensor(scale_factor) else torch.ones(mid_rank, device=device)
+            u_A, v_A, S_A = _svid_nonneg(A_final.to(torch.float32), inner_iters, eps)  # (out,), (mid,), (out, mid)
+            u_B, v_B, S_B = _svid_nonneg(B_final.to(torch.float32), inner_iters, eps)  # (mid,), (in,), (mid, in)
 
-        scale_post = u_A.view(1, -1)
-        scale_mid = (v_A * mid.to(torch.float32) * u_B).view(1, -1)
-        scale_pre = v_B.view(1, -1)
+            scale_post = u_A.view(1, -1)
+            scale_mid = (v_A * mid.to(torch.float32) * u_B).view(1, -1)
+            scale_pre = v_B.view(1, -1)
+        else:  # "balanced"
+            # Outer scales exactly as in the mean-magnitude export below: after the per-rank normaliser every
+            # column of |A| is identical (so the row mean is lossless) and |B| = beta (x) q, so the column mean
+            # is mean(beta) * q. The middle scale is the dimensionless per-rank correction beta / mean(beta).
+            A_bal = (A_final * scale_factor).to(torch.float32)
+            B_bal = B_final.to(torch.float32)
+            S_A, S_B = _sign(A_bal), _sign(B_bal)
+
+            scale_post = A_bal.abs().mean(dim=1).view(1, -1)
+            scale_pre = B_bal.abs().mean(dim=0).view(1, -1)
+            beta = B_bal.abs().mean(dim=1)  # (mid,)
+            scale_mid = (beta / beta.mean().clamp(eps)).view(1, -1)
 
         # W_final = diag(scale_post) S_A diag(scale_mid) S_B diag(scale_pre), i.e. the deployed form
         W_final = ((S_A * scale_post.view(-1, 1)) @ (S_B * scale_mid.view(-1, 1) * scale_pre)).to(W.dtype)

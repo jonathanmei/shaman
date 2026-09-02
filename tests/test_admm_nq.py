@@ -173,14 +173,15 @@ def test_mid_scale_export_is_exact_deployed_form():
     assert rel_err < 1.0
 
 
-def test_mid_scale_transpose_swaps_pre_post_and_keeps_mid():
+@pytest.mark.parametrize("export", ["svid", "balanced"])
+def test_mid_scale_transpose_swaps_pre_post_and_keeps_mid(export):
     torch.manual_seed(7)
     n_out, n_in = 16, 32
     W = torch.randn(n_out, n_in)
     i_norm = torch.rand(n_in) + 0.5
     o_norm = torch.rand(n_out) + 0.5
 
-    out = _run(W, i_norm, o_norm, seed=9, is_transpose=True, mid_scale=True)
+    out = _run(W, i_norm, o_norm, seed=9, is_transpose=True, mid_scale=True, mid_scale_export=export)
 
     assert out["scale_mid"].shape == (1, RANK)
     assert out["scale_pre"].shape == (1, n_in)
@@ -189,15 +190,51 @@ def test_mid_scale_transpose_swaps_pre_post_and_keeps_mid():
     assert torch.allclose(_deployed(out), out["W_final"], atol=1e-4, rtol=1e-4)
 
 
-def test_mid_scale_with_covariances_runs():
+@pytest.mark.parametrize("export", ["svid", "balanced"])
+def test_mid_scale_with_covariances_runs(export):
     torch.manual_seed(8)
     n_out, n_in = 24, 16
     W = torch.randn(n_out, n_in)
     i_norm = torch.rand(n_in) + 0.5
     o_norm = torch.rand(n_out) + 0.5
-    out = _run(W, i_norm, o_norm, seed=10, mid_scale=True, i_cov=_scaled_cov(_spd(n_in, 0.5), i_norm),
-               o_cov=_scaled_cov(_spd(n_out, 0.5), o_norm))
+    out = _run(W, i_norm, o_norm, seed=10, mid_scale=True, mid_scale_export=export,
+               i_cov=_scaled_cov(_spd(n_in, 0.5), i_norm), o_cov=_scaled_cov(_spd(n_out, 0.5), o_norm))
     assert torch.allclose(_deployed(out), out["W_final"], atol=1e-4, rtol=1e-4)
+
+
+def test_balanced_export_matches_two_scale_outer_scales():
+    """``balanced``: pre/post identical to the 2-scale export, mid dimensionless with mean 1, product exact."""
+    torch.manual_seed(10)
+    n_out, n_in = 24, 16
+    W = torch.randn(n_out, n_in)
+    i_norm = torch.rand(n_in) + 0.5
+    o_norm = torch.rand(n_out) + 0.5
+
+    two = _run(W, i_norm, o_norm, seed=11, mid_scale=False)
+    bal = _run(W, i_norm, o_norm, seed=11, mid_scale=True, mid_scale_export="balanced")
+    svid = _run(W, i_norm, o_norm, seed=11, mid_scale=True, mid_scale_export="svid")
+
+    # same outer scales as the mean-magnitude export -> same effective Adam learning rates
+    assert torch.allclose(bal["scale_pre"], two["scale_pre"], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(bal["scale_post"], two["scale_post"], atol=1e-6, rtol=1e-5)
+    # per-rank correction with mean one
+    assert bal["scale_mid"].shape == (1, RANK)
+    assert torch.all(bal["scale_mid"] > 0)
+    assert torch.isclose(bal["scale_mid"].mean(), torch.tensor(1.0), atol=1e-5)
+    # binaries and exact deployed form
+    assert torch.all(bal["A"].abs() == 1) and torch.all(bal["B"].abs() == 1)
+    assert torch.equal(bal["A"], svid["A"]) and torch.equal(bal["B"], svid["B"])
+    assert torch.allclose(_deployed(bal), bal["W_final"], atol=1e-4, rtol=1e-4)
+    # both mid-scale exports represent the same (exact) ADMM product
+    assert torch.allclose(bal["W_final"], svid["W_final"], atol=1e-4, rtol=1e-4)
+    # latents are export-independent
+    assert torch.equal(bal["A_latent"], two["A_latent"]) and torch.equal(bal["B_latent"], two["B_latent"])
+
+
+def test_unknown_mid_scale_export_raises():
+    W = torch.randn(24, 16)
+    with pytest.raises(ValueError, match="mid_scale_export"):
+        _run(W, torch.ones(16), torch.ones(24), seed=0, mid_scale=True, mid_scale_export="bogus")
 
 
 def test_without_mid_scale_export_is_the_legacy_mean_magnitude_one():
@@ -223,6 +260,25 @@ def test_config_defaults_keep_legacy_behaviour():
     assert cfg["kron_stats_device"] == "cpu"
     assert cfg["kron_eigh_dtype"] == "float64"
     assert cfg["admm_mid_scale"] is False
+    assert cfg["admm_mid_scale_export"] == "svid"
+    assert cfg["fact_mid_scale_lr"] is None
+    assert cfg["model_kd_mid_scale_lr"] is None
+
+
+def test_validate_quant_config():
+    nq_utils.validate_quant_config(NanoQuantConfig())
+    nq_utils.validate_quant_config({"admm_type": "nanoquant"})  # old configs without the new keys
+    nq_utils.validate_quant_config(NanoQuantConfig(admm_mid_scale=True, admm_mid_scale_export="balanced",
+                                                   fact_mid_scale_lr=1e-7, model_kd_mid_scale_lr=1e-8))
+    nq_utils.validate_quant_config(NanoQuantConfig(admm_type="dbf", fact_mid_scale_lr=1e-7))
+    with pytest.raises(ValueError, match="admm_mid_scale_export"):
+        nq_utils.validate_quant_config(NanoQuantConfig(admm_mid_scale=True, admm_mid_scale_export="bogus"))
+    with pytest.raises(ValueError, match="admm_mid_scale"):
+        nq_utils.validate_quant_config(NanoQuantConfig(admm_mid_scale_export="balanced"))
+    with pytest.raises(ValueError, match="admm_mid_scale"):
+        nq_utils.validate_quant_config(NanoQuantConfig(fact_mid_scale_lr=1e-7))
+    with pytest.raises(ValueError, match="admm_mid_scale"):
+        nq_utils.validate_quant_config(NanoQuantConfig(model_kd_mid_scale_lr=1e-7))
 
 
 def test_has_mid_scale_helper():

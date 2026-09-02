@@ -27,6 +27,7 @@ _EXPORTS = {
     "get_layers_to_factorize": ".utils",
     "has_mid_scale": ".utils",
     "set_seed": ".utils",
+    "validate_quant_config": ".utils",
 }
 
 __all__ = sorted(_EXPORTS)
