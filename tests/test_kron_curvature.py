@@ -202,6 +202,43 @@ def test_collect_stats_kron_matches_offline_fit(monkeypatch):
     assert torch.allclose(R / R.norm(), R_ref, atol=1e-4)
 
 
+def test_partition_layers_respects_budget_and_order():
+    model = _TinyMLP()
+    layers = {n: m for n, m in model.named_modules() if isinstance(m, nn.Linear)}
+    # layer "0": 8*(36+25)=488 B, layer "2": 8*(25+9)=272 B
+    assert imp._partition_layers(layers, 10**9) == [["0", "2"]]
+    assert imp._partition_layers(layers, 600) == [["0"], ["2"]]
+    assert imp._partition_layers(layers, 100) == [["0"], ["2"]]  # oversized layers get their own group
+    assert imp._partition_layers(layers, 760) == [["0", "2"]]
+
+
+@pytest.mark.parametrize("strategy", ["online", "dbf"])
+def test_grouped_device_accumulation_matches_streaming(monkeypatch, strategy):
+    """One pass per layer group with on-device accumulators gives the same factors as the CPU-streaming path."""
+    torch.manual_seed(6)
+    dataloader = [torch.randn(2, 7, 6) for _ in range(3)]
+    calls = {"n": 0}
+
+    def counting_loop(*args, **kwargs):
+        calls["n"] += 1
+        _fake_loop(*args, **kwargs)
+
+    monkeypatch.setattr(imp, "_run_calibration_loop", counting_loop)
+
+    torch.manual_seed(7)
+    model_a = _TinyMLP()
+    ref = imp.collect_stats(model_a, dataloader, "cpu", strategy=strategy, curvature="kron", nkp_iters=2)
+    assert calls["n"] == 2
+    torch.manual_seed(7)
+    model_b = _TinyMLP()
+    got = imp.collect_stats(model_b, dataloader, "cpu", strategy=strategy, curvature="kron", nkp_iters=2,
+                            gpu_budget_gb=600e-9)  # forces two layer groups
+    assert calls["n"] == 2 + 2 * 2  # nkp_iters x groups
+    for key in ("i_cov", "o_cov", "i_norm", "o_norm"):
+        for name in ref[key]:
+            assert torch.allclose(got[key][name], ref[key][name], atol=1e-5, rtol=1e-5), (key, name)
+
+
 def test_register_stats_attaches_dense_non_persistent_buffers():
     model = _TinyMLP()
     stats = {

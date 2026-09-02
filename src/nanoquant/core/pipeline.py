@@ -42,6 +42,7 @@ def collect_stats_kwargs(quant_config: dict) -> dict:
         'curvature': curvature,
         'nkp_iters': quant_config.get('kron_nkp_iters', 3),
         'stats_device': quant_config.get('kron_stats_device', 'cpu') if curvature == 'kron' else None,
+        'gpu_budget_gb': float(quant_config.get('kron_gpu_budget_gb', 0.0) or 0.0),
     }
 
 

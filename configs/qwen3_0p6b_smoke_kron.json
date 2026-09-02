@@ -12,6 +12,8 @@
   "kron_nkp_iters": 3,
   "kron_stats_device": "cpu",
   "kron_eigh_dtype": "float64",
+  "kron_gpu_budget_gb": 48,
+  "cache_dir": "cache",
   "tune_nonfact": true,
   "nonfact_epochs": 1,
   "admm_type": "nanoquant",
