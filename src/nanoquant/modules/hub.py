@@ -17,30 +17,22 @@ Usage:
     model = AutoModelForCausalLM.from_pretrained("username/nanoquant-llama-7b-1bpw")
 """
 
-import argparse
-import gc
 import json
 import os
 import shutil
-import sys
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from loguru import logger
 
 import torch
 import torch.nn as nn
 from huggingface_hub import (PyTorchModelHubMixin, create_repo, snapshot_download)
-from transformers import AutoConfig, AutoModelForCausalLM
 
-from ..core.compress_model import compress_block_recon, compress_model_recon
-from ..core.importance import collect_stats, get_shrunk_stats, register_stats
-from ..modules.auto_model import collect_stats_kwargs
-from ..modules.linear import NanoQuantLinear
-from ..utils.data_utils import get_calib_loader, prepare_dataset
-from ..utils.load_utils import (get_compressed_state_dict, load_compressed_model, load_model, load_tokenizer)
+from ..core.pipeline import run_quantization_pipeline
+from ..utils.load_utils import (get_compressed_state_dict, load_compressed_model, load_model)
 from ..utils.utils import has_mid_scale
 
 
@@ -64,6 +56,9 @@ class NanoQuantConfigDataclass:
     kron_eigh_dtype: str = "float64"
     seqlen: int = 2048
     device_map: str = "cpu"
+    # stage-level artifact cache / resume ("" disables)
+    cache_dir: str = "cache"
+    checkpoint_every_blocks: int = 1
     # tune_nonfact
     tune_nonfact: bool = True
     nonfact_lr: float = 1e-4
@@ -89,6 +84,8 @@ class NanoQuantConfigDataclass:
     model_kd_lr: float = 1e-5
     model_kd_batch_size: int = 1
     model_kd_epochs: int = 8
+    # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)
+    model_kd_teacher: str = "ram"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -194,7 +191,6 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
 
         # Save weights using existing logic
         try:
-            from ..utils.load_utils import get_compressed_state_dict
             state_dict = get_compressed_state_dict(self.model)
 
             # Try to save as safetensors first (preferred format)
@@ -207,7 +203,7 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
             except ImportError:
                 # Fallback to torch.save
                 torch.save(state_dict, save_directory / "model_state.pt")
-        except Exception as e:
+        except Exception:
             # Fallback to regular state_dict
             state_dict = self.model.state_dict()
             torch.save(state_dict, save_directory / "model_state.pt")
@@ -216,10 +212,10 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
         index_file = save_directory / "model.safetensors.index.json"
         if not index_file.exists():
             try:
-                from safetensors.torch import save_file
+                from safetensors.torch import save_file  # noqa: F401
 
                 # Create a minimal index file for single-shard model
-                weight_map = {key: "model.safetensors" for key in self.model.state_dict().keys()}
+                weight_map = {key: "model.safetensors" for key in self.model.state_dict()}
                 with open(index_file, "w") as f:
                     json.dump(
                         {
@@ -284,7 +280,7 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
             with open(model_config_path) as f:
                 model_config = json.load(f)
             # Apply fallback if the key exists in model_config and hasn't been explicitly set in config
-            for key in NanoQuantConfigDataclass.__dataclass_fields__.keys():
+            for key in NanoQuantConfigDataclass.__dataclass_fields__:
                 if key in model_config and (not hasattr(config, key)
                                             or getattr(config, key) == getattr(NanoQuantConfigDataclass(), key, None)):
                     setattr(config, key, model_config[key])
@@ -321,10 +317,8 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
     @classmethod
     def quantize_model(cls, model_id: str, quant_config: NanoQuantConfigDataclass) -> torch.nn.Module:
         """
-        Quantize a model using NanoQuant pipeline.
-
-        This method implements the complete quantization process from AutoNQModel,
-        including calibration, importance collection, and block reconstruction.
+        Quantize a model using the NanoQuant pipeline (calibration, block reconstruction, model-level KD),
+        with stage-level caching and resume governed by ``quant_config.cache_dir``.
 
         Args:
             model_id: The model identifier (e.g., "meta-llama/Llama-2-7b-hf")
@@ -333,35 +327,7 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
         Returns:
             Quantized PyTorch model
         """
-        # Convert config to dict for compatibility with existing functions
-        quant_dict = quant_config.to_dict()
-
-        # Load model and fp_model
-        device_map = quant_dict.get('device_map', 'cpu')
-        model = load_model(model_id, quant_dict['seqlen'], device_map=device_map)
-        fp_model = load_model(model_id, quant_dict['seqlen'], device_map=device_map)
-
-        # Load dataloader
-        data = prepare_dataset(model_id, quant_dict)
-        tokenizer = load_tokenizer(model_id)
-        dataloader = get_calib_loader(data, tokenizer, quant_dict['num_calib_samples'], quant_dict['seed'],
-                                      quant_dict['seqlen'])
-
-        # Get importance via calibration (diagonal or Kronecker-factored curvature)
-        raw_stats = collect_stats(model, dataloader, "cuda", **collect_stats_kwargs(quant_dict))
-        shrunk_stats = get_shrunk_stats(raw_stats, shrinkage=quant_dict['calib_shrinkage'])
-        model = register_stats(model, shrunk_stats)
-        del raw_stats, shrunk_stats
-
-        # Compress the model
-        model = compress_block_recon(model, fp_model, dataloader, quant_dict)
-
-        # Model-level KD tuning (only if enabled)
-        if quant_config.tune_model:
-            logger.info("Performing model-level KD tuning...")
-            model = compress_model_recon(model, fp_model, dataloader, quant_dict)
-
-        return model
+        return run_quantization_pipeline(model_id, quant_config.to_dict())
 
     @classmethod
     def from_pretrained_quantize(
@@ -395,9 +361,6 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
             quant_config = NanoQuantConfigDataclass()
             # Set model_id from argument
             quant_config.model_id = model_id
-
-        # Convert config to dict
-        quant_dict = quant_config.to_dict()
 
         # Check if qmodel_path exists and points to a valid checkpoint
         if qmodel_path and os.path.isfile(qmodel_path):

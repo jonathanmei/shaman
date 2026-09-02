@@ -26,6 +26,7 @@ import torch
 from transformers import HfArgumentParser
 
 from .modules.hub import NanoQuantConfigDataclass, NanoQuantModel
+from .utils.cache import append_ledger
 from .utils.eval_utils import evaluate_model
 from .utils.load_utils import load_tokenizer
 from .utils.utils import cleanup_memory
@@ -80,6 +81,11 @@ class QuantArguments:
             "choices": ["float64", "float32"],
         },
     )
+    cache_dir: str = field(
+        default="cache",
+        metadata={"help": "Stage-level artifact cache / resume directory ('' disables)"},
+    )
+    checkpoint_every_blocks: int = field(default=1, metadata={"help": "Checkpoint the block loop every N blocks"})
 
 
 @dataclass
@@ -118,6 +124,15 @@ class TuneArguments:
     tune_model: bool = field(default=True, metadata={"help": "Perform model-level KD tuning"})
     model_kd_lr: float = field(default=1e-5, metadata={"help": "LR for model knowledge distillation"})
     model_kd_batch_size: int = field(default=1, metadata={"help": "Batch size for model KD"})
+    model_kd_epochs: int = field(default=8, metadata={"help": "Epochs for model KD"})
+    model_kd_teacher: str = field(
+        default="ram",
+        metadata={
+            "help": "Teacher logits for KD: 'ram' (cache all logits on the host), 'disk' (memmap in cache_dir), "
+                    "'online' (recompute from the FP teacher every step)",
+            "choices": ["ram", "disk", "online"],
+        },
+    )
 
 
 @dataclass
@@ -195,6 +210,8 @@ def main():
         kron_eigh_dtype=quant_args.kron_eigh_dtype,
         seqlen=model_args.seqlen,
         device_map=model_args.device_map,
+        cache_dir=quant_args.cache_dir,
+        checkpoint_every_blocks=quant_args.checkpoint_every_blocks,
         tune_nonfact=tune_args.tune_nonfact,
         nonfact_lr=tune_args.nonfact_lr,
         nonfact_batch_size=tune_args.nonfact_batch_size,
@@ -215,6 +232,8 @@ def main():
         tune_model=tune_args.tune_model,
         model_kd_lr=tune_args.model_kd_lr,
         model_kd_batch_size=tune_args.model_kd_batch_size,
+        model_kd_epochs=tune_args.model_kd_epochs,
+        model_kd_teacher=tune_args.model_kd_teacher,
     )
     logger.info(f"Quantization config:\n{json.dumps(quant_config.to_dict(), indent=2)}")
 
@@ -261,6 +280,16 @@ def main():
     except Exception as e:
         logger.error(f"Evaluation failed: {e}")
         raise RuntimeError(f"Evaluation failed: {e}") from e
+
+    if quant_config.cache_dir:
+        ledger = append_ledger(quant_config.cache_dir, {
+            "config": quant_config.to_dict(),
+            "eval": {"ppl_task": eval_args.ppl_task, "zeroshot_task": eval_args.zeroshot_task,
+                     "num_fewshot": eval_args.num_fewshot, "limit": eval_args.limit},
+            "qmodel_path": model_args.qmodel_path,
+            "results": results,
+        })
+        logger.info(f"Appended results to {ledger}")
 
 
 if __name__ == "__main__":

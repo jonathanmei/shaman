@@ -4,7 +4,6 @@
 import inspect
 import os
 import time
-from collections import OrderedDict
 from typing import Any, Dict, List
 
 import torch
@@ -216,29 +215,10 @@ class ParameterWrapper(nn.Module):
 def get_compressed_state_dict(model: nn.Module):
     """
     Generates a state_dict, forcing NanoQuantLinear modules to use their
-    custom packing logic.
+    custom packing logic (shared with the block checkpoints, see ``core.resume``).
     """
-    from ..modules.linear import NanoQuantLinear
-
-    final_state_dict = OrderedDict()
-
-    # 1. First add parameters from modules that are not custom layers
-    for name, param in model.named_parameters():
-        module_path = name.rsplit('.', 1)[0]
-        try:
-            module = model.get_submodule(module_path)
-            if not isinstance(module, NanoQuantLinear):
-                final_state_dict[name] = param.data
-        except AttributeError:
-            final_state_dict[name] = param.data
-
-    # 2. Iterate through custom modules and add using custom state_dict
-    for name, mod in model.named_modules():
-        if isinstance(mod, NanoQuantLinear):
-            module_state_dict = mod.state_dict(prefix=name + '.')
-            final_state_dict.update(module_state_dict)
-
-    return final_state_dict
+    from ..core.resume import compressed_state_dict
+    return compressed_state_dict(model)
 
 
 def _load_and_process_state_dict(checkpoint_path: str, dtype: torch.dtype) -> Dict[str, Any]:

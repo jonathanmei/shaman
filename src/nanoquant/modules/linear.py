@@ -339,8 +339,8 @@ class NanoQuantLinear(nn.Module):
             shape_key = prefix + f"{param_name}_shape"
             if packed_key in state_dict and shape_key in state_dict:
                 packed_val = state_dict.pop(packed_key)
-                shape = state_dict.pop(shape_key)
-                unpacked_tensor = binary_unpacker(packed_val).view(tuple(shape)).to(self.dtype)
+                shape = tuple(int(s) for s in state_dict.pop(shape_key))
+                unpacked_tensor = binary_unpacker(packed_val, shape).to(self.dtype)
                 setattr(self, param_name, nn.Parameter(unpacked_tensor, requires_grad=False))
 
         unpack_param("V")

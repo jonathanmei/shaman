@@ -102,6 +102,27 @@ Two optional extensions are available:
   (Scale-Binary-Scale-Binary-Scale, as the `dbf` ADMM does), so the deployed form equals the ADMM solution
   exactly. The rank budget accounts for the extra 16-bit scale automatically.
 
+### Caching and Resuming
+
+Every stage writes content-addressed artifacts under `--cache_dir` (default `cache/`, gitignored; `""` disables):
+
+| stage | key depends on | reuse |
+|---|---|---|
+| calibration statistics | model, data, seed, `calib_strategy`, `curvature`, `kron_nkp_iters` | shrinkage sweeps reuse the raw stats |
+| per-layer ADMM solution | bytes of the weight matrix and curvature tensors, rank, `admm_*` | any layer whose inputs are bit-identical (resume, tuning/KD-only sweeps, `tune_nonfact` off) |
+| block checkpoints | calibration key + shrinkage + bits + ADMM + tuning settings, chained per block | an interrupted run resumes at the first unfinished block (`--checkpoint_every_blocks`) |
+| pre-KD model | last block key | KD-only sweeps skip calibration and block reconstruction |
+| KD epochs | pre-KD model + `model_kd_*` | resume at the next epoch |
+
+Results of every evaluation are appended to `cache/results.jsonl` (config, keys, results, git commit, Slurm job id).
+Keys include a fingerprint of the implementing source files, so code changes invalidate stale artifacts. To start
+from scratch, delete the relevant `cache/<kind>/` directory.
+
+The teacher logits used by the model-level KD can be held in host RAM (`--model_kd_teacher ram`, legacy; ~0.6 GB
+per 2048-token sample for a 150k vocabulary), recomputed from the FP teacher at every step (`online`, no extra
+memory, about 30 % more KD time), or memmapped to `cache/teacher/` (`disk`, reusable across runs on the same
+model and data).
+
 ### Very Large Models (>70B)
 
 For models that may not fit in CPU memory, use `--device_map auto` to enable GPU+CPU offloading:
@@ -130,7 +151,7 @@ bash bench_decode.sh
 ### Tests
 
 ```bash
-PYTHONPATH=src uv run --no-project --with pytest --with numpy --with tqdm \
+PYTHONPATH=src uv run --no-project --with pytest --with numpy --with tqdm --with packaging \
   --with torch --index https://download.pytorch.org/whl/cpu pytest tests/ -q
 ```
 

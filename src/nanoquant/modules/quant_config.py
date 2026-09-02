@@ -19,6 +19,9 @@ def NanoQuantConfig(
     kron_eigh_dtype: str = "float64",
     seqlen: int = 2048,
     device_map: str = "cpu",
+    # stage-level artifact cache / resume ("" disables)
+    cache_dir: str = "cache",
+    checkpoint_every_blocks: int = 1,
     # tune_nonfact
     tune_nonfact: bool = True,
     nonfact_lr: float = 1e-4,
@@ -44,6 +47,8 @@ def NanoQuantConfig(
     model_kd_lr: float = 1e-5,
     model_kd_batch_size: int = 1,
     model_kd_epochs: int = 8,
+    # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)
+    model_kd_teacher: str = "ram",
 ) -> dict:
     return {
         # model id
@@ -62,6 +67,9 @@ def NanoQuantConfig(
         "kron_eigh_dtype": kron_eigh_dtype,
         "seqlen": seqlen,
         "device_map": device_map,
+        # cache / resume
+        "cache_dir": cache_dir,
+        "checkpoint_every_blocks": checkpoint_every_blocks,
         # tune_nonfact
         "tune_nonfact": tune_nonfact,
         "nonfact_lr": nonfact_lr,
@@ -87,4 +95,5 @@ def NanoQuantConfig(
         "model_kd_lr": model_kd_lr,
         "model_kd_batch_size": model_kd_batch_size,
         "model_kd_epochs": model_kd_epochs,
+        "model_kd_teacher": model_kd_teacher,
     }

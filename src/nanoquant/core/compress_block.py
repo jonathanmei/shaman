@@ -11,6 +11,7 @@ from ..optimi import AdamW
 from .admm_dbf import factorize_admm_dbf
 from .admm_nq import factorize_admm_nanoquant
 from ..modules.linear import NanoQuantLinear
+from ..utils.cache import ArtifactCache, admm_key
 from ..utils.utils import cleanup_memory, find_layers, set_seed
 
 
@@ -99,17 +100,25 @@ def tune_nonfact(block, block_inputs, block_target_outputs, importance, kwargs, 
     del params, optimizer
 
 
+def _to_device(results: dict, device) -> dict:
+    return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in results.items()}
+
+
 @torch.no_grad()
-def factorize_and_replace(layer, name, rank, quant_config):
+def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache | None = None):
     """
     Factorizes and replaces a submodule with a quantized version (NanoQuantLinear).
+
+    When ``cache`` is enabled the ADMM solution is memoised under a content-addressed key
+    (weight bytes + curvature tensors + ADMM settings), so bit-identical inputs never re-run ADMM.
+    Returns ``(new_module, factor_results)``; ``factor_results.cache_hit`` records whether the memo hit.
     """
     set_seed(quant_config['seed'])
     lx_orig = find_layers(layer)[name]
     original_weight = lx_orig.weight.data.clone()
     weight_for_factorization = original_weight.clone()
     new_module = lx_orig
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- 1. Iterative Factorization and Module Conversion ---
     W_res = weight_for_factorization.clone()
@@ -120,22 +129,37 @@ def factorize_and_replace(layer, name, rank, quant_config):
     # Dense Kronecker curvature factors are present only when calibrated with curvature='kron'
     i_cov = getattr(lx_orig, 'i_cov', None)
     o_cov = getattr(lx_orig, 'o_cov', None)
-    if quant_config['admm_type'] == 'dbf':
-        if i_cov is not None or o_cov is not None:
-            raise ValueError("curvature='kron' is only supported with admm_type='nanoquant'")
-        factor_results = factorize_admm_dbf(W_res.to(device), lx_orig.i_norm.to(device), lx_orig.o_norm.to(device),
-                                            mid_rank=rank, iters=quant_config['admm_outer_iters'],
-                                            is_transpose=is_transpose)
-    elif quant_config['admm_type'] == 'nanoquant':
-        eigh_dtype = getattr(torch, quant_config.get('kron_eigh_dtype', 'float64'))
-        factor_results = factorize_admm_nanoquant(
-            W_res.to(device), lx_orig.i_norm.to(device), lx_orig.o_norm.to(device), mid_rank=rank,
-            outer_iters=quant_config['admm_outer_iters'], inner_iters=quant_config['admm_inner_iters'],
-            is_transpose=is_transpose, rho_scheduler=quant_config['admm_penalty_scheduler'],
-            print_admm_steps=quant_config['admm_print_steps'],
-            i_cov=None if i_cov is None else i_cov.to(device),
-            o_cov=None if o_cov is None else o_cov.to(device),
-            eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)))
+
+    memo_key = None
+    factor_results = None
+    if cache is not None and cache.enabled:
+        memo_key = admm_key(W_res, lx_orig.i_norm, lx_orig.o_norm, i_cov, o_cov, rank, quant_config)
+        cached = cache.load("admm", memo_key)
+        if cached is not None:
+            factor_results = _to_device(cached, device)
+    cache_hit = factor_results is not None
+
+    if factor_results is None:
+        if quant_config['admm_type'] == 'dbf':
+            if i_cov is not None or o_cov is not None:
+                raise ValueError("curvature='kron' is only supported with admm_type='nanoquant'")
+            factor_results = factorize_admm_dbf(W_res.to(device), lx_orig.i_norm.to(device), lx_orig.o_norm.to(device),
+                                                mid_rank=rank, iters=quant_config['admm_outer_iters'],
+                                                is_transpose=is_transpose)
+        elif quant_config['admm_type'] == 'nanoquant':
+            eigh_dtype = getattr(torch, quant_config.get('kron_eigh_dtype', 'float64'))
+            factor_results = factorize_admm_nanoquant(
+                W_res.to(device), lx_orig.i_norm.to(device), lx_orig.o_norm.to(device), mid_rank=rank,
+                outer_iters=quant_config['admm_outer_iters'], inner_iters=quant_config['admm_inner_iters'],
+                is_transpose=is_transpose, rho_scheduler=quant_config['admm_penalty_scheduler'],
+                print_admm_steps=quant_config['admm_print_steps'],
+                i_cov=None if i_cov is None else i_cov.to(device),
+                o_cov=None if o_cov is None else o_cov.to(device),
+                eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)))
+        else:
+            raise ValueError(f"Unknown admm_type: {quant_config['admm_type']}")
+        if memo_key is not None:
+            cache.save("admm", memo_key, _to_device(factor_results, "cpu"))
     admm_time = time.time() - admm_time
     # The dense factors are no longer needed for this layer: free the memory.
     for buf_name in ('i_cov', 'o_cov'):
@@ -145,6 +169,7 @@ def factorize_and_replace(layer, name, rank, quant_config):
 
     # Assemble final factorization results
     final_factor_results = argparse.Namespace(**factor_results)
+    final_factor_results.cache_hit = cache_hit
 
     # Replace module class and convert
     do_tuning = quant_config['tune_fact']
@@ -160,8 +185,9 @@ def factorize_and_replace(layer, name, rank, quant_config):
     per_el_error = recon_error_raw / W_res.numel()
     if original_norm_sq > 0:
         normalized_error = recon_error_raw / original_norm_sq
+        tag = " (memo hit)" if cache_hit else ""
         print(
-            f"\t\tADMM weight recon error: raw={recon_error_raw:.4f}, norm={normalized_error:.4f}, per_el={per_el_error:.4e}, ADMM time={admm_time:.2f}s"
+            f"\t\tADMM weight recon error: raw={recon_error_raw:.4f}, norm={normalized_error:.4f}, per_el={per_el_error:.4e}, ADMM time={admm_time:.2f}s{tag}"
         )
 
     del original_weight, W_res, lx_orig

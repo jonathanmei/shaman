@@ -10,6 +10,7 @@ base_dir = "~/code"  # remote parent dir; project checks out to base_dir/<repo>
 # Command the job runs, from the project root on the cluster.
 # Default: Qwen3-0.6B smoke test with Kronecker curvature + middle scale (fits the 30-min `short` partition).
 # Override per submission with `objob submit -- uv run nanoquant configs/<experiment>.json`.
+# Full 0.6B runs: `--partition gpus --time 04:00:00 --mem 128G` (online KD teacher; 200G with model_kd_teacher=ram).
 command = "uv run nanoquant configs/qwen3_0p6b_smoke_kron.json"
 partition = "short"   # short (30 min) | cpus / gpus / cgpus (4 h) | notebooks
 time = "00:30:00"     # walltime; must fit the partition limit
@@ -19,3 +20,5 @@ nodes = 1
 gres = "gpu:a100:1"
 job_name = "nanoquant-kron"
 log_dir = ".objob/logs"
+# Requeue on node failure / preemption; the pipeline resumes from its stage cache (`cache/`).
+extra_sbatch = ["#SBATCH --requeue"]

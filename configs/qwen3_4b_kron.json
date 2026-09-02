@@ -12,6 +12,8 @@
   "kron_nkp_iters": 3,
   "kron_stats_device": "cpu",
   "kron_eigh_dtype": "float64",
+  "cache_dir": "cache",
+  "checkpoint_every_blocks": 1,
   "tune_nonfact": true,
   "nonfact_lr": 1e-4,
   "nonfact_batch_size": 4,
@@ -29,6 +31,8 @@
   "tune_model": true,
   "model_kd_lr": 1e-6,
   "model_kd_batch_size": 1,
+  "model_kd_epochs": 8,
+  "model_kd_teacher": "online",
   "ppl_task": "wikitext2",
   "zeroshot_task": "boolq,piqa,hellaswag,winogrande,arc_easy,arc_challenge"
 }
