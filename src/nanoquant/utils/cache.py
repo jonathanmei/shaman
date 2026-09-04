@@ -20,10 +20,12 @@ code changes invalidate stale artifacts automatically.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -160,12 +162,22 @@ def admm_key(W: torch.Tensor, i_norm: torch.Tensor, o_norm: torch.Tensor, i_cov:
 
 
 def atomic_save(obj: Any, path: Path) -> None:
-    """``torch.save`` to ``path`` via a temporary file and an atomic rename."""
+    """``torch.save`` to ``path`` via a uniquely named temporary file and an atomic rename.
+
+    The temporary name is unique per call so that concurrent jobs saving the same artifact (e.g. the shared
+    calibration statistics) never rename each other's half-written file away; the last rename wins.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save(obj, tmp)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    os.close(fd)
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
 
 
 class ArtifactCache:

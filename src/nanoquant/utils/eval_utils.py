@@ -3,9 +3,8 @@
 
 import json
 
-import torch.nn as nn
 import torch
-from lm_eval.evaluator import simple_evaluate
+import torch.nn as nn
 from tqdm import tqdm
 
 
@@ -65,7 +64,10 @@ def evaluate_ppl(model, testenc, dev, dataset_name, args=None, verbose=True):
         outputs = model(batch, use_cache=False)
         logits = outputs.logits
 
-        shift_logits = logits[:, :-1, :].contiguous()
+        # Cross-entropy in float32: on bf16 logits the loss itself is rounded to bf16 (spacing 1/64 near 3.3),
+        # which quantises the reported perplexity to steps of ~0.003 and can make different models print the
+        # same value.
+        shift_logits = logits[:, :-1, :].float().contiguous()
         shift_labels = batch[:, 1:].contiguous()
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
@@ -141,6 +143,9 @@ def evaluate_model(
         task_names = [task for task in tasks_str.split(',') if task.strip()]
         if task_names:
             print(f"[INFO] Starting zero-shot evaluation for tasks: {', '.join(task_names)}")
+
+            # heavy dependency, imported only when zero-shot tasks actually run
+            from lm_eval.evaluator import simple_evaluate
 
             harness_results = simple_evaluate(
                 model="hf",

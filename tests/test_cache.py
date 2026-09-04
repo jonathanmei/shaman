@@ -149,3 +149,25 @@ def test_config_defaults_for_cache_fields():
     assert cfg["cache_dir"] == "cache"
     assert cfg["checkpoint_every_blocks"] == 1
     assert cfg["model_kd_teacher"] == "ram"
+
+
+def test_atomic_save_survives_a_concurrent_save_to_the_same_path(tmp_path, monkeypatch):
+    """Two processes saving the same artifact must not trip over each other's temporary file.
+
+    Simulated by letting a second ``atomic_save`` to the same path complete in the middle of the first one's
+    write; with a fixed temporary filename the first rename then fails with FileNotFoundError.
+    """
+    target = tmp_path / "artifact.pt"
+    real_save = C.torch.save
+    state = {"nested": False}
+
+    def racing_save(obj, path, *a, **kw):
+        real_save(obj, path, *a, **kw)
+        if not state["nested"]:
+            state["nested"] = True
+            C.atomic_save({"who": "second"}, target)
+
+    monkeypatch.setattr(C.torch, "save", racing_save)
+    C.atomic_save({"who": "first"}, target)
+    assert torch.load(target, weights_only=False)["who"] in ("first", "second")
+    assert [q.name for q in tmp_path.iterdir()] == ["artifact.pt"]  # no temporary files left behind
