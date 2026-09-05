@@ -76,6 +76,23 @@ def test_block_checkpoint_round_trip(tmp_path, mid_scale):
     assert torch.equal(fresh.mlp.up_proj.U, block.mlp.up_proj.U)
 
 
+def test_block_checkpoint_round_trip_retains_latents_for_kd():
+    torch.manual_seed(1)
+    block = _Block().to(torch.bfloat16)
+    lin = block.mlp.up_proj
+    lin.__class__ = NanoQuantLinear
+    lin.__quant_convert__(do_train=True, rank=RANK,
+                          factor_results=_synthetic_factors(lin.out_features, lin.in_features, RANK, False))
+    lin.finalize()
+    state = resume.block_state(block)
+
+    fresh = _Block().to(torch.bfloat16)
+    resume.restore_block(fresh, state)
+    assert hasattr(fresh.mlp.up_proj, "U_latent") and hasattr(fresh.mlp.up_proj, "V_latent")
+    assert torch.equal(fresh.mlp.up_proj.U_latent, block.mlp.up_proj.U_latent)
+    assert torch.equal(fresh.mlp.up_proj.V_latent, block.mlp.up_proj.V_latent)
+
+
 def test_restore_prefix_uses_progress_and_chain(tmp_path):
     cfg = NanoQuantConfig(model_id="tiny", num_calib_samples=2, seqlen=8)
     cache = ArtifactCache(tmp_path)
@@ -152,6 +169,24 @@ def test_factorize_and_replace_memoises_admm(tmp_path, monkeypatch):
 
     compress_block.factorize_and_replace(make_block(), "mlp.up_proj", RANK, cfg, cache=None)
     assert calls["n"] == 3  # cache disabled -> always compute
+
+
+def test_factorize_and_replace_threads_admm_reg(monkeypatch):
+    cfg = NanoQuantConfig(model_id="tiny", admm_reg=0.123, tune_fact=False)
+    block = _Block(d=8, hidden=6)
+    lin = block.mlp.up_proj
+    lin.register_buffer("i_norm", torch.ones(lin.in_features), persistent=False)
+    lin.register_buffer("o_norm", torch.ones(lin.out_features), persistent=False)
+    seen = {}
+
+    def fake_factorize(W, i_norm, o_norm, mid_rank, **kwargs):
+        seen["reg"] = kwargs["reg"]
+        return vars(_synthetic_factors(W.shape[0], W.shape[1], mid_rank, mid_scale=False))
+
+    monkeypatch.setattr(compress_block, "factorize_admm_nanoquant", fake_factorize)
+    compress_block.factorize_and_replace(block, "mlp.up_proj", RANK, cfg, cache=None)
+
+    assert seen["reg"] == pytest.approx(0.123)
 
 
 class _TinyLM(nn.Module):

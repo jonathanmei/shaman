@@ -79,7 +79,8 @@ def restore_block(block: nn.Module, state: dict) -> None:
             if base + "V_packed" in state:
                 module.__class__ = NanoQuantLinear
                 rank = int(state[base + "V_shape"][0])
-                module.init_for_inference(rank=rank, has_scale_mid=(base + "scale_mid") in state)
+                module.init_for_inference(rank=rank, has_scale_mid=(base + "scale_mid") in state,
+                                          has_latent=(base + "V_latent") in state)
     result = block.load_state_dict(state, strict=False)
     # the packed V/U are consumed by the custom loader and therefore reported as "missing" by torch
     missing = [k for k in result.missing_keys if not (k.endswith((".V", ".U")) or k in ("V", "U"))]

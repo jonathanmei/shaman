@@ -20,6 +20,14 @@ def fused_weighted_mse(pred, tgt, importance):
     return ((pred.float() - tgt.float()).square() * importance).sum()
 
 
+@torch.jit.script
+def fused_weighted_mahalanobis(pred, tgt, curvature):
+    """Dense output-feature quadratic loss for block reconstruction errors."""
+    error = (pred.float() - tgt.float()).reshape(-1, pred.size(-1))
+    curvature = curvature.float()
+    return ((error @ curvature) * error).sum()
+
+
 def get_param_group_config(target_module, binary_lr=1e-5, scale_lr=1e-5, bias_lr=1e-5):
     """
     Get the parameter group config for the optimizer.
@@ -50,11 +58,12 @@ def get_param_group_config(target_module, binary_lr=1e-5, scale_lr=1e-5, bias_lr
 
 
 @torch.enable_grad()
-def tune_nonfact(block, block_inputs, block_target_outputs, importance, kwargs, quant_config):
+def tune_nonfact(block, block_inputs, block_target_outputs, importance, kwargs, quant_config,
+                 importance_cov=None):
     # set random seed
     set_seed(quant_config['seed'])
     # get hyperparams
-    device = "cuda"
+    device = block_target_outputs.device
     numel = block_target_outputs.numel()
     batch_size = quant_config['nonfact_batch_size']
     epochs = quant_config['nonfact_epochs']
@@ -79,7 +88,10 @@ def tune_nonfact(block, block_inputs, block_target_outputs, importance, kwargs, 
             idx = data_idx[i].item()
             # get output and loss
             y = block(block_inputs[idx:idx + 1], **kwargs)[0]
-            loss = fused_weighted_mse(y, block_target_outputs[idx:idx + 1], importance)
+            if importance_cov is None:
+                loss = fused_weighted_mse(y, block_target_outputs[idx:idx + 1], importance)
+            else:
+                loss = fused_weighted_mahalanobis(y, block_target_outputs[idx:idx + 1], importance_cov)
             # backprop
             (loss / batch_size).backward()
             # gradient update
@@ -151,6 +163,7 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
             factor_results = factorize_admm_nanoquant(
                 W_res.to(device), lx_orig.i_norm.to(device), lx_orig.o_norm.to(device), mid_rank=rank,
                 outer_iters=quant_config['admm_outer_iters'], inner_iters=quant_config['admm_inner_iters'],
+                reg=quant_config['admm_reg'],
                 is_transpose=is_transpose, rho_scheduler=quant_config['admm_penalty_scheduler'],
                 print_admm_steps=quant_config['admm_print_steps'],
                 i_cov=None if i_cov is None else i_cov.to(device),
@@ -197,11 +210,12 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
 
 
 @torch.enable_grad()
-def tune_fact(block, target_linear, block_inputs, block_target_outputs, importance, kwargs, quant_config):
+def tune_fact(block, target_linear, block_inputs, block_target_outputs, importance, kwargs, quant_config,
+              importance_cov=None):
     # set random seed
     set_seed(quant_config['seed'])
     # get hyperparams
-    device = "cuda"
+    device = block_target_outputs.device
     numel = block_target_outputs.numel()
     batch_size = quant_config['fact_batch_size']
     epochs = quant_config['fact_epochs']
@@ -222,7 +236,10 @@ def tune_fact(block, target_linear, block_inputs, block_target_outputs, importan
             idx = data_idx[i].item()
             # get output and loss
             y = block(block_inputs[idx:idx + 1], **kwargs)[0]
-            loss = fused_weighted_mse(y, block_target_outputs[idx:idx + 1], importance)
+            if importance_cov is None:
+                loss = fused_weighted_mse(y, block_target_outputs[idx:idx + 1], importance)
+            else:
+                loss = fused_weighted_mahalanobis(y, block_target_outputs[idx:idx + 1], importance_cov)
             # backprop
             (loss / batch_size).backward()
             # gradient update

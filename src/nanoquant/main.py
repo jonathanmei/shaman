@@ -64,6 +64,11 @@ class QuantArguments:
             "choices": ["online", "two_phase", "dbf", "none"],
         },
     )
+    block_loss: str = field(
+        default="diag",
+        metadata={"help": "Block reconstruction loss: 'diag' or dense 'mahalanobis' (requires curvature=kron)",
+                  "choices": ["diag", "mahalanobis"]},
+    )
     curvature: str = field(
         default="diag",
         metadata={
@@ -128,6 +133,11 @@ class TuneArguments:
     fact_epochs: int = field(default=8, metadata={"help": "Epochs for factorized tuning"})
     tune_model: bool = field(default=True, metadata={"help": "Perform model-level KD tuning"})
     model_kd_lr: float = field(default=1e-5, metadata={"help": "LR for model knowledge distillation"})
+    model_kd_latent_lr: float = field(default=1e-6, metadata={"help": "LR for latent binary parameters during KD"})
+    model_kd_mode: str = field(
+        default="scales",
+        metadata={"help": "KD parameters: scales or scales_latent", "choices": ["scales", "scales_latent"]},
+    )
     model_kd_batch_size: int = field(default=1, metadata={"help": "Batch size for model KD"})
     model_kd_epochs: int = field(default=8, metadata={"help": "Epochs for model KD"})
     model_kd_teacher: str = field(
@@ -209,6 +219,7 @@ def main():
         calib_dataset=quant_args.calib_dataset,
         calib_shrinkage=quant_args.calib_shrinkage,
         calib_strategy=quant_args.calib_strategy,
+        block_loss=quant_args.block_loss,
         curvature=quant_args.curvature,
         kron_nkp_iters=quant_args.kron_nkp_iters,
         kron_stats_device=quant_args.kron_stats_device,
@@ -237,6 +248,8 @@ def main():
         fact_epochs=tune_args.fact_epochs,
         tune_model=tune_args.tune_model,
         model_kd_lr=tune_args.model_kd_lr,
+        model_kd_latent_lr=tune_args.model_kd_latent_lr,
+        model_kd_mode=tune_args.model_kd_mode,
         model_kd_batch_size=tune_args.model_kd_batch_size,
         model_kd_epochs=tune_args.model_kd_epochs,
         model_kd_teacher=tune_args.model_kd_teacher,

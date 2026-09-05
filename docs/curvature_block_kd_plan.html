@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dense Curvature Through Block Tuning and KD</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18211d;
+      --muted: #5d6b63;
+      --paper: #f4f1e8;
+      --panel: #fffdf7;
+      --line: #d7d1c3;
+      --green: #155f4a;
+      --green-soft: #dcebe3;
+      --amber: #9a5b16;
+      --amber-soft: #f6e8cf;
+      --blue: #315d8a;
+      --blue-soft: #e2ebf3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 16px/1.58 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(1120px, calc(100% - 40px)); margin: 48px auto 80px; }
+    header { border-top: 8px solid var(--green); padding: 34px 0 22px; }
+    h1, h2, h3 { font-family: Georgia, "Times New Roman", serif; line-height: 1.12; }
+    h1 { max-width: 850px; margin: 0 0 14px; font-size: clamp(2.25rem, 6vw, 4.5rem); letter-spacing: -0.04em; }
+    h2 { margin: 0 0 18px; font-size: 2rem; }
+    h3 { margin: 0 0 8px; font-size: 1.25rem; }
+    p { margin: 0 0 14px; }
+    code { background: #ebe6da; padding: .08em .32em; border-radius: 4px; font-size: .92em; }
+    .dek { max-width: 790px; color: var(--muted); font-size: 1.16rem; }
+    .stamp { margin-top: 18px; color: var(--muted); font-size: .88rem; letter-spacing: .06em; text-transform: uppercase; }
+    section { margin-top: 28px; padding: 28px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .card { padding: 20px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+    .label { display: inline-block; margin-bottom: 10px; padding: 3px 9px; border-radius: 999px; font-size: .78rem; font-weight: 750; letter-spacing: .04em; text-transform: uppercase; }
+    .easy { color: var(--green); background: var(--green-soft); }
+    .moderate { color: var(--amber); background: var(--amber-soft); }
+    .finding { color: var(--blue); background: var(--blue-soft); }
+    .callout { padding: 18px 20px; border-left: 5px solid var(--amber); background: var(--amber-soft); }
+    .equation { overflow-x: auto; margin: 18px 0; padding: 15px 18px; background: #18211d; color: #f7f3e8; border-radius: 8px; font: 1rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    ul, ol { margin: 10px 0 0; padding-left: 1.25rem; }
+    li + li { margin-top: 7px; }
+    table { width: 100%; border-collapse: collapse; font-size: .94rem; }
+    th, td { padding: 12px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: .78rem; letter-spacing: .05em; text-transform: uppercase; }
+    .phase { display: grid; grid-template-columns: 80px 1fr; gap: 18px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+    .phase:last-child { border-bottom: 0; }
+    .phase-num { color: var(--green); font: 700 2rem/1 Georgia, serif; }
+    .metric-groups { columns: 2; column-gap: 34px; }
+    .metric-groups > div { break-inside: avoid; margin-bottom: 22px; }
+    .small { color: var(--muted); font-size: .9rem; }
+    @media (max-width: 760px) {
+      main { width: min(100% - 24px, 1120px); margin-top: 20px; }
+      .grid { grid-template-columns: 1fr; }
+      .metric-groups { columns: 1; }
+      section { padding: 20px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Carry dense curvature past ADMM—or let KD reshape the binaries?</h1>
+    <p class="dek">A deliberately compact plan to locate where the dense NKP–Shampoo advantage is lost: in block reconstruction, in global distillation, or at the transition between continuous latent and hardened binary factors.</p>
+    <p class="stamp">NanoQuant · Qwen3 · two-scale path · 5 September 2026</p>
+  </header>
+
+  <section>
+    <h2>Decision summary</h2>
+    <div class="grid">
+      <article class="card">
+        <span class="label easy">Low code difficulty</span>
+        <h3>Mahalanobis block loss</h3>
+        <p>Replace the feature-diagonal weighted MSE with a dense quadratic form using the shrunk <code>o_cov</code> from <code>mlp.down_proj</code>. The necessary matrix already exists.</p>
+        <p class="small">Engineering risk is low-to-moderate; runtime overhead is moderate because each loss evaluation adds a hidden-size square matrix multiply.</p>
+      </article>
+      <article class="card">
+        <span class="label moderate">Moderate difficulty</span>
+        <h3>Scale + latent KD</h3>
+        <p>The optimizer change is small, but binary/latent mode transitions must be made explicit. The present scale-only path also needs a correctness control before its result can be trusted.</p>
+        <p class="small">Expect changes to parameter selection, STE state, final hardening, cache keys, checkpoint restore, and logging.</p>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>1. Dense curvature during block tuning</h2>
+    <p>For a token-level block-output error <code>E</code> with shape <code>[tokens, hidden]</code>, use the output-side factor from the block’s <code>mlp.down_proj</code>:</p>
+    <div class="equation">L_diag = Σₜ Σⱼ E[t,j]² · diag(L)[j]
+L_dense = Σₜ E[t,:] · L · E[t,:]ᵀ</div>
+    <p>This is the correct reuse of the NKP factors at block output. The input-side factor <code>R</code> should not be applied again: the observed block errors already integrate over the sampled input activations. For Qwen-style residual blocks, the down-projection output is added directly to the residual stream, making its output-side gradient factor the natural available proxy.</p>
+
+    <h3>Implementation outline</h3>
+    <ol>
+      <li>Add a block-loss mode such as <code>block_loss = diag | mahalanobis</code> and include it in block cache keys.</li>
+      <li>Before factorization begins, retain <code>mlp.down_proj.o_cov</code> in a local block-level variable. Individual layer factors are currently deleted after ADMM to release memory.</li>
+      <li>Implement the dense loss in fp32 as <code>((E @ L) * E).sum()</code>. Symmetrize once, outside the training loop.</li>
+      <li>Use the raw shrunk factor, not its unit-diagonal correlation form. Its diagonal then exactly recovers the existing weighted-MSE convention, preserving trace and approximate learning-rate scale.</li>
+      <li>Use the same selected loss for both <code>tune_nonfact</code> and <code>tune_fact</code>; a mixed variant can wait unless the full change fails.</li>
+    </ol>
+
+    <div class="callout">
+      <strong>Cost caveat.</strong> The dense loss is <code>O(tokens × hidden²)</code> per optimization example and adds a similarly sized backward operation. It should be manageable for a diagnostic 0.6B/1.7B run, but benchmark one block before launching the full 4B matrix. A truncated eigenspace is the fallback if overhead is excessive.
+    </div>
+  </section>
+
+  <section>
+    <h2>2. Scale + latent global KD</h2>
+    <p>Adding latent parameters to the optimizer is straightforward, but the forward mode requires care. After block tuning, <code>finalize()</code> retains latent parameters while creating hardened <code>U/V</code>. Global KD then sets <code>do_train = True</code>; this selects <code>U_latent/V_latent</code>. Because <code>_binarized</code> remains true, the current “scale-only” KD forward uses the continuous latents rather than STE binaries. After KD it switches back to hardened <code>U/V</code>.</p>
+
+    <div class="callout">
+      <strong>Required control:</strong> first define a corrected scale-only mode whose forward always uses hardened <code>U/V</code>. Otherwise the scale-only versus scale+latent comparison changes two things at once and scales are optimized against a different model than the one evaluated.
+    </div>
+
+    <h3>Proposed KD modes</h3>
+    <table>
+      <thead><tr><th>Mode</th><th>Forward weights</th><th>Trainable parameters</th><th>End of KD</th></tr></thead>
+      <tbody>
+        <tr><td><code>none</code></td><td>Hardened U/V</td><td>None</td><td>No action</td></tr>
+        <tr><td><code>scales</code></td><td>Hardened U/V</td><td>Pre/post scales</td><td>Keep U/V; freeze scales</td></tr>
+        <tr><td><code>scales_latent</code></td><td>STE(sign(latent))</td><td>Latents + scales</td><td>Finalize every NanoQuantLinear, then evaluate</td></tr>
+      </tbody>
+    </table>
+
+    <p>Give latents their own learning rate—initially the existing factor binary LR or a conservative <code>1e-6</code>—and keep scale LR at <code>1e-6</code>. Add KD mode and latent LR to <code>KD_FIELDS</code> so incompatible checkpoints cannot collide. Checkpoint both parameter groups plus the mode state, and always evaluate the hardened model.</p>
+  </section>
+
+  <section>
+    <h2>Experiment permutations</h2>
+    <p>Use one seed initially. Run 0.6B first because it has a strong positive Kron signal, then repeat only the informative arms at 1.7B where the ordering currently flips after KD.</p>
+    <table>
+      <thead><tr><th>Arm</th><th>Block loss</th><th>Global KD</th><th>Question answered</th></tr></thead>
+      <tbody>
+        <tr><td>A — corrected baseline</td><td>Diagonal</td><td>Scales</td><td>How much of the current result is the latent/hardened forward mismatch?</td></tr>
+        <tr><td>B — curvature carried forward</td><td>Mahalanobis</td><td>Scales</td><td>Does curvature-aware block tuning preserve or amplify the ADMM gain?</td></tr>
+        <tr><td>C — binary repair</td><td>Diagonal</td><td>Scales + latent</td><td>Can global bit flips recover what scale-only KD cannot?</td></tr>
+        <tr><td>D — full treatment</td><td>Mahalanobis</td><td>Scales + latent</td><td>Are the two changes complementary or redundant?</td></tr>
+      </tbody>
+    </table>
+    <p class="small">Also evaluate the shared pre-KD checkpoint (“KD none”) once per block-loss mode. This is a diagnostic checkpoint, not another full reconstruction arm.</p>
+  </section>
+
+  <section>
+    <h2>Metrics to add</h2>
+    <div class="metric-groups">
+      <div>
+        <h3>At each block boundary</h3>
+        <ul>
+          <li>Held-out WikiText-2 PPL, as today.</li>
+          <li>Calibration diagonal block loss and dense Mahalanobis block loss, logged together regardless of optimized mode.</li>
+          <li>Optional small held-out reconstruction set with both losses to expose calibration overfitting.</li>
+          <li>Wall time and peak allocated/reserved CUDA memory per block.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>At each layer transition</h3>
+        <ul>
+          <li>Actual deployed two-scale Euclidean weight error—not only continuous <code>W_final</code> error.</li>
+          <li>Actual deployed Mahalanobis weight error using the same <code>L/R</code>.</li>
+          <li>Both errors after ADMM initialization and after factor tuning/hardening.</li>
+          <li>Dense-versus-diagonal loss ratio and optimization time.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>At every KD epoch</h3>
+        <ul>
+          <li>Training KL and calibration-token PPL.</li>
+          <li>Held-out PPL after hardening; select best epoch by this metric as well as report last epoch.</li>
+          <li>STE-forward versus hardened-forward KL/PPL gap before the epoch, after the update, and after finalization.</li>
+          <li>Scale relative drift and per-group gradient norms.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Latent-specific</h3>
+        <ul>
+          <li>Cumulative and per-epoch bit-flip fraction for U and V, overall and by layer type.</li>
+          <li>Latent sign margin: median <code>|latent|</code> and fraction below thresholds such as 0.01 and 0.1.</li>
+          <li>Number of layers with zero flips, to detect an ineffective latent LR.</li>
+          <li>Final PPL change per million flipped bits as a coarse efficiency measure.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Execution order and stopping rules</h2>
+    <div class="phase"><div class="phase-num">01</div><div><h3>Correct the control</h3><p>Implement explicit KD modes and compare current behavior, corrected hardened scale-only, and no KD from the same cached pre-KD model. Stop and reassess if corrected scale-only alone removes the 1.7B reversal.</p></div></div>
+    <div class="phase"><div class="phase-num">02</div><div><h3>Benchmark one block</h3><p>Implement dense block loss and measure overhead plus both reconstruction metrics on an early and late block. Use full dense loss if overhead is acceptable; otherwise retain the top eigenspace explaining roughly 95% of trace.</p></div></div>
+    <div class="phase"><div class="phase-num">03</div><div><h3>Run the 2 × 2 matrix at 0.6B</h3><p>Advance only variants that improve pre-KD PPL or final held-out PPL without a large hardening gap. Zero-shot evaluation is unnecessary at this screening stage.</p></div></div>
+    <div class="phase"><div class="phase-num">04</div><div><h3>Confirm at 1.7B</h3><p>Run the corrected baseline and the best one or two experimental arms. Only then spend on extra seeds or 4B.</p></div></div>
+  </section>
+
+  <section>
+    <h2>Independent fix included with this plan</h2>
+    <p><code>admm_reg</code> is now passed from the quantization configuration into <code>factorize_admm_nanoquant</code>. The cache key already included this field, so regularization sweeps will now both invalidate correctly and change the computation.</p>
+  </section>
+</main>
+</body>
+</html>

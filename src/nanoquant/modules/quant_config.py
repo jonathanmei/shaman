@@ -12,6 +12,7 @@ def NanoQuantConfig(
     calib_dataset: str = "wikitext2",
     calib_shrinkage: float = 0.4,
     calib_strategy: str = "online",
+    block_loss: str = "diag",
     # curvature estimate: "diag" (legacy per-feature second moments) or "kron" (nearest Kronecker product)
     curvature: str = "diag",
     kron_nkp_iters: int = 3,
@@ -47,8 +48,10 @@ def NanoQuantConfig(
     # tune_model
     tune_model: bool = True,
     model_kd_lr: float = 1e-5,
+    model_kd_latent_lr: float = 1e-6,
     model_kd_batch_size: int = 1,
     model_kd_epochs: int = 8,
+    model_kd_mode: str = "scales",
     # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)
     model_kd_teacher: str = "ram",
 ) -> dict:
@@ -63,6 +66,7 @@ def NanoQuantConfig(
         "calib_dataset": calib_dataset,
         "calib_shrinkage": calib_shrinkage,
         "calib_strategy": calib_strategy,
+        "block_loss": block_loss,
         "curvature": curvature,
         "kron_nkp_iters": kron_nkp_iters,
         "kron_stats_device": kron_stats_device,
@@ -96,7 +100,9 @@ def NanoQuantConfig(
         # tune_model
         "tune_model": tune_model,
         "model_kd_lr": model_kd_lr,
+        "model_kd_latent_lr": model_kd_latent_lr,
         "model_kd_batch_size": model_kd_batch_size,
         "model_kd_epochs": model_kd_epochs,
+        "model_kd_mode": model_kd_mode,
         "model_kd_teacher": model_kd_teacher,
     }

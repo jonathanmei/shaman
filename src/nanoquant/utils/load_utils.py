@@ -304,7 +304,8 @@ def load_compressed_model(model_name_or_path: str, checkpoint_path: str, seqlen:
                 if (base + "V") in sd or (base + "U") in sd:
                     module.__class__ = NanoQuantLinear
                     rank = sd[base + "V"].shape[0]
-                    module.init_for_inference(rank=rank, has_scale_mid=has_mid_scale)
+                    module.init_for_inference(rank=rank, has_scale_mid=has_mid_scale,
+                                              has_latent=(base + "V_latent") in sd)
 
     print("INFO: Converting layers to compressed format...")
     convert_layers(model)

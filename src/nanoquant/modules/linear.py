@@ -83,7 +83,7 @@ class NanoQuantLinear(nn.Module):
 
             setattr(self, name, param)
 
-    def init_for_inference(self, rank, has_scale_mid=False):
+    def init_for_inference(self, rank, has_scale_mid=False, has_latent=False):
         self.rank = rank
         self.do_train = False
         self._binarized = True
@@ -94,6 +94,10 @@ class NanoQuantLinear(nn.Module):
         self.register_parameter("weight", None)
 
         self._setup_path(factors=None)
+
+        if has_latent:
+            self.V_latent = nn.Parameter(torch.empty_like(self.V), requires_grad=False)
+            self.U_latent = nn.Parameter(torch.empty_like(self.U), requires_grad=False)
 
         if not has_scale_mid and hasattr(self, "scale_mid"):
             delattr(self, "scale_mid")

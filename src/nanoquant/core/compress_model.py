@@ -93,9 +93,15 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
         tuning_inputs = compressed_inputs.clone().detach()
         # get all linear layers
         sublayers = find_layers(q_block)
-        # get importance
+        block_loss = quant_config.get("block_loss", "diag")
+        if block_loss not in ("diag", "mahalanobis"):
+            raise ValueError(f"Unknown block_loss: {block_loss}")
+        # get importance. For a dense block loss, the output-side curvature of
+        # mlp.down_proj is the appropriate factor; the sampled block errors
+        # already include the input-activation distribution.
         # Try to get importance from common layer names, fall back to uniform
         importance_layer = sublayers.get('mlp.down_proj', sublayers.get('fc2', None))
+        importance_cov = None
         if importance_layer is None:
             # Fallback to uniform importance if expected layer not found
             importance = torch.ones(model.config.hidden_size, device=dev)
@@ -104,6 +110,13 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             importance = torch.ones(model.config.hidden_size, device=dev)
         else:
             importance = importance_layer.o_norm.to(dev)
+            if block_loss == "mahalanobis":
+                if not hasattr(importance_layer, 'o_cov'):
+                    raise ValueError("block_loss='mahalanobis' requires dense Kron curvature statistics")
+                importance_cov = importance_layer.o_cov.to(dev)
+                importance_cov = 0.5 * (importance_cov + importance_cov.mT)
+        if block_loss == "mahalanobis" and importance_cov is None:
+            raise ValueError("block_loss='mahalanobis' requires dense Kron curvature statistics")
         # move data to GPU
         tuning_inputs = tuning_inputs.to(dev)
         target_outputs = target_outputs.to(dev)
@@ -114,7 +127,8 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             # 1/3) tune non-factorized, full-precision weights to absorb quant error
             if quant_config['tune_nonfact']:
                 print(f"\t(1/3) Block {i+1}/{n_blocks}, {name} | Tuning Non-Factorized Weights...")
-                tune_nonfact(q_block, tuning_inputs, target_outputs, importance, kwargs, quant_config)
+                tune_nonfact(q_block, tuning_inputs, target_outputs, importance, kwargs, quant_config,
+                             importance_cov=importance_cov)
                 cleanup_memory()
             # 2/3) ADMM to factorize/initialize low-rank binary matrices and scales
             print(f"\t(2/3) Block {i+1}/{n_blocks}, {name} | Initialization via ADMM...")
@@ -127,7 +141,8 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             # 3/3) tune low-rank binary and scales
             if quant_config['tune_fact']:
                 print(f"\t(3/3) Block {i+1}/{n_blocks}, {name} | Tuning Factorized Weights...")
-                tune_fact(q_block, nano_linear, tuning_inputs, target_outputs, importance, kwargs, quant_config)
+                tune_fact(q_block, nano_linear, tuning_inputs, target_outputs, importance, kwargs, quant_config,
+                          importance_cov=importance_cov)
                 cleanup_memory()
             cleanup_memory()
         if cache is not None and cache.enabled:
@@ -147,6 +162,7 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
         q_blocks[i] = q_block.cpu()
 
         del q_block, fp_block, target_outputs
+        del importance_cov
         cleanup_memory()
 
         # checkpoint the reconstructed blocks and the activations entering block i+1
@@ -195,6 +211,10 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
         loss = -torch.sum(x * mask.view(-1), dim=0) / (torch.sum(mask.view(-1), dim=0) + 1e-8)
         return (temperature**2) * loss
 
+    kd_mode = quant_config.get("model_kd_mode", "scales")
+    if kd_mode not in ("scales", "scales_latent"):
+        raise ValueError(f"Unknown model_kd_mode: {kd_mode}")
+
     # set seed
     set_seed(quant_config['seed'])
     # load tokenizer
@@ -234,13 +254,28 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
     model.cuda()
 
     params_to_tune = []
+    scale_params = []
+    latent_params = []
     for module in model.modules():
         if isinstance(module, NanoQuantLinear):
-            module.do_train = True
+            # Scale-only KD must evaluate the same hardened U/V weights that
+            # will be used after KD. Latent KD explicitly enables STE mode.
+            module.do_train = kd_mode == "scales_latent"
+            if kd_mode == "scales_latent":
+                if not hasattr(module, "U_latent") or not hasattr(module, "V_latent"):
+                    raise ValueError("model_kd_mode='scales_latent' requires retained latent factors")
+                module._binarized = False
+            else:
+                module._binarized = True
             for name, param in module.named_parameters():
                 if 'scale' in name:
                     param.requires_grad = True
                     params_to_tune.append(param)
+                    scale_params.append(param)
+                elif kd_mode == "scales_latent" and "latent" in name:
+                    param.requires_grad = True
+                    params_to_tune.append(param)
+                    latent_params.append(param)
 
     print(f"Total number of scale parameters to tune: {len(params_to_tune)}")
     if not params_to_tune:
@@ -248,7 +283,13 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
         model.eval()
         return model
 
-    optimizer = AdamW(params_to_tune, lr=quant_config['model_kd_lr'])
+    if kd_mode == "scales_latent":
+        optimizer = AdamW([
+            {'params': scale_params, 'lr': quant_config['model_kd_lr']},
+            {'params': latent_params, 'lr': quant_config.get('model_kd_latent_lr', 1e-6)},
+        ])
+    else:
+        optimizer = AdamW(params_to_tune, lr=quant_config['model_kd_lr'])
     epochs = quant_config["model_kd_epochs"]
     total_steps = epochs * len(dataloader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
@@ -322,9 +363,15 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
     del params_to_tune, optimizer, scheduler, dataloader, samples, teacher
     cleanup_memory(verbose=True)
 
+    if kd_mode == "scales_latent":
+        for module in model.modules():
+            if isinstance(module, NanoQuantLinear):
+                module.finalize()
+
     for module in model.modules():
         if isinstance(module, NanoQuantLinear):
             module.do_train = False
+            module._binarized = True
 
     model.eval()
     return model

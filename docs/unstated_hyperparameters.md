@@ -40,7 +40,7 @@ stage epoch counts (8/8/8); $\tau$, $\lambda$, $\epsilon$ and the $\rho$ range a
 
 | # | knob | current value (code) | notes |
 |---|---|---|---|
-| 7 | ridge $\lambda$ | `reg = 3e-2`, added to the diagonal **relative to** the mean diagonal of $V^\top V$ (`_admm_solve_step`) | Eq. 5 has $(\rho+\lambda)I$ with absolute $\lambda$; value unstated. `admm_reg` config field is currently not threaded into the call (function default used) |
+| 7 | ridge $\lambda$ | `admm_reg = 3e-2`, added to the diagonal **relative to** the mean diagonal of $V^\top V$ (`_admm_solve_step`) | Eq. 5 has $(\rho+\lambda)I$ with absolute $\lambda$; value unstated. The configured value is threaded into the NanoQuant ADMM call. |
 | 8 | $\epsilon$ | `eps = 1e-12` (clamps on norms / stabiliser) | unstated |
 | 9 | $\rho$ range | `linear`: $\rho_t = t/K$, i.e. 0 → 0.9975, never reaching 1; stabiliser uses $\rho \cdot \overline{\mathrm{diag}} + \lambda$ | only "linear schedule" stated |
 | 10 | SVID power iterations | `inner_iters = 5` random-start power iterations per projection | unstated |
