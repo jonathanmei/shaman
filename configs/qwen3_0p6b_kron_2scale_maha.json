@@ -1,6 +1,6 @@
 {
   "model_id": "Qwen/Qwen3-0.6B-Base",
-  "qmodel_path": "checkpoints/qwen3_0p6b_kron_2scale.pt",
+  "qmodel_path": "checkpoints/qwen3_0p6b_kron_2scale_maha.pt",
   "seqlen": 2048,
   "bits": 1.0,
   "seed": 0,
@@ -9,7 +9,7 @@
   "calib_shrinkage": 0.2,
   "calib_strategy": "online",
   "curvature": "kron",
-  "block_loss": "diag",
+  "block_loss": "mahalanobis",
   "kron_nkp_iters": 3,
   "kron_stats_device": "cpu",
   "kron_eigh_dtype": "float64",
