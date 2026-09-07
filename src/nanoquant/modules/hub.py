@@ -50,6 +50,12 @@ class NanoQuantConfigDataclass:
     calib_shrinkage: float = 0.4
     calib_strategy: str = "online"
     block_loss: str = "diag"
+    # block-loss curvature conditioning (dense block loss only), see modules.quant_config
+    block_loss_cond_max: float = 0.0
+    block_loss_power: float = 1.0
+    block_loss_mix: float = 1.0
+    # block-loss curvature source: "nkp" (Kronecker output factor) or "plain" (unweighted gradient covariance)
+    block_loss_source: str = "nkp"
     # curvature estimate: "diag" (legacy per-feature second moments) or "kron" (nearest Kronecker product)
     curvature: str = "diag"
     kron_nkp_iters: int = 3
@@ -62,6 +68,8 @@ class NanoQuantConfigDataclass:
     # stage-level artifact cache / resume ("" disables)
     cache_dir: str = "cache"
     checkpoint_every_blocks: int = 1
+    # >0: reconstruct only the first N decoder blocks (screening); KD and the pre-KD model artifact are skipped
+    max_blocks: int = 0
     # tune_nonfact
     tune_nonfact: bool = True
     nonfact_lr: float = 1e-4
@@ -75,6 +83,9 @@ class NanoQuantConfigDataclass:
     admm_penalty_scheduler: str = "linear"
     admm_print_steps: bool = False
     admm_mid_scale: bool = False
+    # input-side curvature handed to ADMM: "calib" (calibration-time) or "fresh" (measured before binarisation)
+    admm_input_factor: str = "calib"
+    block_diagnostics: bool = False
     # tune_fact
     tune_fact: bool = True
     fact_binary_lr: float = 1e-5
@@ -82,6 +93,8 @@ class NanoQuantConfigDataclass:
     fact_bias_lr: float = 1e-5
     fact_batch_size: int = 1
     fact_epochs: int = 8
+    # keep the continuous latent factors (frozen) after block tuning; required by model_kd_mode="scales_latent"
+    retain_latent: bool = False
     # tune_model
     tune_model: bool = True
     model_kd_lr: float = 1e-5
@@ -89,6 +102,8 @@ class NanoQuantConfigDataclass:
     model_kd_batch_size: int = 1
     model_kd_epochs: int = 8
     model_kd_mode: str = "scales"
+    model_kd_latent_normalize: bool = False
+    model_kd_eval_every_epoch: bool = False
     # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)
     model_kd_teacher: str = "ram"
 

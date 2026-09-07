@@ -13,6 +13,14 @@ def NanoQuantConfig(
     calib_shrinkage: float = 0.4,
     calib_strategy: str = "online",
     block_loss: str = "diag",
+    # block-loss curvature conditioning (dense block loss only): condition-number cap by eigenvalue flooring
+    # (0 = off), spectral power tempering (1 = off) and mixing with the diagonal (1 = fully dense)
+    block_loss_cond_max: float = 0.0,
+    block_loss_power: float = 1.0,
+    block_loss_mix: float = 1.0,
+    # block-loss curvature source: "nkp" (output factor of the Kronecker fit of mlp.down_proj) or "plain"
+    # (unweighted, clipped covariance of the block-output gradient collected alongside it)
+    block_loss_source: str = "nkp",
     # curvature estimate: "diag" (legacy per-feature second moments) or "kron" (nearest Kronecker product)
     curvature: str = "diag",
     kron_nkp_iters: int = 3,
@@ -25,6 +33,8 @@ def NanoQuantConfig(
     # stage-level artifact cache / resume ("" disables)
     cache_dir: str = "cache",
     checkpoint_every_blocks: int = 1,
+    # >0: reconstruct only the first N decoder blocks (screening); KD and the pre-KD model artifact are skipped
+    max_blocks: int = 0,
     # tune_nonfact
     tune_nonfact: bool = True,
     nonfact_lr: float = 1e-4,
@@ -38,6 +48,11 @@ def NanoQuantConfig(
     admm_penalty_scheduler: str = "linear",
     admm_print_steps: bool = False,
     admm_mid_scale: bool = False,
+    # input-side curvature handed to ADMM: "calib" (calibration-time factor of the full-precision model) or "fresh"
+    # (plain second moment of the inputs actually reaching the layer, measured right before it is binarised)
+    admm_input_factor: str = "calib",
+    # log input-factor drift, Mahalanobis weight errors and the block-loss change of every ADMM solution
+    block_diagnostics: bool = False,
     # tune_fact
     tune_fact: bool = True,
     fact_binary_lr: float = 1e-5,
@@ -45,6 +60,8 @@ def NanoQuantConfig(
     fact_bias_lr: float = 1e-5,
     fact_batch_size: int = 1,
     fact_epochs: int = 8,
+    # keep the continuous latent factors (frozen) after block tuning; required by model_kd_mode="scales_latent"
+    retain_latent: bool = False,
     # tune_model
     tune_model: bool = True,
     model_kd_lr: float = 1e-5,
@@ -52,6 +69,10 @@ def NanoQuantConfig(
     model_kd_batch_size: int = 1,
     model_kd_epochs: int = 8,
     model_kd_mode: str = "scales",
+    # rescale each latent row to unit mean magnitude before KD (sign-preserving) so one lr means one flip budget
+    model_kd_latent_normalize: bool = False,
+    # evaluate held-out perplexity after every KD epoch
+    model_kd_eval_every_epoch: bool = False,
     # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)
     model_kd_teacher: str = "ram",
 ) -> dict:
@@ -67,6 +88,10 @@ def NanoQuantConfig(
         "calib_shrinkage": calib_shrinkage,
         "calib_strategy": calib_strategy,
         "block_loss": block_loss,
+        "block_loss_cond_max": block_loss_cond_max,
+        "block_loss_power": block_loss_power,
+        "block_loss_mix": block_loss_mix,
+        "block_loss_source": block_loss_source,
         "curvature": curvature,
         "kron_nkp_iters": kron_nkp_iters,
         "kron_stats_device": kron_stats_device,
@@ -77,6 +102,7 @@ def NanoQuantConfig(
         # cache / resume
         "cache_dir": cache_dir,
         "checkpoint_every_blocks": checkpoint_every_blocks,
+        "max_blocks": max_blocks,
         # tune_nonfact
         "tune_nonfact": tune_nonfact,
         "nonfact_lr": nonfact_lr,
@@ -90,6 +116,8 @@ def NanoQuantConfig(
         "admm_penalty_scheduler": admm_penalty_scheduler,
         'admm_print_steps': admm_print_steps,
         "admm_mid_scale": admm_mid_scale,
+        "admm_input_factor": admm_input_factor,
+        "block_diagnostics": block_diagnostics,
         # tune_fact
         "tune_fact": tune_fact,
         "fact_binary_lr": fact_binary_lr,
@@ -97,6 +125,7 @@ def NanoQuantConfig(
         "fact_bias_lr": fact_bias_lr,
         "fact_batch_size": fact_batch_size,
         "fact_epochs": fact_epochs,
+        "retain_latent": retain_latent,
         # tune_model
         "tune_model": tune_model,
         "model_kd_lr": model_kd_lr,
@@ -104,5 +133,7 @@ def NanoQuantConfig(
         "model_kd_batch_size": model_kd_batch_size,
         "model_kd_epochs": model_kd_epochs,
         "model_kd_mode": model_kd_mode,
+        "model_kd_latent_normalize": model_kd_latent_normalize,
+        "model_kd_eval_every_epoch": model_kd_eval_every_epoch,
         "model_kd_teacher": model_kd_teacher,
     }

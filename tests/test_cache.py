@@ -50,9 +50,13 @@ def test_chain_keys_track_block_level_fields_and_are_chained():
     assert keys == C.chain_keys(base, 3)
     assert keys[:2] == C.chain_keys(base, 2)  # prefix stability
     assert keys == C.chain_keys(_cfg(model_kd_lr=1.0, tune_model=False, ppl_task="x"), 3)  # KD/eval irrelevant
+    assert keys == C.chain_keys(_cfg(max_blocks=2), 3)  # a screening run shares the full chain's checkpoints
+    assert keys == C.chain_keys(_cfg(block_diagnostics=True), 3)  # logging only
     for field, value in (("calib_shrinkage", 0.9), ("bits", 0.8), ("block_loss", "mahalanobis"),
                          ("admm_outer_iters", 7), ("admm_mid_scale", True),
-                         ("fact_epochs", 1), ("tune_nonfact", False), ("curvature", "kron")):
+                         ("fact_epochs", 1), ("tune_nonfact", False), ("curvature", "kron"), ("block_loss_source", "plain"),
+                         ("retain_latent", True), ("block_loss_cond_max", 10.0), ("block_loss_power", 0.5),
+                         ("block_loss_mix", 0.5), ("admm_input_factor", "fresh")):
         assert keys[0] != C.chain_keys(_cfg(**{field: value}), 3)[0], field
 
 
@@ -61,6 +65,8 @@ def test_kd_and_teacher_keys():
     assert C.kd_key(base, 3) != C.kd_key(_cfg(model_kd_lr=1.0), 3)
     assert C.kd_key(base, 3) != C.kd_key(_cfg(model_kd_mode="scales_latent"), 3)
     assert C.kd_key(base, 3) != C.kd_key(_cfg(model_kd_latent_lr=2e-6), 3)
+    assert C.kd_key(base, 3) != C.kd_key(_cfg(model_kd_latent_normalize=True), 3)
+    assert C.kd_key(base, 3) == C.kd_key(_cfg(model_kd_eval_every_epoch=True), 3)  # diagnostics only
     assert C.kd_key(base, 3) != C.kd_key(_cfg(admm_outer_iters=7), 3)  # depends on the chain
     assert C.teacher_key(base) == C.teacher_key(_cfg(admm_outer_iters=7, calib_shrinkage=0.9, curvature="kron"))
     assert C.teacher_key(base) != C.teacher_key(_cfg(num_calib_samples=8))

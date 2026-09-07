@@ -69,6 +69,21 @@ class QuantArguments:
         metadata={"help": "Block reconstruction loss: 'diag' or dense 'mahalanobis' (requires curvature=kron)",
                   "choices": ["diag", "mahalanobis"]},
     )
+    block_loss_cond_max: float = field(
+        default=0.0,
+        metadata={"help": "Dense block loss: cap the curvature's condition number at this value by flooring its "
+                          "eigenvalues, trace preserved (0 = off)"})
+    block_loss_power: float = field(
+        default=1.0, metadata={"help": "Dense block loss: raise the curvature's eigenvalues to this power (1 = off)"})
+    block_loss_mix: float = field(
+        default=1.0,
+        metadata={"help": "Dense block loss: use (1-mix)*diag(L) + mix*L (1 = fully dense, 0 = diagonal)"})
+    block_loss_source: str = field(
+        default="nkp",
+        metadata={"help": "Curvature of the block loss: 'nkp' (output factor of the Kronecker fit of mlp.down_proj) "
+                          "or 'plain' (unweighted, clipped block-output gradient covariance; requires curvature=kron)",
+                  "choices": ["nkp", "plain"]},
+    )
     curvature: str = field(
         default="diag",
         metadata={
@@ -96,6 +111,10 @@ class QuantArguments:
         metadata={"help": "Stage-level artifact cache / resume directory ('' disables)"},
     )
     checkpoint_every_blocks: int = field(default=1, metadata={"help": "Checkpoint the block loop every N blocks"})
+    max_blocks: int = field(
+        default=0,
+        metadata={"help": ">0: reconstruct only the first N decoder blocks (screening run); KD and the pre-KD "
+                          "model artifact are skipped"})
 
 
 @dataclass
@@ -125,12 +144,25 @@ class TuneArguments:
     admm_mid_scale: bool = field(
         default=False,
         metadata={"help": "Export an explicit per-rank middle scale (Scale-Binary-Scale-Binary-Scale) for admm_type=nanoquant"})
+    admm_input_factor: str = field(
+        default="calib",
+        metadata={"help": "Input-side curvature for ADMM: 'calib' (calibration-time factor of the FP model) or "
+                          "'fresh' (plain second moment of the inputs reaching the layer right before binarisation)",
+                  "choices": ["calib", "fresh"]},
+    )
+    block_diagnostics: bool = field(
+        default=False,
+        metadata={"help": "Log input-factor drift, Mahalanobis weight errors (stale vs fresh factor) and the "
+                          "block-loss change of every ADMM solution (two extra block forward passes per layer)"})
     tune_fact: bool = field(default=True, metadata={"help": "Tune factorized layers"})
     fact_binary_lr: float = field(default=1e-5, metadata={"help": "LR for factorized binary parameters"})
     fact_scale_lr: float = field(default=1e-5, metadata={"help": "LR for factorized scale parameters"})
     fact_bias_lr: float = field(default=1e-5, metadata={"help": "LR for factorized bias parameters"})
     fact_batch_size: int = field(default=1, metadata={"help": "Batch size for factorized tuning"})
     fact_epochs: int = field(default=8, metadata={"help": "Epochs for factorized tuning"})
+    retain_latent: bool = field(
+        default=False,
+        metadata={"help": "Keep the (frozen) latent factors after block tuning; required by model_kd_mode=scales_latent"})
     tune_model: bool = field(default=True, metadata={"help": "Perform model-level KD tuning"})
     model_kd_lr: float = field(default=1e-5, metadata={"help": "LR for model knowledge distillation"})
     model_kd_latent_lr: float = field(default=1e-6, metadata={"help": "LR for latent binary parameters during KD"})
@@ -138,6 +170,11 @@ class TuneArguments:
         default="scales",
         metadata={"help": "KD parameters: scales or scales_latent", "choices": ["scales", "scales_latent"]},
     )
+    model_kd_latent_normalize: bool = field(
+        default=False,
+        metadata={"help": "scales_latent: rescale each latent row to unit mean magnitude before KD (sign-preserving)"})
+    model_kd_eval_every_epoch: bool = field(default=False,
+                                            metadata={"help": "Evaluate held-out perplexity after every KD epoch"})
     model_kd_batch_size: int = field(default=1, metadata={"help": "Batch size for model KD"})
     model_kd_epochs: int = field(default=8, metadata={"help": "Epochs for model KD"})
     model_kd_teacher: str = field(
@@ -220,6 +257,10 @@ def main():
         calib_shrinkage=quant_args.calib_shrinkage,
         calib_strategy=quant_args.calib_strategy,
         block_loss=quant_args.block_loss,
+        block_loss_cond_max=quant_args.block_loss_cond_max,
+        block_loss_power=quant_args.block_loss_power,
+        block_loss_mix=quant_args.block_loss_mix,
+        block_loss_source=quant_args.block_loss_source,
         curvature=quant_args.curvature,
         kron_nkp_iters=quant_args.kron_nkp_iters,
         kron_stats_device=quant_args.kron_stats_device,
@@ -229,6 +270,7 @@ def main():
         device_map=model_args.device_map,
         cache_dir=quant_args.cache_dir,
         checkpoint_every_blocks=quant_args.checkpoint_every_blocks,
+        max_blocks=quant_args.max_blocks,
         tune_nonfact=tune_args.tune_nonfact,
         nonfact_lr=tune_args.nonfact_lr,
         nonfact_batch_size=tune_args.nonfact_batch_size,
@@ -240,16 +282,21 @@ def main():
         admm_penalty_scheduler=tune_args.admm_penalty_scheduler,
         admm_print_steps=tune_args.admm_print_steps,
         admm_mid_scale=tune_args.admm_mid_scale,
+        admm_input_factor=tune_args.admm_input_factor,
+        block_diagnostics=tune_args.block_diagnostics,
         tune_fact=tune_args.tune_fact,
         fact_binary_lr=tune_args.fact_binary_lr,
         fact_scale_lr=tune_args.fact_scale_lr,
         fact_bias_lr=tune_args.fact_bias_lr,
         fact_batch_size=tune_args.fact_batch_size,
         fact_epochs=tune_args.fact_epochs,
+        retain_latent=tune_args.retain_latent,
         tune_model=tune_args.tune_model,
         model_kd_lr=tune_args.model_kd_lr,
         model_kd_latent_lr=tune_args.model_kd_latent_lr,
         model_kd_mode=tune_args.model_kd_mode,
+        model_kd_latent_normalize=tune_args.model_kd_latent_normalize,
+        model_kd_eval_every_epoch=tune_args.model_kd_eval_every_epoch,
         model_kd_batch_size=tune_args.model_kd_batch_size,
         model_kd_epochs=tune_args.model_kd_epochs,
         model_kd_teacher=tune_args.model_kd_teacher,

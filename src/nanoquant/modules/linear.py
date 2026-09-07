@@ -19,15 +19,30 @@ class NanoQuantLinear(nn.Module):
         *,
         rank: int = 1024,
         factor_results: argparse.Namespace = None,
+        keep_latent: bool = False,
         **kwargs,
     ):
+        """Convert this ``nn.Linear`` in place into a factorised NanoQuant layer.
+
+        Parameters
+        ----------
+        do_train : bool
+            Keep the continuous latent factors trainable (STE forward) for block-level tuning.
+        rank : int
+            Factorisation rank.
+        factor_results : argparse.Namespace
+            Output of the ADMM factoriser (``A``, ``B``, ``A_latent``, ``B_latent``, scales).
+        keep_latent : bool
+            With ``do_train=False``, additionally store the frozen latent factors so that a later
+            latent-aware stage (model-level KD with ``model_kd_mode="scales_latent"``) can resume them.
+        """
         self.do_train = do_train
         self.rank = rank
         self._binarized = not self.do_train
         self.dtype = torch.bfloat16
 
         assert factor_results is not None, "factor_results must be provided"
-        self._setup_path(factor_results)
+        self._setup_path(factor_results, keep_latent=keep_latent)
 
         if not self.do_train:
             for param in self.parameters():
@@ -41,7 +56,7 @@ class NanoQuantLinear(nn.Module):
             del self.weight
         self.register_parameter("weight", None)
 
-    def _setup_path(self, factors):
+    def _setup_path(self, factors, keep_latent: bool = False):
         if factors is not None:
             vals = {
                 "scale_pre": factors.scale_pre.float(),
@@ -50,10 +65,10 @@ class NanoQuantLinear(nn.Module):
             if hasattr(factors, "scale_mid") and factors.scale_mid is not None:
                 vals["scale_mid"] = factors.scale_mid.float()
 
-            if self.do_train:
+            if self.do_train or keep_latent:
                 vals["V_latent"] = factors.B_latent.float()
                 vals["U_latent"] = factors.A_latent.mT.float()
-            else:
+            if not self.do_train:
                 vals["V"] = self.binary_ste(factors.B.float())
                 vals["U"] = self.binary_ste(factors.A.float().mT)
         else:
@@ -265,7 +280,15 @@ class NanoQuantLinear(nn.Module):
             return x
         return self.binary_ste(x)
 
-    def finalize(self):
+    def finalize(self, keep_latent: bool = False):
+        """Harden the latent factors into ±1 ``U``/``V`` and leave training mode.
+
+        Parameters
+        ----------
+        keep_latent : bool
+            Keep ``U_latent``/``V_latent`` as frozen parameters (for a later latent-aware KD stage)
+            instead of deleting them. The forward pass uses the hardened ``U``/``V`` either way.
+        """
         if not self.do_train:
             return
         with torch.no_grad():
@@ -282,9 +305,18 @@ class NanoQuantLinear(nn.Module):
             for param in self.parameters():
                 param.requires_grad_(False)
 
-            for attr_name in latent_attrs:
-                if hasattr(self, attr_name):
-                    delattr(self, attr_name)
+            if not keep_latent:
+                self.drop_latent()
+
+    def drop_latent(self):
+        """Delete the latent factors ``U_latent``/``V_latent`` if present (hardened ``U``/``V`` remain)."""
+        for attr_name in ("U_latent", "V_latent"):
+            if hasattr(self, attr_name):
+                delattr(self, attr_name)
+
+    @property
+    def has_latent(self) -> bool:
+        return hasattr(self, "U_latent") and hasattr(self, "V_latent")
 
     # -------------------------
     # packing / state_dict
@@ -313,7 +345,8 @@ class NanoQuantLinear(nn.Module):
         state = super().state_dict(*args, **kwargs)
         prefix = kwargs.get("prefix", "")
 
-        keys_to_remove = [k for k in state.keys() if ".V" in k or ".U" in k]
+        # drop the dense ±1 factors (they are stored packed below); latents, if any, stay as-is
+        keys_to_remove = [k for k in state.keys() if k.rsplit(".", 1)[-1] in ("V", "U")]
         for k in keys_to_remove:
             if k in state:
                 del state[k]

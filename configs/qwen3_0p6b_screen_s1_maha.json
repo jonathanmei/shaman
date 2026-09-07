@@ -1,6 +1,6 @@
 {
   "model_id": "Qwen/Qwen3-0.6B-Base",
-  "qmodel_path": "checkpoints/qwen3_0p6b_kron_2scale_maha.pt",
+  "qmodel_path": null,
   "seqlen": 2048,
   "bits": 1.0,
   "seed": 0,
@@ -30,7 +30,7 @@
   "fact_bias_lr": 1e-05,
   "fact_batch_size": 1,
   "fact_epochs": 8,
-  "tune_model": true,
+  "tune_model": false,
   "model_kd_lr": 1e-06,
   "model_kd_latent_lr": 1e-06,
   "model_kd_mode": "scales",
@@ -38,6 +38,8 @@
   "model_kd_epochs": 8,
   "model_kd_teacher": "online",
   "ppl_task": "wikitext2",
-  "zeroshot_task": "boolq,piqa,hellaswag,winogrande,arc_easy,arc_challenge",
+  "zeroshot_task": "",
+  "max_blocks": 4,
+  "block_diagnostics": true,
   "retain_latent": true
 }

@@ -174,6 +174,35 @@ def test_collect_stats_kron_on_tiny_mlp(monkeypatch, strategy):
         assert L.norm() > 0 and R.norm() > 0
         assert torch.allclose(raw["o_norm"][name], L.diagonal())
         assert torch.allclose(raw["i_norm"][name], R.diagonal())
+    assert raw[imp.PLAIN_COV_KEY] == {}  # no block-output layer names in the tiny MLP
+
+
+def test_collect_stats_kron_plain_output_covariance(monkeypatch):
+    """The plain covariance is the token-averaged, unweighted delta delta^T of the block-output layer (pass 1)."""
+    torch.manual_seed(8)
+    model = _TinyMLP()
+    dataloader = [torch.randn(1, 9, 6) for _ in range(2)]
+    monkeypatch.setattr(imp, "_run_calibration_loop", _fake_loop)
+    ds = []
+    lin = model[2]
+    h = lin.register_full_backward_hook(lambda m, gi, go: ds.append(go[0].detach().flatten(0, -2).float()))
+    _fake_loop(dataloader, model, "cpu", False, False)
+    h.remove()
+    delta = torch.cat(ds)
+    ref = delta.mT @ delta / delta.shape[0] * imp.GRAD_SCALE_FACTOR  # legacy o_norm scale: S * E[delta^2]
+
+    raw = imp.collect_stats(model, dataloader, "cpu", strategy="dbf", curvature="kron", nkp_iters=2,
+                            plain_cov_layers=("2",))
+    plain = raw[imp.PLAIN_COV_KEY]
+    assert set(plain) == {"2"}
+    assert torch.allclose(plain["2"], ref, rtol=1e-4, atol=1e-6 * ref.abs().max())
+    assert torch.allclose(plain["2"].diagonal().mean(), raw["o_norm"]["2"].mean(), rtol=1e-3)
+    # shrinkage treats it like the other dense factors; registration attaches it as a buffer
+    shrunk = imp.get_shrunk_stats(raw, shrinkage=0.4)
+    d = plain["2"].diagonal()
+    assert torch.allclose(shrunk[imp.PLAIN_COV_KEY]["2"].diagonal(), 0.6 * d + 0.4 * d.mean(), atol=1e-6)
+    imp.register_stats(model, shrunk)
+    assert hasattr(model[2], "o_cov_plain") and not hasattr(model[0], "o_cov_plain")
 
 
 def test_collect_stats_kron_matches_offline_fit(monkeypatch):
@@ -227,14 +256,16 @@ def test_grouped_device_accumulation_matches_streaming(monkeypatch, strategy):
 
     torch.manual_seed(7)
     model_a = _TinyMLP()
-    ref = imp.collect_stats(model_a, dataloader, "cpu", strategy=strategy, curvature="kron", nkp_iters=2)
+    ref = imp.collect_stats(model_a, dataloader, "cpu", strategy=strategy, curvature="kron", nkp_iters=2,
+                            plain_cov_layers=("2",))
     assert calls["n"] == 2
     torch.manual_seed(7)
     model_b = _TinyMLP()
     got = imp.collect_stats(model_b, dataloader, "cpu", strategy=strategy, curvature="kron", nkp_iters=2,
-                            gpu_budget_gb=600e-9)  # forces two layer groups
+                            gpu_budget_gb=600e-9, plain_cov_layers=("2",))  # forces two layer groups
     assert calls["n"] == 2 + 2 * 2  # nkp_iters x groups
-    for key in ("i_cov", "o_cov", "i_norm", "o_norm"):
+    for key in ("i_cov", "o_cov", "i_norm", "o_norm", imp.PLAIN_COV_KEY):
+        assert set(got[key]) == set(ref[key])
         for name in ref[key]:
             assert torch.allclose(got[key][name], ref[key][name], atol=1e-5, rtol=1e-5), (key, name)
 

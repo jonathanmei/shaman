@@ -17,10 +17,56 @@ from ..utils.data_utils import get_calib_loader, prepare_dataset
 from ..utils.load_utils import load_compressed_model, load_model, load_tokenizer
 from ..utils.utils import cleanup_memory, get_decoder_layers, get_layers_to_factorize, has_mid_scale
 from .compress_model import compress_block_recon, compress_model_recon
-from .importance import collect_stats, get_shrunk_stats, register_stats
+from .importance import CURVATURE_TYPES, collect_stats, get_shrunk_stats, register_stats
+from .latent import drop_latents
 from .resume import compressed_state_dict
 
 PRE_KD_KIND = "model"
+BLOCK_LOSSES = ("diag", "mahalanobis")
+BLOCK_LOSS_SOURCES = ("nkp", "plain")
+KD_MODES = ("scales", "scales_latent")
+ADMM_INPUT_FACTORS = ("calib", "fresh")
+
+
+def validate_config(quant_config: dict) -> None:
+    """Reject inconsistent configurations before any (expensive) stage runs.
+
+    Parameters
+    ----------
+    quant_config : dict
+        Quantisation configuration.
+
+    Raises
+    ------
+    ValueError
+        For unknown enum values, a dense block loss without Kronecker curvature, latent KD without
+        retained latents, or a negative ``max_blocks``.
+    """
+    curvature = quant_config.get("curvature", "diag")
+    if curvature not in CURVATURE_TYPES:
+        raise ValueError(f"Unknown curvature: {curvature}")
+    block_loss = quant_config.get("block_loss", "diag")
+    if block_loss not in BLOCK_LOSSES:
+        raise ValueError(f"Unknown block_loss: {block_loss}")
+    if block_loss == "mahalanobis" and curvature != "kron":
+        raise ValueError("block_loss='mahalanobis' requires curvature='kron' (dense output-side curvature)")
+    source = quant_config.get("block_loss_source", "nkp")
+    if source not in BLOCK_LOSS_SOURCES:
+        raise ValueError(f"Unknown block_loss_source: {source}")
+    if source == "plain" and curvature != "kron":
+        raise ValueError("block_loss_source='plain' requires curvature='kron' (the plain output-gradient covariance "
+                         "is collected during the Kronecker calibration passes)")
+    if quant_config.get("admm_input_factor", "calib") not in ADMM_INPUT_FACTORS:
+        raise ValueError(f"Unknown admm_input_factor: {quant_config.get('admm_input_factor')}")
+    kd_mode = quant_config.get("model_kd_mode", "scales")
+    if kd_mode not in KD_MODES:
+        raise ValueError(f"Unknown model_kd_mode: {kd_mode}")
+    if quant_config.get("tune_model", True) and kd_mode == "scales_latent" \
+            and not quant_config.get("retain_latent", False):
+        raise ValueError("model_kd_mode='scales_latent' requires retain_latent=true: the latent factors are "
+                         "dropped when each layer is hardened after block tuning otherwise")
+    if int(quant_config.get("max_blocks", 0) or 0) < 0:
+        raise ValueError("max_blocks must be >= 0")
 
 
 def collect_stats_kwargs(quant_config: dict) -> dict:
@@ -57,6 +103,10 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
        the fully reconstructed pre-KD model is stored as a ``model`` artifact;
     3. model-level KD – per-epoch checkpoints; skipped when ``tune_model`` is false.
 
+    With ``max_blocks > 0`` (screening) only the first blocks are reconstructed: the pre-KD artifact is
+    not written (it would masquerade as a full model under the chain's key), KD is skipped and the
+    per-block checkpoints stay reusable by a later full run of the same chain.
+
     The predicted (rank-budget) and actual bits-per-weight accounting are printed.
 
     Parameters
@@ -73,6 +123,7 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
     torch.nn.Module
         The quantised model (on CPU/GPU as left by the last stage).
     """
+    validate_config(quant_config)
     cache = ArtifactCache(quant_config.get("cache_dir", ""))
     device_map = quant_config.get('device_map', 'cpu')
 
@@ -85,8 +136,10 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
     print(format_accounting(static_accounting(fp_model, get_layers_to_factorize(fp_model.config.model_type),
                                               quant_config), title="bpw budget"))
 
+    max_blocks = int(quant_config.get("max_blocks", 0) or 0)
+    truncated = 0 < max_blocks < n_blocks
     pre_kd_key = chain_keys(quant_config, n_blocks)[-1]
-    if cache.exists(PRE_KD_KIND, pre_kd_key):
+    if not truncated and cache.exists(PRE_KD_KIND, pre_kd_key):
         # Every block-level input is unchanged: reload the reconstructed model and go straight to KD.
         print(f"[cache] hit  {PRE_KD_KIND} {pre_kd_key[:12]} (skipping calibration and block reconstruction)")
         model = load_compressed_model(model_name_or_path=model_id,
@@ -107,13 +160,18 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
 
         # 2) block-wise reconstruction (resumable)
         model = compress_block_recon(model, fp_model, dataloader, quant_config, cache=cache)
-        if cache.enabled:
+        if truncated:
+            print(f"[screen] reconstructed the first {max_blocks}/{n_blocks} blocks only: "
+                  f"pre-KD model not cached, KD skipped")
+        elif cache.enabled:
             atomic_save(compressed_state_dict(model), cache.path(PRE_KD_KIND, pre_kd_key))
             print(f"[cache] saved {PRE_KD_KIND} {pre_kd_key[:12]}")
 
-    # 3) model-level KD (scale-only reconstruction)
-    if quant_config.get('tune_model', True):
+    # 3) model-level KD (scale-only or scale + latent reconstruction)
+    if quant_config.get('tune_model', True) and not truncated:
         model = compress_model_recon(model, fp_model, dataloader, quant_config, dev=dev, cache=cache)
+    else:
+        drop_latents(model)
 
     print(format_accounting(model_accounting(model), title="bpw actual"))
     return model

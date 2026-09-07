@@ -53,7 +53,7 @@ def test_static_accounting_qwen3_0p6b(mid_scale, expected_bpw):
     assert "bpw" in B.format_accounting(acc)
 
 
-def _quantised_linear(in_f, out_f, rank, mid_scale):
+def _quantised_linear(in_f, out_f, rank, mid_scale, keep_latent=False):
     lin = nn.Linear(in_f, out_f, bias=False)
     lin.__class__ = NanoQuantLinear
     A = torch.ones(rank, out_f)
@@ -62,8 +62,19 @@ def _quantised_linear(in_f, out_f, rank, mid_scale):
          "scale_post": torch.ones(1, out_f), "W_final": torch.zeros(out_f, in_f)}
     if mid_scale:
         f["scale_mid"] = torch.ones(1, rank)
-    lin.__quant_convert__(do_train=False, rank=rank, factor_results=argparse.Namespace(**f))
+    lin.__quant_convert__(do_train=False, rank=rank, factor_results=argparse.Namespace(**f), keep_latent=keep_latent)
     return lin
+
+
+def test_model_accounting_ignores_retained_latents():
+    plain = nn.Module()
+    plain.q = _quantised_linear(16, 8, 4, False)
+    with_latent = nn.Module()
+    with_latent.q = _quantised_linear(16, 8, 4, False, keep_latent=True)
+    assert with_latent.q.has_latent
+    a, b = B.model_accounting(plain), B.model_accounting(with_latent)
+    assert a["factorized_bits"] == b["factorized_bits"] == 4 * 16 + 4 * 8 + 16 * (16 + 8)
+    assert a["model_bpw"] == b["model_bpw"]
 
 
 @pytest.mark.parametrize("mid_scale", [False, True])

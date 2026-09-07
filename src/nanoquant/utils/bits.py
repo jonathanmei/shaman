@@ -119,8 +119,11 @@ def model_accounting(model: nn.Module) -> dict:
             continue
         quant_modules.add(mod)
         binary = 0
-        for attr in ("V", "U", "V_latent", "U_latent"):
+        for attr in ("V", "U"):
+            # the hardened ±1 factor; a still-training layer only has its latent (same shape, same bit count)
             p = getattr(mod, attr, None)
+            if p is None:
+                p = getattr(mod, attr + "_latent", None)
             if p is not None:
                 binary += p.numel()
         scales = 0
