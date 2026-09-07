@@ -109,8 +109,8 @@ deleted by `finalize()` after block tuning; fixed on branch `latent-kd-kl-kron`)
 | s2 maha + `block_loss_power` 0.5 | 5615708 | 21.67 | 14.36 | 14.99 | 15.30 | 3.70 / 3.44 | 18 / 15 / 22 / 26 |
 | s3 diag, `block_loss_source` plain | 5615709 | 20.52 | 14.48 | 15.14 | 15.47 | 4.88 / 4.79 | 66 / 56 / 65 / 63 |
 | s3 maha, `block_loss_source` plain | 5615710 | 20.13 | 14.56 | 15.26 | 15.85 | 5.47 / 4.73 | same |
-| s4 diag, `admm_input_factor` fresh | 5615711 | | | | | | |
-| s4 maha, `admm_input_factor` fresh | 5615712 | | | | | | |
+| s4 diag, `admm_input_factor` fresh | 5615711 | 18.18 | 14.21 | 14.80 | 15.36 | 3.15 / 2.81 | (NKP; ADMM uses the fresh factor) |
+| s4 maha, `admm_input_factor` fresh | 5615712 | 19.82 | 14.48 | 15.26 | 15.49 | 3.74 / 2.63 | same |
 
 Observations:
 
@@ -127,4 +127,18 @@ Observations:
   diagonal is a worse importance than the NKP diagonal (15.47 vs 15.28) and the dense form is the worst arm (15.85).
   The token weighting by MLP-input energy, which up-weights massive-activation tokens, therefore *helps* the
   diagonal block loss; the unweighted Gauss–Newton surrogate is not the right target either.
+- **Fresh ADMM input factor (docs/admm_block_tuning_curvature.html §4.3-2).** Measuring the input second moment on
+  the quantised prefix right before each layer is binarised is neutral for the diag chain at 4 blocks (better on blocks
+  0–2, 15.36 vs 15.28 at block 3, inside the ±0.2 noise) and recovers 0.3 PPL of the Mahalanobis gap. The drift
+  diagnostic shows why the effect is not larger: the calibration-time NKP input factor and the plain second moment are
+  nearly orthogonal in their top-16 eigenspaces already at block 0 (principal angles 88–90°, relative spectral
+  perturbation 11–162), i.e. the difference is the token weighting, not staleness, and ADMM tolerates either. The
+  note's eq. 9 holds numerically: for `down_proj` the Gauss–Newton prediction tr(L ΔW R_fresh ΔWᵀ) matches the
+  observed dense block-loss increase of the ADMM solution to within 10 % at blocks 0, 1 and 3 (e.g. 3.43e-6
+  predicted vs 3.44e-6 observed at block 3) and within 40 % at block 2, where `tune_nonfact` had not converged.
+  Staleness is predicted to grow with depth, so the full-model diag+fresh arm remains the open test.
 - Cost: the dense loss plus diagnostics raises the per-block time from 132 s to ~220 s at 0.6B.
+
+Decision (stopping rule of the plan): the dense block loss is dropped from further tuning experiments at 0.6B; dense
+curvature stays in ADMM, where it earns its gain. Conditioning knobs and the fresh input factor remain available for
+the 1.7B check, where the Kron advantage vanished and depth/width make staleness more likely.
