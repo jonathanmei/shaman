@@ -27,6 +27,8 @@ from .resume import restore_prefix, save_block_checkpoint, save_progress
 from .teacher import TeacherLogits
 
 KD_KIND = "kd"
+# layers whose output is added straight to the residual stream (their weight error maps 1:1 onto the block error)
+BLOCK_OUTPUT_LAYERS = ("mlp.down_proj", "fc2")
 
 
 @torch.no_grad()
@@ -134,12 +136,15 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             if fresh_input or diagnostics:
                 # plain second moment of the inputs that actually reach the layer (quantised prefix, tuned block)
                 R_fresh = input_second_moment(q_block, layer, tuning_inputs, kwargs, num_samples)
+                R_fresh_shrunk = shrink_toward_identity(R_fresh, quant_config['calib_shrinkage'])
                 if diagnostics:
+                    # the calibration-time factor is shrunk; compare it with the equally shrunk fresh one
                     stale = getattr(layer, 'i_cov', None)
                     stale = layer.i_norm.diag() if stale is None else stale
-                    print("\t\t" + format_drift(factor_drift(stale.to(dev), R_fresh), title=f"{name} input factor drift"))
+                    print("\t\t" + format_drift(factor_drift(stale.to(dev), R_fresh_shrunk),
+                                                 title=f"{name} input factor drift"))
                 if fresh_input:
-                    input_factor = shrink_toward_identity(R_fresh, quant_config['calib_shrinkage'])
+                    input_factor = R_fresh_shrunk
             if diagnostics:
                 w_before = layer.weight.detach().clone()
                 loss_before = evaluate_block_loss(q_block, tuning_inputs, target_outputs, curvature, kwargs, num_samples)
@@ -155,12 +160,16 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
                 tokens = tuning_inputs.shape[0] * tuning_inputs.shape[1]
                 msg = (f"\t\tblock loss before -> after ADMM: diag {loss_before[0]:.4e} -> {loss_after[0]:.4e}")
                 if loss_before[1] is not None:
-                    gn = mahalanobis_weight_error(w_before, W_final, curvature.dense, R_fresh) * tokens / numel
-                    msg += (f" | dense {loss_before[1]:.4e} -> {loss_after[1]:.4e} (delta {loss_after[1] - loss_before[1]:.4e},"
-                            f" Gauss-Newton prediction with fresh R {gn:.4e})")
+                    msg += (f" | dense {loss_before[1]:.4e} -> {loss_after[1]:.4e} "
+                            f"(delta {loss_after[1] - loss_before[1]:.4e}")
+                    if name in BLOCK_OUTPUT_LAYERS and w_before.shape[0] == curvature.dense.shape[0]:
+                        # only the block-output layer writes straight to the residual stream (eq. 9 exact)
+                        gn = mahalanobis_weight_error(w_before, W_final, curvature.dense, R_fresh) * tokens / numel
+                        msg += f", Gauss-Newton prediction with fresh R {gn:.4e}"
+                    msg += ")"
                 print(msg)
                 del w_before, W_final
-            del final_factor_results, input_factor, R_fresh
+            del final_factor_results, input_factor, R_fresh, R_fresh_shrunk
             cleanup_memory()
             # 3/3) tune low-rank binary and scales
             if quant_config['tune_fact']:

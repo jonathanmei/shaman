@@ -116,6 +116,24 @@ def test_cache_round_trip_hit_miss_and_atomic_write(tmp_path):
     assert cache.load("stats", "k3") == {"x": 1}
 
 
+def test_atomic_save_concurrent_writers_do_not_clobber(tmp_path, monkeypatch):
+    """A second writer finishing between our torch.save and os.replace must not make our rename fail."""
+    cache = C.ArtifactCache(tmp_path)
+    real_replace = C.os.replace
+    state = {"nested": False}
+
+    def replace_with_interleaved_writer(src, dst):
+        if not state["nested"]:
+            state["nested"] = True
+            cache.save("stats", "k", {"x": "second"})  # completes first, under its own temporary name
+        real_replace(src, dst)
+
+    monkeypatch.setattr(C.os, "replace", replace_with_interleaved_writer)
+    cache.save("stats", "k", {"x": "first"})
+    assert cache.load("stats", "k")["x"] == "first"  # the outer writer's rename wins, and did not raise
+    assert not list((tmp_path / "stats").glob("*.tmp"))
+
+
 def test_cache_key_mismatch_raises_and_disabled_cache_is_noop(tmp_path):
     cache = C.ArtifactCache(tmp_path)
     cache.save("stats", "right", {"x": 1})

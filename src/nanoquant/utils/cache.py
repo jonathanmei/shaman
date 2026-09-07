@@ -23,8 +23,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import time
+import uuid
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
@@ -163,12 +165,20 @@ def admm_key(W: torch.Tensor, i_norm: torch.Tensor, o_norm: torch.Tensor, i_cov:
 
 
 def atomic_save(obj: Any, path: Path) -> None:
-    """``torch.save`` to ``path`` via a temporary file and an atomic rename."""
+    """``torch.save`` to ``path`` via a writer-unique temporary file and an atomic rename.
+
+    The temporary name carries the host, pid and a random suffix so that concurrent jobs producing the same
+    artifact (e.g. two arms sharing one calibration-statistics key) never rename each other's file away.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save(obj, tmp)
-    os.replace(tmp, path)
+    tmp = path.with_suffix(f"{path.suffix}.{socket.gethostname()}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 class ArtifactCache:
