@@ -90,3 +90,41 @@ accumulation (`kron_gpu_budget_gb`, commit dedd7e5) removes that overhead (4B: 3
   pre-KD model and KD epochs are all reusable/resumable. Drill: job 5606325 restored all 28 blocks after a crash and
   finished. Runs longer than the 4 h partition limit are resubmitted and resume from their block checkpoints. Results of
   every run are appended to `cache/results.jsonl` on the cluster.
+
+## Block-loss screen on the first 4 blocks (2026-09-07, Qwen3-0.6B-Base, 2 scales, kron curvature)
+
+Motivation: in the 2×2 screen of 2026-09-07 (jobs 5615563–5615566) the dense Mahalanobis block loss was worse than
+the diagonal one from block 0 on (block 3: 15.96/15.99 vs 15.49/15.29 PPL; block 27: 28.8/28.9 vs 28.0/27.4) while
+run-to-run noise at block 3 is only ~0.2. The two `scales_latent` arms crashed at the start of KD (latents were
+deleted by `finalize()` after block tuning; fixed on branch `latent-kd-kl-kron`). The 4-block screen
+(`max_blocks: 4`, `tune_model: false`, `block_diagnostics: true`, configs `configs/qwen3_0p6b_screen_*.json`,
+~15 min per arm) reads out the held-out PPL after block 3 and logs **both** block losses whichever is optimised.
+
+| arm | job | block 0 | block 1 | block 2 | block 3 PPL | block-3 down_proj final losses (diag / dense, ×1e-5) | cond. number of the dense matrix (blocks 0–3) |
+|---|---|---|---|---|---|---|---|
+| s0 diag (control) | 5615704 | 19.32 | 14.48 | 15.08 | **15.28** | 3.48 / 3.21 | 331 / 217 / 487 / 684 |
+| s1 mahalanobis | 5615705 | 20.16 | 14.69 | 15.49 | 15.79 | 4.36 / 3.05 | same |
+| s2 maha + `block_loss_cond_max` 10 | 5615706 | 21.52 | 14.57 | 15.24 | 15.49 | | ≤ 10 |
+| s2 maha + `block_loss_cond_max` 30 | 5615707 | 20.69 | 14.48 | 15.20 | 15.42 | | ≤ 30 |
+| s2 maha + `block_loss_power` 0.5 | 5615708 | 21.67 | 14.36 | 14.99 | 15.30 | 3.70 / 3.44 | 18 / 15 / 22 / 26 |
+| s3 diag, `block_loss_source` plain | 5615709 | 20.52 | 14.48 | 15.14 | 15.47 | 4.88 / 4.79 | 66 / 56 / 65 / 63 |
+| s3 maha, `block_loss_source` plain | 5615710 | 20.13 | 14.56 | 15.26 | 15.85 | 5.47 / 4.73 | same |
+| s4 diag, `admm_input_factor` fresh | 5615711 | | | | | | |
+| s4 maha, `admm_input_factor` fresh | 5615712 | | | | | | |
+
+Observations:
+
+- **The dense objective is optimised, and it is the wrong proxy.** The Mahalanobis arm ends block 3 with a lower
+  dense loss than the diag arm (3.05 vs 3.21) but a 25 % higher diagonal loss (4.36 vs 3.48) and +0.5 PPL. So the
+  gap is not an optimisation failure; weighting block-output errors by the FP gradient covariance trades off the
+  wrong directions at 1 bpw (docs/admm_block_tuning_curvature.html §5.3 argues the block objective should be the
+  reference; at these error magnitudes the diagonal, near-isotropic form is the more robust one).
+- **Conditioning explains most of the size of the gap.** Capping the condition number at 30 halves it, at 10 recovers
+  60 %, and spectral tempering with power 0.5 (condition number ~20 instead of ~300–700) closes it entirely
+  (15.30 vs 15.28) without beating the diagonal.
+- **The plain (unweighted) output-gradient covariance is worse, not better.** It is far better conditioned (~60) and
+  has effective rank ~500 of 1024, confirming that the NKP token weighting concentrates the spectrum, yet its
+  diagonal is a worse importance than the NKP diagonal (15.47 vs 15.28) and the dense form is the worst arm (15.85).
+  The token weighting by MLP-input energy, which up-weights massive-activation tokens, therefore *helps* the
+  diagonal block loss; the unweighted Gauss–Newton surrogate is not the right target either.
+- Cost: the dense loss plus diagnostics raises the per-block time from 132 s to ~220 s at 0.6B.

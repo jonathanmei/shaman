@@ -1,6 +1,6 @@
 {
   "model_id": "Qwen/Qwen3-0.6B-Base",
-  "qmodel_path": "checkpoints/qwen3_0p6b_kron_2scale_latent.pt",
+  "qmodel_path": "checkpoints/qwen3_0p6b_kron_2scale_latent_rl.pt",
   "seqlen": 2048,
   "bits": 1.0,
   "seed": 0,
