@@ -132,7 +132,7 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             print(f"\t(2/3) Block {i+1}/{n_blocks}, {name} | Initialization via ADMM...")
             curr_rank = admm_ranks.get(f"{i}.{name}")
             layer = sublayers[name]
-            input_factor = R_fresh = None
+            input_factor = R_fresh = R_fresh_shrunk = None
             if fresh_input or diagnostics:
                 # plain second moment of the inputs that actually reach the layer (quantised prefix, tuned block)
                 R_fresh = input_second_moment(q_block, layer, tuning_inputs, kwargs, num_samples)
