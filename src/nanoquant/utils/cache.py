@@ -37,10 +37,10 @@ PACKAGE_DIR = Path(__file__).resolve().parents[1]
 
 # --- field subsets (single source of truth; tests assert sensitivity/insensitivity against these) ---
 STATS_FIELDS: tuple[str, ...] = ("model_id", "seqlen", "calib_dataset", "num_calib_samples", "seed", "calib_strategy",
-                                 "curvature", "kron_nkp_iters")
+                                 "curvature", "kron_fit", "kron_nkp_iters")
 ADMM_FIELDS: tuple[str, ...] = ("admm_type", "admm_outer_iters", "admm_inner_iters", "admm_reg",
                                 "admm_penalty_scheduler", "admm_mid_scale", "kron_eigh_dtype", "seed",
-                                "admm_curvature_power", "admm_curvature_cond_max")
+                                "admm_curvature_power", "admm_curvature_cond_max", "admm_curvature_spike_rank")
 # ``max_blocks`` and ``block_diagnostics`` are deliberately absent: a truncated screening run and a run with extra
 # logging share their per-block checkpoints with the plain full chain.
 BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits") + ADMM_FIELDS + (

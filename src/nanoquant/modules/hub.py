@@ -58,6 +58,8 @@ class NanoQuantConfigDataclass:
     block_loss_source: str = "nkp"
     # curvature estimate: "diag" (legacy per-feature second moments) or "kron" (nearest Kronecker product)
     curvature: str = "diag"
+    # Kronecker fit: "frobenius" (nearest Kronecker product) or "kl" (matrix-normal MLE, KL-Shampoo)
+    kron_fit: str = "frobenius"
     kron_nkp_iters: int = 3
     kron_stats_device: str = "cpu"
     kron_eigh_dtype: str = "float64"
@@ -87,6 +89,7 @@ class NanoQuantConfigDataclass:
     admm_input_factor: str = "calib"
     admm_curvature_power: float = 1.0
     admm_curvature_cond_max: float = 0.0
+    admm_curvature_spike_rank: int = 0
     curvature_refresh_every: int = 0
     curvature_refresh_iters: int = 1
     block_diagnostics: bool = False

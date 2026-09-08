@@ -174,11 +174,13 @@ def _sylvester_solve_step(Q: torch.Tensor, lam: torch.Tensor, M: torch.Tensor, C
 
 @torch.no_grad()
 def _normalized_curvature(cov: torch.Tensor, norm_vec: torch.Tensor, eigh_dtype: torch.dtype, eps: float,
-                          power: float = 1.0, cond_max: float = 0.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                          power: float = 1.0, cond_max: float = 0.0,
+                          spike_rank: int = 0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Unit-diagonal curvature factor ``D^-1/2 cov D^-1/2`` (with ``D = norm_vec^2``) and its eigendecomposition.
 
-    With ``power != 1`` or ``cond_max > 0`` the spectrum is tempered (:func:`temper_eigenvalues`, trace preserved)
-    and ``Sigma`` is rebuilt from the tempered eigenvalues, so the data term trusts the dominant directions less.
+    With ``power != 1``, ``cond_max > 0`` or ``spike_rank > 0`` the spectrum is projected/tempered
+    (:func:`temper_eigenvalues`, trace preserved) and ``Sigma`` is rebuilt from the new eigenvalues, so the data
+    term trusts the dominant directions less (tempering) or denoises the bulk (spike-plus-flat projection).
 
     Returns
     -------
@@ -191,8 +193,8 @@ def _normalized_curvature(cov: torch.Tensor, norm_vec: torch.Tensor, eigh_dtype:
     lam, Q = torch.linalg.eigh(Sigma.to(eigh_dtype))
     lam = lam.to(torch.float32).clamp(min=eps)
     Q = Q.to(torch.float32)
-    if power != 1.0 or cond_max > 0:
-        lam = temper_eigenvalues(lam, power=power, cond_max=cond_max).clamp(min=eps)
+    if power != 1.0 or cond_max > 0 or spike_rank > 0:
+        lam = temper_eigenvalues(lam, power=power, cond_max=cond_max, spike_rank=spike_rank).clamp(min=eps)
         Sigma = (Q * lam) @ Q.mT
         Sigma = 0.5 * (Sigma + Sigma.mT)
     return Sigma, lam, Q
@@ -217,6 +219,7 @@ def factorize_admm_nanoquant(
     mid_scale: bool = False,
     curvature_power: float = 1.0,
     curvature_cond_max: float = 0.0,
+    curvature_spike_rank: int = 0,
 ):
     """
     Decomposes the weight matrix W into two binary matrices A and B using ADMM.
@@ -247,14 +250,15 @@ def factorize_admm_nanoquant(
                rho penalty and the SVID projection stay Euclidean.
         eigh_dtype: Precision of the eigendecompositions used by the Mahalanobis solver.
         mid_scale: Export an explicit per-rank ``scale_mid`` (see above).
-        curvature_power, curvature_cond_max: Spectral tempering of the unit-diagonal factors L, R
-               (``core.curvature.temper_eigenvalues``); defaults leave them untouched.
+        curvature_power, curvature_cond_max, curvature_spike_rank: Spectral tempering / spike-plus-flat projection
+               of the unit-diagonal factors L, R (``core.curvature.temper_eigenvalues``); defaults leave them untouched.
     """
     if is_transpose:
         results = factorize_admm_nanoquant(W.mT, o_norm, i_norm, mid_rank, outer_iters, inner_iters, reg, False, eps,
                                            rho_scheduler, print_admm_steps, i_cov=o_cov, o_cov=i_cov,
                                            eigh_dtype=eigh_dtype, mid_scale=mid_scale,
-                                           curvature_power=curvature_power, curvature_cond_max=curvature_cond_max)
+                                           curvature_power=curvature_power, curvature_cond_max=curvature_cond_max,
+                                           curvature_spike_rank=curvature_spike_rank)
         swapped = {
             "W_final": results["W_final"].mT,
             "A": results["B"],
@@ -279,9 +283,9 @@ def factorize_admm_nanoquant(
     use_maha = i_cov is not None and o_cov is not None
     if use_maha:
         Lt, lam_L, Q_L = _normalized_curvature(o_cov.to(device), norm_o, eigh_dtype, eps,
-                                               curvature_power, curvature_cond_max)  # (out, out)
+                                               curvature_power, curvature_cond_max, curvature_spike_rank)  # (out, out)
         Rt, lam_R, Q_R = _normalized_curvature(i_cov.to(device), norm_i, eigh_dtype, eps,
-                                               curvature_power, curvature_cond_max)  # (in, in)
+                                               curvature_power, curvature_cond_max, curvature_spike_rank)  # (in, in)
         W_norm32 = W_norm.to(torch.float32)
         P = Lt @ W_norm32 @ Rt  # curvature-weighted target, (out, in)
         if print_admm_steps:

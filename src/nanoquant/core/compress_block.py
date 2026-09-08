@@ -419,7 +419,8 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
                 o_cov=None if o_cov is None else o_cov.to(device),
                 eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)),
                 curvature_power=float(quant_config.get('admm_curvature_power', 1.0)),
-                curvature_cond_max=float(quant_config.get('admm_curvature_cond_max', 0.0) or 0.0))
+                curvature_cond_max=float(quant_config.get('admm_curvature_cond_max', 0.0) or 0.0),
+                curvature_spike_rank=int(quant_config.get('admm_curvature_spike_rank', 0) or 0))
         else:
             raise ValueError(f"Unknown admm_type: {quant_config['admm_type']}")
         if memo_key is not None:

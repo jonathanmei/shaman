@@ -23,6 +23,8 @@ def NanoQuantConfig(
     block_loss_source: str = "nkp",
     # curvature estimate: "diag" (legacy per-feature second moments) or "kron" (nearest Kronecker product)
     curvature: str = "diag",
+    # Kronecker fit: "frobenius" (nearest Kronecker product, Shampoo-like) or "kl" (matrix-normal MLE, KL-Shampoo)
+    kron_fit: str = "frobenius",
     kron_nkp_iters: int = 3,
     kron_stats_device: str = "cpu",
     kron_eigh_dtype: str = "float64",
@@ -54,6 +56,8 @@ def NanoQuantConfig(
     # spectral tempering of ADMM's unit-diagonal dense factors (power < 1 and/or condition-number floor)
     admm_curvature_power: float = 1.0,
     admm_curvature_cond_max: float = 0.0,
+    # >0: spike-plus-flat projection of ADMM's dense factors (keep this many eigenpairs, flatten the tail; Pro-KLShampoo)
+    admm_curvature_spike_rank: int = 0,
     # >0: every N blocks re-estimate the curvature of the remaining layers on the quantised prefix (kron only)
     curvature_refresh_every: int = 0,
     curvature_refresh_iters: int = 1,
@@ -103,6 +107,7 @@ def NanoQuantConfig(
         "block_loss_mix": block_loss_mix,
         "block_loss_source": block_loss_source,
         "curvature": curvature,
+        "kron_fit": kron_fit,
         "kron_nkp_iters": kron_nkp_iters,
         "kron_stats_device": kron_stats_device,
         "kron_eigh_dtype": kron_eigh_dtype,
@@ -129,6 +134,7 @@ def NanoQuantConfig(
         "admm_input_factor": admm_input_factor,
         "admm_curvature_power": admm_curvature_power,
         "admm_curvature_cond_max": admm_curvature_cond_max,
+        "admm_curvature_spike_rank": admm_curvature_spike_rank,
         "curvature_refresh_every": curvature_refresh_every,
         "curvature_refresh_iters": curvature_refresh_iters,
         "block_diagnostics": block_diagnostics,

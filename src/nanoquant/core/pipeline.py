@@ -17,9 +17,20 @@ from ..utils.bits import format_accounting, model_accounting, static_accounting
 from ..utils.cache import ArtifactCache, atomic_save, chain_keys, stats_key
 from ..utils.data_utils import get_calib_loader, prepare_dataset
 from ..utils.load_utils import load_compressed_model, load_model, load_tokenizer
-from ..utils.utils import cleanup_memory, get_decoder_layers, get_layers_to_factorize, has_mid_scale
+from ..utils.utils import (
+    cleanup_memory,
+    get_decoder_layers,
+    get_layers_to_factorize,
+    has_mid_scale,
+)
 from .compress_model import compress_block_recon, compress_model_recon
-from .importance import CURVATURE_TYPES, collect_stats, get_shrunk_stats, register_stats
+from .importance import (
+    CURVATURE_TYPES,
+    KRON_FITS,
+    collect_stats,
+    get_shrunk_stats,
+    register_stats,
+)
 from .latent import drop_latents
 from .resume import compressed_state_dict
 
@@ -47,6 +58,10 @@ def validate_config(quant_config: dict) -> None:
     curvature = quant_config.get("curvature", "diag")
     if curvature not in CURVATURE_TYPES:
         raise ValueError(f"Unknown curvature: {curvature}")
+    if quant_config.get("kron_fit", "frobenius") not in KRON_FITS:
+        raise ValueError(f"Unknown kron_fit: {quant_config.get('kron_fit')}")
+    if int(quant_config.get("admm_curvature_spike_rank", 0) or 0) < 0:
+        raise ValueError("admm_curvature_spike_rank must be >= 0")
     block_loss = quant_config.get("block_loss", "diag")
     if block_loss not in BLOCK_LOSSES:
         raise ValueError(f"Unknown block_loss: {block_loss}")
@@ -98,6 +113,7 @@ def collect_stats_kwargs(quant_config: dict) -> dict:
     return {
         'strategy': quant_config['calib_strategy'],
         'curvature': curvature,
+        'fit': quant_config.get('kron_fit', 'frobenius'),
         'nkp_iters': quant_config.get('kron_nkp_iters', 3),
         'stats_device': quant_config.get('kron_stats_device', 'cpu') if curvature == 'kron' else None,
         'gpu_budget_gb': float(quant_config.get('kron_gpu_budget_gb', 0.0) or 0.0),

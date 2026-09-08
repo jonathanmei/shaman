@@ -50,6 +50,7 @@ def refresh_block_curvature(model, dataloader, dev: str, quant_config: dict) -> 
     init = {key: {n: getattr(m, key) for n, m in layers.items() if hasattr(m, key)} for key in ("i_cov", "o_cov")}
     with torch.enable_grad():
         raw = collect_stats(model, dataloader, dev, strategy=quant_config['calib_strategy'], curvature='kron',
+                            fit=quant_config.get('kron_fit', 'frobenius'),
                             nkp_iters=int(quant_config.get('curvature_refresh_iters', 1) or 1),
                             stats_device=quant_config.get('kron_stats_device', 'cpu'),
                             gpu_budget_gb=float(quant_config.get('kron_gpu_budget_gb', 0.0) or 0.0),

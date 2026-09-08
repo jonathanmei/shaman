@@ -92,6 +92,12 @@ class QuantArguments:
             "choices": ["diag", "kron"],
         },
     )
+    kron_fit: str = field(
+        default="frobenius",
+        metadata={"help": "Kronecker fit for curvature=kron: 'frobenius' (nearest Kronecker product) or 'kl' "
+                          "(matrix-normal MLE / KL-Shampoo, inverse-weighted ALS)",
+                  "choices": ["frobenius", "kl"]},
+    )
     kron_nkp_iters: int = field(default=3, metadata={"help": "Calibration passes (ALS iterations) for curvature=kron"})
     kron_stats_device: str = field(default="cpu",
                                    metadata={"help": "Device holding the dense Kronecker factors between passes"})
@@ -154,6 +160,9 @@ class TuneArguments:
         default=1.0, metadata={"help": "ADMM: raise the eigenvalues of the dense curvature factors to this power (1 = off)"})
     admm_curvature_cond_max: float = field(
         default=0.0, metadata={"help": "ADMM: cap the condition number of the dense curvature factors (0 = off)"})
+    admm_curvature_spike_rank: int = field(
+        default=0, metadata={"help": "ADMM: spike-plus-flat projection of the dense factors, keeping this many "
+                                     "eigenpairs and flattening the tail (0 = off)"})
     curvature_refresh_every: int = field(
         default=0, metadata={"help": ">0: every N blocks re-estimate the curvature of the remaining layers on the "
                                      "quantised prefix (curvature=kron)"})
@@ -275,6 +284,7 @@ def main():
         block_loss_mix=quant_args.block_loss_mix,
         block_loss_source=quant_args.block_loss_source,
         curvature=quant_args.curvature,
+        kron_fit=quant_args.kron_fit,
         kron_nkp_iters=quant_args.kron_nkp_iters,
         kron_stats_device=quant_args.kron_stats_device,
         kron_eigh_dtype=quant_args.kron_eigh_dtype,
@@ -298,6 +308,7 @@ def main():
         admm_input_factor=tune_args.admm_input_factor,
         admm_curvature_power=tune_args.admm_curvature_power,
         admm_curvature_cond_max=tune_args.admm_curvature_cond_max,
+        admm_curvature_spike_rank=tune_args.admm_curvature_spike_rank,
         curvature_refresh_every=tune_args.curvature_refresh_every,
         curvature_refresh_iters=tune_args.curvature_refresh_iters,
         block_diagnostics=tune_args.block_diagnostics,

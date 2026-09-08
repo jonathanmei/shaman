@@ -214,9 +214,38 @@ def _frobenius_normalize(M: torch.Tensor, eps: float = 1e-30) -> torch.Tensor:
     return M / M.norm().clamp(min=eps)
 
 
+# Kronecker fits: "frobenius" = nearest Kronecker product (Shampoo-like ALS, token weights x^T R x);
+# "kl" = matrix-normal MLE / KL-Shampoo (ALS with the *inverse* factors as weights, i.e. leverage scores).
+KRON_FITS = ("frobenius", "kl")
+
+
 @torch.no_grad()
-def nkp_fit(x: torch.Tensor, delta: torch.Tensor, num_iters: int = 3) -> tuple[torch.Tensor, torch.Tensor]:
-    """In-memory reference of the multi-pass (Jacobi) nearest-Kronecker-product fit.
+def _damped_inverse(M: torch.Tensor, rel: float = 1e-3) -> torch.Tensor:
+    """Inverse of a symmetric PSD matrix with its eigenvalues floored at ``rel * mean`` (fp64 internally)."""
+    S = M.double()
+    S = 0.5 * (S + S.mT)
+    lam, Q = torch.linalg.eigh(S)
+    lam = lam.clamp_min(rel * lam.mean().clamp_min(torch.finfo(torch.float64).tiny))
+    return ((Q / lam) @ Q.mT).to(M.dtype)
+
+
+def _als_weights(prev: dict, fit: str) -> dict:
+    """Matrices handed to :func:`nkp_update` as ``L_prev``/``R_prev`` for the next ALS pass.
+
+    The Frobenius fit weights token ``t`` by ``x_t^T R x_t``; the KL fit by ``x_t^T R^{-1} x_t`` (and symmetrically
+    for the output side), so for ``fit == "kl"`` the previous factors are (damped) inverted here.
+    """
+    if fit == "frobenius":
+        return prev
+    if fit == "kl":
+        return {key: {n: _damped_inverse(M) for n, M in prev[key].items()} for key in ("i_cov", "o_cov")}
+    raise ValueError(f"Unknown kron fit '{fit}'. Choose from {KRON_FITS}.")
+
+
+@torch.no_grad()
+def nkp_fit(x: torch.Tensor, delta: torch.Tensor, num_iters: int = 3,
+            fit: str = "frobenius") -> tuple[torch.Tensor, torch.Tensor]:
+    """In-memory reference of the multi-pass (Jacobi) Kronecker fit.
 
     Both factors are updated in every pass from the previous pass's factors, starting from identity,
     and each is normalised to unit Frobenius norm after every pass. This mirrors exactly what the
@@ -228,15 +257,24 @@ def nkp_fit(x: torch.Tensor, delta: torch.Tensor, num_iters: int = 3) -> tuple[t
         All tokens' inputs ``(tokens, in)`` and output gradients ``(tokens, out)``.
     num_iters : int
         Number of passes.
+    fit : {"frobenius", "kl"}
+        Nearest Kronecker product (weights ``x^T R x``) or KL-Shampoo / matrix-normal MLE (weights ``x^T R^-1 x``).
 
     Returns
     -------
     tuple of torch.Tensor
         Unit-Frobenius-norm factors ``(L, R)``.
     """
+    if fit not in KRON_FITS:
+        raise ValueError(f"Unknown kron fit '{fit}'. Choose from {KRON_FITS}.")
     L_prev = R_prev = None
     for _ in range(num_iters):
-        L, R = nkp_update(x, delta, L_prev, R_prev)
+        if L_prev is None:
+            L_w = R_w = None
+        else:
+            w = _als_weights({"i_cov": {"_": R_prev}, "o_cov": {"_": L_prev}}, fit)
+            L_w, R_w = w["o_cov"]["_"], w["i_cov"]["_"]
+        L, R = nkp_update(x, delta, L_w, R_w)
         L_prev, R_prev = _frobenius_normalize(L), _frobenius_normalize(R)
     return L_prev, R_prev
 
@@ -350,8 +388,12 @@ def _kron_backward_hook(module, grad_input, grad_output, layer_name, run_states,
 def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Linear], strategy: str, nkp_iters: int,
                         stats_device: str, use_truefisher: bool, model_offload: bool,
                         gpu_budget_gb: float = 0.0, plain_cov_layers: tuple[str, ...] = PLAIN_COV_LAYERS,
-                        init_factors: dict | None = None) -> dict:
-    """Multi-pass streaming estimate of the nearest Kronecker product of the per-token empirical Fisher.
+                        init_factors: dict | None = None, fit: str = "frobenius") -> dict:
+    """Multi-pass streaming Kronecker fit of the per-token empirical Fisher.
+
+    ``fit="frobenius"`` is the nearest Kronecker product (ALS token weights ``x^T R x`` / ``delta^T L delta``);
+    ``fit="kl"`` is the KL-Shampoo / matrix-normal MLE fixed point, whose ALS weights are the *inverse* factors
+    (leverage scores), obtained by handing the hooks damped inverses of the previous pass's factors.
 
     ``init_factors`` (``{"i_cov": {name: R}, "o_cov": {name: L}}``) warm-starts the ALS weights of pass 1 from
     existing factors instead of the identity, which is how a curvature *refresh* on a partially quantised model
@@ -377,6 +419,8 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
     """
     if nkp_iters < 1:
         raise ValueError("nkp_iters must be >= 1")
+    if fit not in KRON_FITS:
+        raise ValueError(f"Unknown kron fit '{fit}'. Choose from {KRON_FITS}.")
     clip_state = None
     if strategy != "dbf":
         clip_state = defaultdict(lambda: {
@@ -400,6 +444,8 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
     for it in range(nkp_iters):
         sq_sums = defaultdict(lambda: {"i": 0.0, "o": 0.0, "n": 0, "tokens": 0})
         new = {"i_cov": {}, "o_cov": {}}
+        # ALS weights of this pass: the previous factors (Frobenius fit) or their damped inverses (KL fit)
+        weights = _als_weights(prev, fit)
         for g, names in enumerate(groups):
             group_bytes = sum(_factor_bytes(linear_layers[n]) for n in names)
             print(f">>> Kronecker curvature: NKP pass {it + 1}/{nkp_iters}, layer group {g + 1}/{len(groups)} "
@@ -423,7 +469,7 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
                     for n in names if n.endswith(tuple(plain_cov_layers))
                 }
             prev_group = {
-                key: {n: prev[key][n].to(acc_device) for n in names if n in prev[key]}
+                key: {n: weights[key][n].to(acc_device) for n in names if n in weights[key]}
                 for key in ("i_cov", "o_cov")
             }
             run_states = defaultdict(dict)
@@ -665,7 +711,7 @@ def register_stats(model, stats: dict):
 # -----------------------------------------------------------------------------
 def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=False, vram_limit_gb=50, save_plots=False,
                   strategy='online', curvature='diag', nkp_iters=3, stats_device=None, gpu_budget_gb=0.0,
-                  plain_cov_layers=PLAIN_COV_LAYERS, init_factors=None):
+                  plain_cov_layers=PLAIN_COV_LAYERS, init_factors=None, fit='frobenius'):
     """
     Main entry point for NanoQuant calibration statistics collection.
     Collects raw calibration statistics without applying shrinkage.
@@ -692,6 +738,8 @@ def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=Fa
         covariance ``o_cov_plain`` is collected in addition to the Kronecker factors.
     init_factors : dict, optional
         For ``curvature="kron"``: previous factors that warm-start the ALS (see ``_collect_kron_stats``).
+    fit : {"frobenius", "kl"}
+        For ``curvature="kron"``: nearest-Kronecker-product or KL-Shampoo (matrix-normal MLE) fit.
     """
     if curvature not in CURVATURE_TYPES:
         raise ValueError(f"Unknown curvature '{curvature}'. Choose from {CURVATURE_TYPES}.")
@@ -732,7 +780,7 @@ def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=Fa
             raise ValueError(f"Unknown strategy: {strategy}")
         factors = _collect_kron_stats(model, dataloader, dev, linear_layers, strategy, nkp_iters, stats_device,
                                       use_truefisher, model_offload, gpu_budget_gb=gpu_budget_gb,
-                                      plain_cov_layers=tuple(plain_cov_layers), init_factors=init_factors)
+                                      plain_cov_layers=tuple(plain_cov_layers), init_factors=init_factors, fit=fit)
         raw_stats = {
             'i_norm': {n: factors['i_cov'][n].diagonal().clone() for n in linear_layers},
             'o_norm': {n: factors['o_cov'][n].diagonal().clone() for n in linear_layers},
