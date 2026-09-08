@@ -142,3 +142,56 @@ Observations:
 Decision (stopping rule of the plan): the dense block loss is dropped from further tuning experiments at 0.6B; dense
 curvature stays in ADMM, where it earns its gain. Conditioning knobs and the fresh input factor remain available for
 the 1.7B check, where the Kron advantage vanished and depth/width make staleness more likely.
+
+## 2×2 rerun with retained latents: block loss × KD mode (2026-09-07/08, Qwen3-0.6B-Base, 2 scales, kron)
+
+Branch `latent-kd-kl-kron`; all arms `retain_latent: true` so that the pre-KD model of each block-loss chain is
+built once (jobs 5615715 diag, 5615716 maha; the first 4 blocks were resumed from the screen's checkpoints) and every
+KD arm reloads it from the cache (~10–15 min per KD arm). Configs `configs/qwen3_0p6b_kron_2scale*_rl`-paths.
+
+| block loss | pre-KD PPL (block 27) | no KD (control) | KD scales only | KD scales + latent, lr 1e-5 | best latent variant |
+|---|---|---|---|---|---|
+| diag | 28.05 | 28.05 (5615726) | **26.24** (5615715) | 32.05 (5615722) | 27.75, row-normalised latents @1e-5 (5615725) |
+| mahalanobis | 29.01 | 29.01 (5615718) | **26.47** (5615716) | 28.90 (5615717) | 26.61, lr 1e-7 (5615720) |
+
+Latent-KD variants (all on the cached pre-KD models; flip fraction = share of the 418 M binary entries whose sign
+changed during KD; PPL after epoch 1 / epoch 8):
+
+| chain | latent lr | normalised | flipped bits | PPL after epoch 1 → 8 | final PPL | zero-shot mean |
+|---|---|---|---|---|---|---|
+| diag | 1e-5 | no | 2.29 % | – | 32.05 | 0.387 |
+| diag | 1e-6 | no | 1.62 % | 929.6 → 30.8 | 30.77 | 0.400 |
+| diag | 1e-7 | no | 1.26 % | 48.4 → 29.9 | 29.88 | 0.394 |
+| diag | 1e-5 | yes | 0.83 % | 40.2 → 27.8 | 27.75 | 0.421 |
+| maha | 1e-5 | no | 1.61 % | – | 28.90 | 0.416 |
+| maha | 1e-6 | no | 1.08 % | 33.8 → 30.7 | 30.73 | 0.402 |
+| maha | 1e-7 | no | 0.72 % | 32.4 → 26.6 | 26.61 | 0.414 |
+| maha | 1e-5 | yes | 0.52 % | 39.5 → 28.0 | 27.96 | 0.416 |
+
+Zero-shot means of the scale-only arms: diag 0.399, maha 0.415 (no-KD controls 0.397 / 0.415); the differences are
+within the noise noted for this model size.
+
+Observations:
+
+- **The crash is fixed and the pipeline is consistent.** The no-KD controls reproduce the block-27 perplexity exactly
+  from the cached model with retained latents, all arms report the same 0.9729 bpw, and the per-epoch held-out
+  perplexity of the STE forward equals the final hardened perplexity (`model_kd_eval_every_epoch`).
+- **Scale+latent KD does not beat scale-only KD at 0.6B; the planned lr of 1e-5 is destructive.** Every latent arm is
+  far worse than scale-only KD after epoch 1 (PPL 32–930 versus ~27) and recovers only partially over 8 epochs; the
+  best variants (maha @1e-7: 26.61; diag normalised: 27.75) end at or below the scale-only result (26.47 / 26.24). The
+  mechanism is visible in the diagnostics: the latents are tiny (median |latent| ≈ 2e-3, 23 % below 1e-3), Adam's
+  first steps are ±lr regardless of gradient size, so every latent with margin below the lr flips on a single noisy
+  gradient, and a binary flip is a full-magnitude weight perturbation whatever the latent's margin was. Even at 1e-7,
+  0.7–1.3 % of all bits flip (2.9–5.3 M bits) and the KD then spends its epochs repairing the damage while the
+  training KL (2.76–2.85) ends *below* the scale-only value (2.85–2.86): it overfits the 128 calibration samples.
+  Row-normalising the latents (uniform flip budget per row) is the least harmful setting but still loses 1.3–1.5 PPL.
+- **Block loss after KD.** Scale-only KD narrows the Mahalanobis deficit from 0.96 PPL pre-KD to 0.23 (26.47 vs
+  26.24), inside the run-to-run noise, so the dense block loss neither helps nor clearly hurts the final model; the
+  4-block screen above explains the pre-KD gap.
+- Versus the earlier runs (26.11 / 27.13 for the same two chains without retained latents): diag +0.13, maha −0.66,
+  i.e. within the ±0.5 seed/nondeterminism spread; retaining latents does not change the scale-only path.
+
+Next steps if latent KD is pursued: gate flips on gradient-sign consistency over several steps (or use SGD-type
+updates whose size scales with the gradient) instead of Adam's sign-like first steps, keep latents frozen for the
+first epochs, and enlarge the calibration set; a 1.7B check of the fresh ADMM input factor (`admm_input_factor:
+fresh`) remains the open item of docs/admm_block_tuning_curvature.html.
