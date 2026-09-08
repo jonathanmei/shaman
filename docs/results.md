@@ -195,3 +195,27 @@ Next steps if latent KD is pursued: gate flips on gradient-sign consistency over
 updates whose size scales with the gradient) instead of Adam's sign-like first steps, keep latents frozen for the
 first epochs, and enlarge the calibration set; a 1.7B check of the fresh ADMM input factor (`admm_input_factor:
 fresh`) remains the open item of docs/admm_block_tuning_curvature.html.
+
+## KD feature distillation on a fixed pre-KD model (2026-09-08, Qwen3-0.6B, diag chain)
+
+All arms reload the same pre-KD checkpoint (`pre_kd_checkpoint`, the diag chain model of job 5615715) and run the
+8-epoch scale-only KD with an added residual-stream feature term: the relative squared error of the student's
+hidden state after every block against the online teacher's, averaged over blocks (`model_kd_feature_weight`).
+Held-out PPL is evaluated after every epoch.
+
+| feature weight | job | final PPL | best epoch (PPL) | final KL | feature term |
+|---|---|---|---|---|---|
+| 0 (control) | 5615753 | 26.26 | 6 (26.25) | 2.848 | – |
+| 0.1 | 5615755 | 26.19 | 6 (26.15) | 2.851 | 0.0277 |
+| 1 | 5615754 | **26.07** | 6 (26.06) | 2.849 | 0.0277 |
+| 10 | 5615756 | 26.10 | 7 (26.08) | 2.851 | 0.0271 |
+| 100 | 5615757 | 26.37 | 7 (26.35) | 2.864 | 0.0267 |
+
+- The KD stage is close to deterministic given the pre-KD model: the control reproduces the original run's 26.24
+  to within 0.02, so KD-only comparisons on a fixed checkpoint have a noise floor of a few hundredths, far below
+  the ±0.5 of full reconstruction chains. This makes the cached pre-KD model the right test bed for KD changes.
+- Feature distillation gives a small, real gain (−0.2 PPL at weights 1–10) and hurts at 100, where it crowds out
+  the KL. The feature term itself hardly moves (2.7 % relative residual-stream error throughout) because only the
+  392 scale vectors are trainable: it acts as a regulariser on the logit fit, not as a fit of the features. More
+  trainable full-precision parameters (RMSNorm / q_norm / k_norm weights) would be the natural next pairing.
+- Every arm peaks at epoch 6–7 and drifts up slightly afterwards; early stopping on held-out PPL is worth ~0.02.
