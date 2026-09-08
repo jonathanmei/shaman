@@ -11,9 +11,10 @@ import torch.nn.functional as F
 from tqdm import trange
 
 from ..core.compress_block import (block_curvature, evaluate_block_loss, factor_drift, factorize_and_replace,
-                                   format_drift, format_spectrum, input_second_moment, mahalanobis_weight_error,
-                                   tune_fact, tune_nonfact)
-from .importance import shrink_toward_identity
+                                   format_drift, input_second_moment, mahalanobis_weight_error, tune_fact,
+                                   tune_nonfact)
+from .curvature import format_spectrum
+from .importance import collect_stats, get_shrunk_stats, register_stats, shrink_toward_identity
 from ..modules.linear import NanoQuantLinear
 from ..optimi import AdamW
 from ..utils.cache import ArtifactCache, chain_keys, chain_root, kd_key, teacher_key
@@ -27,6 +28,69 @@ from .resume import restore_prefix, save_block_checkpoint, save_progress
 from .teacher import TeacherLogits
 
 KD_KIND = "kd"
+
+
+def refresh_block_curvature(model, dataloader, dev: str, quant_config: dict) -> int:
+    """Re-estimate the Kronecker curvature of every not-yet-factorised layer on the *current* model.
+
+    The remaining ``nn.Linear`` layers (the quantised ones are ``NanoQuantLinear`` and are skipped automatically)
+    get new ``i_cov``/``o_cov``/``i_norm``/``o_norm``/``o_cov_plain`` buffers from ``curvature_refresh_iters``
+    calibration passes warm-started from their present factors, shrunk with ``calib_shrinkage``. The forward
+    and backward passes run through the quantised prefix, so the statistics see the activations and gradients
+    that later blocks actually receive (docs/admm_block_tuning_curvature.html, section 5).
+
+    Returns
+    -------
+    int
+        Number of layers refreshed.
+    """
+    layers = {n: m for n, m in model.named_modules() if isinstance(m, torch.nn.Linear) and "lm_head" not in n}
+    if not layers:
+        return 0
+    init = {key: {n: getattr(m, key) for n, m in layers.items() if hasattr(m, key)} for key in ("i_cov", "o_cov")}
+    with torch.enable_grad():
+        raw = collect_stats(model, dataloader, dev, strategy=quant_config['calib_strategy'], curvature='kron',
+                            nkp_iters=int(quant_config.get('curvature_refresh_iters', 1) or 1),
+                            stats_device=quant_config.get('kron_stats_device', 'cpu'),
+                            gpu_budget_gb=float(quant_config.get('kron_gpu_budget_gb', 0.0) or 0.0),
+                            init_factors=init)
+    register_stats(model, get_shrunk_stats(raw, shrinkage=quant_config['calib_shrinkage']))
+    del raw, init
+    # collect_stats leaves the model on the device in train mode with gradient checkpointing: undo that
+    model.cpu()
+    model.eval()
+    model.gradient_checkpointing_disable()
+    model.config.use_cache = False
+    cleanup_memory()
+    return len(layers)
+
+
+def feature_loss(student_hidden, teacher_hidden, mask: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Relative squared error of the residual stream after every block, averaged over blocks.
+
+    Parameters
+    ----------
+    student_hidden, teacher_hidden : sequence of torch.Tensor
+        ``output_hidden_states`` tuples ``(embedding output, block 1, ..., block N)``; the embedding entry is
+        skipped because it is identical for student and teacher.
+    mask : torch.Tensor
+        ``(1, seqlen)`` token mask.
+
+    Returns
+    -------
+    torch.Tensor
+        ``mean_b sum_t ||s_bt - t_bt||^2 / sum_t ||t_bt||^2`` over masked tokens.
+    """
+    m = mask.to(torch.float32).unsqueeze(-1)
+    total = None
+    n = 0
+    for s, t in zip(student_hidden[1:], teacher_hidden[1:]):
+        t32 = t.float()
+        num = ((s.float() - t32).square() * m).sum()
+        den = (t32.square() * m).sum().clamp_min(eps)
+        total = num / den if total is None else total + num / den
+        n += 1
+    return total / max(n, 1)
 # layers whose output is added straight to the residual stream (their weight error maps 1:1 onto the block error)
 BLOCK_OUTPUT_LAYERS = ("mlp.down_proj", "fc2")
 
@@ -91,10 +155,17 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
     fresh_input = quant_config.get('admm_input_factor', 'calib') == 'fresh'
     diagnostics = bool(quant_config.get('block_diagnostics', False))
     num_samples = quant_config['num_calib_samples']
+    refresh_every = int(quant_config.get('curvature_refresh_every', 0) or 0)
 
     # block reconstruction loop
     for i in trange(start, stop, initial=start, total=stop, desc="Compressing Layers"):
         cleanup_memory()
+        if refresh_every > 0 and i > 0 and (i % refresh_every == 0 or i == start):
+            # periodic refresh (also right after a resume, whose prefix may have skipped one)
+            t_ref = time.time()
+            n_ref = refresh_block_curvature(model, dataloader, dev, quant_config)
+            print(f"\t\t[refresh] block {i}: re-estimated curvature of {n_ref} remaining layers on the quantised "
+                  f"prefix ({time.time() - t_ref:.0f}s)")
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         t_block = time.time()
@@ -297,6 +368,7 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
         raise ValueError(f"Unknown model_kd_mode: {kd_mode}")
     latent_mode = kd_mode == "scales_latent"
     eval_every_epoch = bool(quant_config.get("model_kd_eval_every_epoch", False))
+    feat_w = float(quant_config.get("model_kd_feature_weight", 0.0) or 0.0)
 
     # set seed
     set_seed(quant_config['seed'])
@@ -312,6 +384,8 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
 
     # teacher logits (ram / disk / online)
     teacher_mode = quant_config.get('model_kd_teacher', 'ram')
+    if feat_w > 0 and teacher_mode != "online":
+        raise ValueError("model_kd_feature_weight > 0 requires model_kd_teacher='online' (teacher hidden states)")
     use_cache = cache is not None and cache.enabled
     fp_model.eval()
     teacher = TeacherLogits(teacher_mode, fp_model, samples, dev, cache=cache if use_cache else None,
@@ -385,6 +459,8 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
             model.train()
             random.shuffle(data_indices)
             total_train_loss = torch.zeros(1, device=dev)
+            total_kl = torch.zeros(1, device=dev)
+            total_feat = torch.zeros(1, device=dev)
             t_epoch = time.time()
 
             for idx in data_indices:
@@ -396,13 +472,23 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
                 else:
                     mask = torch.ones_like(batch).int().to(dev)
 
-                # KD Loss
-                student_outputs = model(batch)
+                # KD Loss (logit KL, optionally plus residual-stream feature distillation)
+                if feat_w > 0:
+                    student_outputs = model(batch, output_hidden_states=True)
+                    teacher_logits, teacher_hidden = teacher.get(idx, batch, hidden=True)
+                else:
+                    student_outputs = model(batch)
+                    teacher_logits = teacher.get(idx, batch)
                 student_logits = student_outputs.logits if hasattr(student_outputs, "logits") else student_outputs
-                teacher_logits = teacher.get(idx, batch)
 
-                # Pass logits + mask to KD functions
-                loss = kl_loss_fn(student_logits, teacher_logits, mask)
+                kl = kl_loss_fn(student_logits, teacher_logits, mask)
+                loss = kl
+                if feat_w > 0:
+                    feat = feature_loss(student_outputs.hidden_states, teacher_hidden, mask)
+                    loss = kl + feat_w * feat
+                    total_feat += feat.detach()
+                    del teacher_hidden
+                total_kl += kl.detach()
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -413,7 +499,11 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
                 total_train_loss += loss.detach()
 
             avg_train = total_train_loss / len(dataloader)
-            print(f"Epoch {epoch} - Loss: {avg_train.item():.4f} ({time.time() - t_epoch:.0f}s)")
+            msg = f"Epoch {epoch} - Loss: {avg_train.item():.4f}"
+            if feat_w > 0:
+                msg += (f" (KL {(total_kl / len(dataloader)).item():.4f}, "
+                        f"feature {(total_feat / len(dataloader)).item():.4e} x {feat_w:g})")
+            print(msg + f" ({time.time() - t_epoch:.0f}s)")
             if latent_mode:
                 print(format_flip_stats(latent_flip_stats(model), title=f"latent flips after epoch {epoch}"))
             if eval_every_epoch:

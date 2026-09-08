@@ -51,6 +51,12 @@ def NanoQuantConfig(
     # input-side curvature handed to ADMM: "calib" (calibration-time factor of the full-precision model) or "fresh"
     # (plain second moment of the inputs actually reaching the layer, measured right before it is binarised)
     admm_input_factor: str = "calib",
+    # spectral tempering of ADMM's unit-diagonal dense factors (power < 1 and/or condition-number floor)
+    admm_curvature_power: float = 1.0,
+    admm_curvature_cond_max: float = 0.0,
+    # >0: every N blocks re-estimate the curvature of the remaining layers on the quantised prefix (kron only)
+    curvature_refresh_every: int = 0,
+    curvature_refresh_iters: int = 1,
     # log input-factor drift, Mahalanobis weight errors and the block-loss change of every ADMM solution
     block_diagnostics: bool = False,
     # tune_fact
@@ -73,6 +79,10 @@ def NanoQuantConfig(
     model_kd_latent_normalize: bool = False,
     # evaluate held-out perplexity after every KD epoch
     model_kd_eval_every_epoch: bool = False,
+    # weight of the residual-stream feature-distillation term added to the logit KL (0 = off; online teacher)
+    model_kd_feature_weight: float = 0.0,
+    # explicit pre-KD checkpoint to load instead of the keyed cache artifact ("" = use the cache)
+    pre_kd_checkpoint: str = "",
     # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)
     model_kd_teacher: str = "ram",
 ) -> dict:
@@ -117,6 +127,10 @@ def NanoQuantConfig(
         'admm_print_steps': admm_print_steps,
         "admm_mid_scale": admm_mid_scale,
         "admm_input_factor": admm_input_factor,
+        "admm_curvature_power": admm_curvature_power,
+        "admm_curvature_cond_max": admm_curvature_cond_max,
+        "curvature_refresh_every": curvature_refresh_every,
+        "curvature_refresh_iters": curvature_refresh_iters,
         "block_diagnostics": block_diagnostics,
         # tune_fact
         "tune_fact": tune_fact,
@@ -135,5 +149,7 @@ def NanoQuantConfig(
         "model_kd_mode": model_kd_mode,
         "model_kd_latent_normalize": model_kd_latent_normalize,
         "model_kd_eval_every_epoch": model_kd_eval_every_epoch,
+        "model_kd_feature_weight": model_kd_feature_weight,
+        "pre_kd_checkpoint": pre_kd_checkpoint,
         "model_kd_teacher": model_kd_teacher,
     }

@@ -96,8 +96,17 @@ class TeacherLogits:
         self._mm = np.memmap(path, dtype=np.int16, mode="r", shape=shape)
 
     @torch.no_grad()
-    def get(self, idx: int, batch: torch.Tensor) -> torch.Tensor:
-        """Teacher logits for sample ``idx`` (``batch`` is the same ``(1, seqlen)`` tensor), on ``dev``."""
+    def get(self, idx: int, batch: torch.Tensor, hidden: bool = False):
+        """Teacher logits for sample ``idx`` (``batch`` is the same ``(1, seqlen)`` tensor), on ``dev``.
+
+        With ``hidden=True`` (online mode only) returns ``(logits, hidden_states)`` where ``hidden_states`` is the
+        tuple of residual-stream tensors after the embedding and after every block, for feature distillation.
+        """
+        if hidden:
+            if self.mode != "online":
+                raise ValueError("teacher hidden states require model_kd_teacher='online'")
+            out = self.model(batch, output_hidden_states=True)
+            return out.logits.detach(), tuple(h.detach() for h in out.hidden_states)
         if self.mode == "ram":
             return self._ram[idx].to(self.dev, non_blocking=True)
         if self.mode == "disk":

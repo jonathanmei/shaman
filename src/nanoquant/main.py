@@ -150,6 +150,14 @@ class TuneArguments:
                           "'fresh' (plain second moment of the inputs reaching the layer right before binarisation)",
                   "choices": ["calib", "fresh"]},
     )
+    admm_curvature_power: float = field(
+        default=1.0, metadata={"help": "ADMM: raise the eigenvalues of the dense curvature factors to this power (1 = off)"})
+    admm_curvature_cond_max: float = field(
+        default=0.0, metadata={"help": "ADMM: cap the condition number of the dense curvature factors (0 = off)"})
+    curvature_refresh_every: int = field(
+        default=0, metadata={"help": ">0: every N blocks re-estimate the curvature of the remaining layers on the "
+                                     "quantised prefix (curvature=kron)"})
+    curvature_refresh_iters: int = field(default=1, metadata={"help": "Calibration passes per curvature refresh"})
     block_diagnostics: bool = field(
         default=False,
         metadata={"help": "Log input-factor drift, Mahalanobis weight errors (stale vs fresh factor) and the "
@@ -175,6 +183,11 @@ class TuneArguments:
         metadata={"help": "scales_latent: rescale each latent row to unit mean magnitude before KD (sign-preserving)"})
     model_kd_eval_every_epoch: bool = field(default=False,
                                             metadata={"help": "Evaluate held-out perplexity after every KD epoch"})
+    model_kd_feature_weight: float = field(
+        default=0.0, metadata={"help": "Weight of the residual-stream feature distillation term in KD (0 = off; "
+                                       "requires model_kd_teacher=online)"})
+    pre_kd_checkpoint: str = field(
+        default="", metadata={"help": "Explicit pre-KD checkpoint to load instead of the keyed cache artifact"})
     model_kd_batch_size: int = field(default=1, metadata={"help": "Batch size for model KD"})
     model_kd_epochs: int = field(default=8, metadata={"help": "Epochs for model KD"})
     model_kd_teacher: str = field(
@@ -283,6 +296,10 @@ def main():
         admm_print_steps=tune_args.admm_print_steps,
         admm_mid_scale=tune_args.admm_mid_scale,
         admm_input_factor=tune_args.admm_input_factor,
+        admm_curvature_power=tune_args.admm_curvature_power,
+        admm_curvature_cond_max=tune_args.admm_curvature_cond_max,
+        curvature_refresh_every=tune_args.curvature_refresh_every,
+        curvature_refresh_iters=tune_args.curvature_refresh_iters,
         block_diagnostics=tune_args.block_diagnostics,
         tune_fact=tune_args.tune_fact,
         fact_binary_lr=tune_args.fact_binary_lr,
@@ -297,6 +314,8 @@ def main():
         model_kd_mode=tune_args.model_kd_mode,
         model_kd_latent_normalize=tune_args.model_kd_latent_normalize,
         model_kd_eval_every_epoch=tune_args.model_kd_eval_every_epoch,
+        model_kd_feature_weight=tune_args.model_kd_feature_weight,
+        pre_kd_checkpoint=tune_args.pre_kd_checkpoint,
         model_kd_batch_size=tune_args.model_kd_batch_size,
         model_kd_epochs=tune_args.model_kd_epochs,
         model_kd_teacher=tune_args.model_kd_teacher,

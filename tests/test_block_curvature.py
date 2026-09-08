@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from nanoquant.core import compress_block as cb
+from nanoquant.core import curvature as cv
 from nanoquant.modules.quant_config import NanoQuantConfig
 
 
@@ -51,7 +52,7 @@ def test_spectrum_summary_values():
     s = cb.spectrum_summary(torch.eye(4))
     assert s["cond"] == pytest.approx(1.0) and s["eff_rank"] == pytest.approx(4.0)
     assert s["lam_max_over_mean_diag"] == pytest.approx(1.0) and s["top50_share"] == pytest.approx(1.0)
-    assert "cond" in cb.format_spectrum(s)
+    assert "cond" in cv.format_spectrum(s)
 
 
 def _block(with_plain: bool):

@@ -349,8 +349,13 @@ def _kron_backward_hook(module, grad_input, grad_output, layer_name, run_states,
 
 def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Linear], strategy: str, nkp_iters: int,
                         stats_device: str, use_truefisher: bool, model_offload: bool,
-                        gpu_budget_gb: float = 0.0, plain_cov_layers: tuple[str, ...] = PLAIN_COV_LAYERS) -> dict:
+                        gpu_budget_gb: float = 0.0, plain_cov_layers: tuple[str, ...] = PLAIN_COV_LAYERS,
+                        init_factors: dict | None = None) -> dict:
     """Multi-pass streaming estimate of the nearest Kronecker product of the per-token empirical Fisher.
+
+    ``init_factors`` (``{"i_cov": {name: R}, "o_cov": {name: L}}``) warm-starts the ALS weights of pass 1 from
+    existing factors instead of the identity, which is how a curvature *refresh* on a partially quantised model
+    gets away with a single pass.
 
     For the layers whose name ends with one of ``plain_cov_layers`` (the block-output layers) the first pass
     additionally accumulates the plain, unweighted covariance of the (clipped) output gradient,
@@ -387,6 +392,9 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
         acc_device = stats_device
 
     prev = {"i_cov": {}, "o_cov": {}}
+    if init_factors is not None:
+        prev = {key: {n: _frobenius_normalize(M.float()) for n, M in init_factors.get(key, {}).items()}
+                for key in ("i_cov", "o_cov")}
     plain: dict[str, torch.Tensor] = {}
     sq_sums = None
     for it in range(nkp_iters):
@@ -657,7 +665,7 @@ def register_stats(model, stats: dict):
 # -----------------------------------------------------------------------------
 def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=False, vram_limit_gb=50, save_plots=False,
                   strategy='online', curvature='diag', nkp_iters=3, stats_device=None, gpu_budget_gb=0.0,
-                  plain_cov_layers=PLAIN_COV_LAYERS):
+                  plain_cov_layers=PLAIN_COV_LAYERS, init_factors=None):
     """
     Main entry point for NanoQuant calibration statistics collection.
     Collects raw calibration statistics without applying shrinkage.
@@ -682,6 +690,8 @@ def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=Fa
     plain_cov_layers : tuple of str
         For ``curvature="kron"``: name suffixes of the block-output layers for which the plain output-gradient
         covariance ``o_cov_plain`` is collected in addition to the Kronecker factors.
+    init_factors : dict, optional
+        For ``curvature="kron"``: previous factors that warm-start the ALS (see ``_collect_kron_stats``).
     """
     if curvature not in CURVATURE_TYPES:
         raise ValueError(f"Unknown curvature '{curvature}'. Choose from {CURVATURE_TYPES}.")
@@ -722,7 +732,7 @@ def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=Fa
             raise ValueError(f"Unknown strategy: {strategy}")
         factors = _collect_kron_stats(model, dataloader, dev, linear_layers, strategy, nkp_iters, stats_device,
                                       use_truefisher, model_offload, gpu_budget_gb=gpu_budget_gb,
-                                      plain_cov_layers=tuple(plain_cov_layers))
+                                      plain_cov_layers=tuple(plain_cov_layers), init_factors=init_factors)
         raw_stats = {
             'i_norm': {n: factors['i_cov'][n].diagonal().clone() for n in linear_layers},
             'o_norm': {n: factors['o_cov'][n].diagonal().clone() for n in linear_layers},

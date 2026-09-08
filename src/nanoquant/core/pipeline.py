@@ -9,6 +9,8 @@ stage-level artifact cache so that repeated or interrupted runs reuse whatever i
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from ..utils.bits import format_accounting, model_accounting, static_accounting
@@ -67,6 +69,16 @@ def validate_config(quant_config: dict) -> None:
                          "dropped when each layer is hardened after block tuning otherwise")
     if int(quant_config.get("max_blocks", 0) or 0) < 0:
         raise ValueError("max_blocks must be >= 0")
+    if int(quant_config.get("curvature_refresh_every", 0) or 0) < 0:
+        raise ValueError("curvature_refresh_every must be >= 0")
+    if int(quant_config.get("curvature_refresh_every", 0) or 0) > 0 and curvature != "kron":
+        raise ValueError("curvature_refresh_every > 0 requires curvature='kron'")
+    if float(quant_config.get("model_kd_feature_weight", 0.0) or 0.0) > 0 \
+            and quant_config.get("model_kd_teacher", "ram") != "online":
+        raise ValueError("model_kd_feature_weight > 0 requires model_kd_teacher='online'")
+    override = quant_config.get("pre_kd_checkpoint") or ""
+    if override and not os.path.isfile(override):
+        raise ValueError(f"pre_kd_checkpoint does not exist: {override}")
 
 
 def collect_stats_kwargs(quant_config: dict) -> dict:
@@ -139,11 +151,17 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
     max_blocks = int(quant_config.get("max_blocks", 0) or 0)
     truncated = 0 < max_blocks < n_blocks
     pre_kd_key = chain_keys(quant_config, n_blocks)[-1]
-    if not truncated and cache.exists(PRE_KD_KIND, pre_kd_key):
-        # Every block-level input is unchanged: reload the reconstructed model and go straight to KD.
-        print(f"[cache] hit  {PRE_KD_KIND} {pre_kd_key[:12]} (skipping calibration and block reconstruction)")
-        model = load_compressed_model(model_name_or_path=model_id,
-                                      checkpoint_path=str(cache.path(PRE_KD_KIND, pre_kd_key)),
+    override = quant_config.get("pre_kd_checkpoint") or ""
+    if not truncated and (override or cache.exists(PRE_KD_KIND, pre_kd_key)):
+        # Every block-level input is unchanged (or an explicit pre-KD checkpoint was given): reload the
+        # reconstructed model and go straight to KD.
+        if override:
+            print(f"[pre-kd] loading {override} (explicit override; chain key {pre_kd_key[:12]} not checked)")
+            path = override
+        else:
+            print(f"[cache] hit  {PRE_KD_KIND} {pre_kd_key[:12]} (skipping calibration and block reconstruction)")
+            path = str(cache.path(PRE_KD_KIND, pre_kd_key))
+        model = load_compressed_model(model_name_or_path=model_id, checkpoint_path=path,
                                       seqlen=quant_config['seqlen'], device="cpu",
                                       has_mid_scale=has_mid_scale(quant_config), dtype=torch.bfloat16)
     else:

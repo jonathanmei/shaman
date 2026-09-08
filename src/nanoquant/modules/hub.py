@@ -85,6 +85,10 @@ class NanoQuantConfigDataclass:
     admm_mid_scale: bool = False
     # input-side curvature handed to ADMM: "calib" (calibration-time) or "fresh" (measured before binarisation)
     admm_input_factor: str = "calib"
+    admm_curvature_power: float = 1.0
+    admm_curvature_cond_max: float = 0.0
+    curvature_refresh_every: int = 0
+    curvature_refresh_iters: int = 1
     block_diagnostics: bool = False
     # tune_fact
     tune_fact: bool = True
@@ -104,6 +108,8 @@ class NanoQuantConfigDataclass:
     model_kd_mode: str = "scales"
     model_kd_latent_normalize: bool = False
     model_kd_eval_every_epoch: bool = False
+    model_kd_feature_weight: float = 0.0
+    pre_kd_checkpoint: str = ""
     # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)
     model_kd_teacher: str = "ram"
 

@@ -17,6 +17,7 @@ from ..utils.cache import ArtifactCache, admm_key
 from ..utils.utils import cleanup_memory, find_layers, set_seed
 from .admm_dbf import factorize_admm_dbf
 from .admm_nq import factorize_admm_nanoquant
+from .curvature import condition_curvature, spectrum_summary
 from .latent import hard_sign, sign_flips
 
 
@@ -56,78 +57,6 @@ class BlockCurvature:
     dense: torch.Tensor | None
     optimize_dense: bool
     summary: dict
-
-
-@torch.no_grad()
-def spectrum_summary(M: torch.Tensor) -> dict:
-    """Conditioning summary of a symmetric PSD matrix.
-
-    Returns
-    -------
-    dict
-        ``lam_max_over_mean_diag``, ``max_diag_over_mean_diag``, ``cond`` (``lam_max / lam_min``),
-        ``eff_rank`` (``tr(M)^2 / tr(M^2)``) and ``top50_share`` (trace share of the 50 largest eigenvalues).
-    """
-    M = 0.5 * (M.double() + M.double().mT)
-    lam = torch.linalg.eigvalsh(M).clamp_min(0)
-    mean_diag = M.diagonal().mean().clamp_min(1e-30)
-    tr = lam.sum().clamp_min(1e-30)
-    k = min(50, lam.numel())
-    return {
-        "lam_max_over_mean_diag": (lam[-1] / mean_diag).item(),
-        "max_diag_over_mean_diag": (M.diagonal().max() / mean_diag).item(),
-        "cond": (lam[-1] / lam[0].clamp_min(1e-30)).item(),
-        "eff_rank": (tr.square() / lam.square().sum().clamp_min(1e-30)).item(),
-        "top50_share": (lam[-k:].sum() / tr).item(),
-    }
-
-
-def format_spectrum(summary: dict, title: str = "block curvature") -> str:
-    """One-line rendering of :func:`spectrum_summary`."""
-    return (f"[{title}] lam_max/mean_diag {summary['lam_max_over_mean_diag']:.1f} | "
-            f"max_diag/mean_diag {summary['max_diag_over_mean_diag']:.1f} | cond {summary['cond']:.3g} | "
-            f"eff_rank {summary['eff_rank']:.1f} | top-50 share {summary['top50_share']:.3f}")
-
-
-@torch.no_grad()
-def condition_curvature(cov: torch.Tensor, cond_max: float = 0.0, power: float = 1.0,
-                        mix: float = 1.0) -> torch.Tensor:
-    """Regularise the spectrum of a dense curvature matrix, preserving its trace.
-
-    Parameters
-    ----------
-    cov : torch.Tensor
-        Symmetric PSD matrix ``(d, d)``.
-    cond_max : float
-        If ``> 0``, floor the eigenvalues at ``lam_max / cond_max`` so the condition number is at most
-        ``cond_max`` (ignored directions are lifted rather than dominant ones truncated).
-    power : float
-        Raise the eigenvalues to this power (``0.5`` halves the log-condition number; ``1`` = off).
-    mix : float
-        Return ``(1 - mix) * diag(cov) + mix * conditioned`` (``1`` = fully dense, ``0`` = diagonal).
-
-    Returns
-    -------
-    torch.Tensor
-        Conditioned matrix in fp32 with the same trace as ``cov``.
-    """
-    cov64 = cov.detach().double()
-    cov64 = 0.5 * (cov64 + cov64.mT)
-    diag = cov64.diagonal().clone()
-    trace = diag.sum()
-    out = cov64
-    if power != 1.0 or cond_max > 0:
-        lam, Q = torch.linalg.eigh(cov64)
-        lam = lam.clamp_min(0)
-        if power != 1.0:
-            lam = lam.pow(power)
-        if cond_max > 0:
-            lam = lam.clamp_min(lam.max() / cond_max)
-        out = (Q * lam) @ Q.mT
-        out = out * (trace / out.diagonal().sum().clamp_min(1e-30))
-    if mix != 1.0:
-        out = (1.0 - mix) * torch.diag(diag) + mix * out
-    return (0.5 * (out + out.mT)).float()
 
 
 @torch.no_grad()
@@ -488,7 +417,9 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
                 print_admm_steps=quant_config['admm_print_steps'],
                 i_cov=None if i_cov is None else i_cov.to(device),
                 o_cov=None if o_cov is None else o_cov.to(device),
-                eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)))
+                eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)),
+                curvature_power=float(quant_config.get('admm_curvature_power', 1.0)),
+                curvature_cond_max=float(quant_config.get('admm_curvature_cond_max', 0.0) or 0.0))
         else:
             raise ValueError(f"Unknown admm_type: {quant_config['admm_type']}")
         if memo_key is not None:

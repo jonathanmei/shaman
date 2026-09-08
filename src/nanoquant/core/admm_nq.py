@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .curvature import temper_eigenvalues
+
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -171,9 +173,12 @@ def _sylvester_solve_step(Q: torch.Tensor, lam: torch.Tensor, M: torch.Tensor, C
 
 
 @torch.no_grad()
-def _normalized_curvature(cov: torch.Tensor, norm_vec: torch.Tensor, eigh_dtype: torch.dtype,
-                          eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _normalized_curvature(cov: torch.Tensor, norm_vec: torch.Tensor, eigh_dtype: torch.dtype, eps: float,
+                          power: float = 1.0, cond_max: float = 0.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Unit-diagonal curvature factor ``D^-1/2 cov D^-1/2`` (with ``D = norm_vec^2``) and its eigendecomposition.
+
+    With ``power != 1`` or ``cond_max > 0`` the spectrum is tempered (:func:`temper_eigenvalues`, trace preserved)
+    and ``Sigma`` is rebuilt from the tempered eigenvalues, so the data term trusts the dominant directions less.
 
     Returns
     -------
@@ -184,7 +189,13 @@ def _normalized_curvature(cov: torch.Tensor, norm_vec: torch.Tensor, eigh_dtype:
     Sigma = cov.to(torch.float32) / (n.unsqueeze(1) * n.unsqueeze(0))
     Sigma = 0.5 * (Sigma + Sigma.mT)
     lam, Q = torch.linalg.eigh(Sigma.to(eigh_dtype))
-    return Sigma, lam.to(torch.float32).clamp(min=eps), Q.to(torch.float32)
+    lam = lam.to(torch.float32).clamp(min=eps)
+    Q = Q.to(torch.float32)
+    if power != 1.0 or cond_max > 0:
+        lam = temper_eigenvalues(lam, power=power, cond_max=cond_max).clamp(min=eps)
+        Sigma = (Q * lam) @ Q.mT
+        Sigma = 0.5 * (Sigma + Sigma.mT)
+    return Sigma, lam, Q
 
 
 @torch.no_grad()
@@ -204,6 +215,8 @@ def factorize_admm_nanoquant(
     o_cov: torch.Tensor | None = None,
     eigh_dtype: torch.dtype = torch.float64,
     mid_scale: bool = False,
+    curvature_power: float = 1.0,
+    curvature_cond_max: float = 0.0,
 ):
     """
     Decomposes the weight matrix W into two binary matrices A and B using ADMM.
@@ -234,11 +247,14 @@ def factorize_admm_nanoquant(
                rho penalty and the SVID projection stay Euclidean.
         eigh_dtype: Precision of the eigendecompositions used by the Mahalanobis solver.
         mid_scale: Export an explicit per-rank ``scale_mid`` (see above).
+        curvature_power, curvature_cond_max: Spectral tempering of the unit-diagonal factors L, R
+               (``core.curvature.temper_eigenvalues``); defaults leave them untouched.
     """
     if is_transpose:
         results = factorize_admm_nanoquant(W.mT, o_norm, i_norm, mid_rank, outer_iters, inner_iters, reg, False, eps,
                                            rho_scheduler, print_admm_steps, i_cov=o_cov, o_cov=i_cov,
-                                           eigh_dtype=eigh_dtype, mid_scale=mid_scale)
+                                           eigh_dtype=eigh_dtype, mid_scale=mid_scale,
+                                           curvature_power=curvature_power, curvature_cond_max=curvature_cond_max)
         swapped = {
             "W_final": results["W_final"].mT,
             "A": results["B"],
@@ -262,8 +278,10 @@ def factorize_admm_nanoquant(
     # Optional dense curvature -> Mahalanobis data term
     use_maha = i_cov is not None and o_cov is not None
     if use_maha:
-        Lt, lam_L, Q_L = _normalized_curvature(o_cov.to(device), norm_o, eigh_dtype, eps)  # (out, out)
-        Rt, lam_R, Q_R = _normalized_curvature(i_cov.to(device), norm_i, eigh_dtype, eps)  # (in, in)
+        Lt, lam_L, Q_L = _normalized_curvature(o_cov.to(device), norm_o, eigh_dtype, eps,
+                                               curvature_power, curvature_cond_max)  # (out, out)
+        Rt, lam_R, Q_R = _normalized_curvature(i_cov.to(device), norm_i, eigh_dtype, eps,
+                                               curvature_power, curvature_cond_max)  # (in, in)
         W_norm32 = W_norm.to(torch.float32)
         P = Lt @ W_norm32 @ Rt  # curvature-weighted target, (out, in)
         if print_admm_steps:

@@ -39,24 +39,28 @@ PACKAGE_DIR = Path(__file__).resolve().parents[1]
 STATS_FIELDS: tuple[str, ...] = ("model_id", "seqlen", "calib_dataset", "num_calib_samples", "seed", "calib_strategy",
                                  "curvature", "kron_nkp_iters")
 ADMM_FIELDS: tuple[str, ...] = ("admm_type", "admm_outer_iters", "admm_inner_iters", "admm_reg",
-                                "admm_penalty_scheduler", "admm_mid_scale", "kron_eigh_dtype", "seed")
+                                "admm_penalty_scheduler", "admm_mid_scale", "kron_eigh_dtype", "seed",
+                                "admm_curvature_power", "admm_curvature_cond_max")
 # ``max_blocks`` and ``block_diagnostics`` are deliberately absent: a truncated screening run and a run with extra
 # logging share their per-block checkpoints with the plain full chain.
-BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits") + ADMM_FIELDS + ("admm_input_factor",
+BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits") + ADMM_FIELDS + (
+    "admm_input_factor", "curvature_refresh_every", "curvature_refresh_iters",
     "block_loss", "block_loss_source", "block_loss_cond_max", "block_loss_power", "block_loss_mix",
     "tune_nonfact", "nonfact_lr", "nonfact_batch_size", "nonfact_epochs", "tune_fact", "fact_binary_lr",
     "fact_scale_lr", "fact_bias_lr", "fact_batch_size", "fact_epochs", "retain_latent")
 KD_FIELDS: tuple[str, ...] = ("model_kd_lr", "model_kd_latent_lr", "model_kd_batch_size", "model_kd_epochs",
-                              "model_kd_mode", "model_kd_latent_normalize")
+                              "model_kd_mode", "model_kd_latent_normalize", "model_kd_feature_weight",
+                              "pre_kd_checkpoint")
 TEACHER_FIELDS: tuple[str, ...] = ("model_id", "seqlen", "calib_dataset", "num_calib_samples", "seed")
 
 # source files whose algorithm determines each stage's output (relative to the ``nanoquant`` package)
 SOURCE_GROUPS: dict[str, tuple[str, ...]] = {
     "stats": ("core/importance.py",),
-    "admm": ("core/admm_nq.py", "core/admm_dbf.py", "core/compress_block.py"),
+    "admm": ("core/admm_nq.py", "core/admm_dbf.py", "core/compress_block.py", "core/curvature.py"),
     "blocks": ("core/admm_nq.py", "core/admm_dbf.py", "core/compress_block.py", "core/compress_model.py",
-               "modules/linear.py"),
+               "modules/linear.py", "core/curvature.py"),
     "kd": ("core/compress_model.py", "core/teacher.py"),
+    "curvature": ("core/curvature.py",),
 }
 
 
