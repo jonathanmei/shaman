@@ -19,7 +19,7 @@ The actual bit counter of every run matched these predictions.
 | model | actual bpw | paper (Table 2) | diag, 2 scales (paper-faithful) | kron, 2 scales | diag, 3 scales | kron, 3 scales |
 |---|---|---|---|---|---|---|
 | Qwen3-0.6B-Base | 0.973 / 0.977 | 27.56 | 29.21 | **25.82** | 34.18 | 29.29 |
-| Qwen3-1.7B-Base | 0.986 | 19.21 | **18.76** | 19.21 | – | – |
+| Qwen3-1.7B-Base | 0.986 | 19.21 | 18.76 | 19.21 (**17.28** with tempered ADMM + curvature refresh, 2026-09-08) | – | – |
 | Qwen3-4B-Base | 0.986 | 14.29 | 14.86 | running (job 5606588) | – | – |
 
 ## Qwen3-0.6B-Base (2026-09-02)
@@ -219,3 +219,39 @@ Held-out PPL is evaluated after every epoch.
   392 scale vectors are trainable: it acts as a regulariser on the logit fit, not as a fit of the features. More
   trainable full-precision parameters (RMSNorm / q_norm / k_norm weights) would be the natural next pairing.
 - Every arm peaks at epoch 6–7 and drifts up slightly afterwards; early stopping on held-out PPL is worth ~0.02.
+
+## Qwen3-1.7B-Base: ADMM spectral tempering and curvature refresh (2026-09-08, 2 scales, kron)
+
+Motivated by the 0.6B block-loss screen (power-0.5 tempering of the dense block-loss matrix removed its
+ill-conditioning) and by docs/admm_block_tuning_curvature.html (input-side staleness grows with depth). Both arms
+temper ADMM's unit-diagonal Kronecker factors with `admm_curvature_power: 0.5` (eigenvalues raised to the power
+0.5, trace preserved; `core/curvature.py`). The second arm additionally hands ADMM the fresh input second moment of
+every layer (`admm_input_factor: fresh`) and re-estimates the Kronecker factors of all remaining layers on the
+quantised prefix every 7 blocks (`curvature_refresh_every: 7`, one warm-started ALS pass, 53–104 s each).
+
+| arm | job | block 0 | block 7 | block 14 | block 21 | block 27 (pre-KD) | KD loss ep1 → ep8 | **WikiText-2 PPL** | zero-shot mean | wall-clock |
+|---|---|---|---|---|---|---|---|---|---|---|
+| diag (2026-09-02) | 5606401 | | | | | 20.35 | 2.545 → 2.496 | 18.76 | 0.426 | 1 h 18 |
+| kron (2026-09-02) | 5606402 | | | | | 20.19 | 2.505 → 2.471 | 19.21 | 0.421 | 3 h 11 |
+| kron, tempered ADMM | 5615751 | 9.97 | 11.54 | 12.57 | 14.61 | 18.24 | 2.494 → 2.461 | 17.46 | 0.435 | 2 h 22 |
+| kron, tempered + fresh R + refresh/7 | 5615752 | 10.03 | 11.44 | 12.46 | 14.49 | **18.02** | 2.489 → 2.457 | **17.28** | 0.446 | 2 h 09 |
+
+Paper (Table 2): 19.21.
+
+Observations:
+
+- **Tempering the ADMM curvature recovers the Kron advantage at 1.7B and beats every previous 1.7B number**: 17.46 vs
+  19.21 for untempered Kron (−9 %) and 18.76 for diag (−7 %), 2.1 PPL better pre-KD as well. The earlier 1.7B
+  reversal therefore looks like ADMM over-trusting a concentrated dense spectrum rather than seed noise. The
+  comparison runs are from 2026-09-02 (older code; the block loss and calibration are the same), so a same-code
+  untempered Kron control would make the attribution exact.
+- **Fresh input factor plus periodic refresh adds a further −0.18 PPL** (17.28) with a consistently lower trajectory
+  from block 7 on (−0.1 to −0.2 at every block boundary), within the ±0.5 noise of single runs but in the predicted
+  direction at every checkpoint. The three refreshes cost 4 minutes in total; the arm was faster overall because the
+  grouped GPU calibration replaced the 75-minute CPU-streamed one.
+- Zero-shot means rose with perplexity (0.435 / 0.446 vs 0.421–0.426).
+- Cost: 2 h 10–20 per 1.7B run on the current GPUs (calibration ~10 min, ~4.5 min per block, KD 6 min).
+
+Summary across sizes (WikiText-2 PPL, best arm per size): 0.6B 26.07 (kron, diag block loss, feature-KD weight 1),
+1.7B 17.28 (kron, tempered ADMM, fresh R, refresh/7). Open: same-code untempered 1.7B control; tempering at 0.6B and
+4B; tempering exponent and refresh period sweeps.
