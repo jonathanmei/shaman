@@ -62,6 +62,8 @@ class QuantArguments:
         default=0.0, metadata={"help": "Log-ratio of the last block's bit budget to the first block's (0 = flat)"})
     rank_type_weights: str = field(
         default="", metadata={"help": "Per-layer-type bit-budget multipliers, e.g. 'v_proj:1.2,down_proj:1.15'"})
+    rank_max_ratio: float = field(
+        default=1.0, metadata={"help": "Rank ceiling as a multiple of min(in, out); 1.0 = legacy cap"})
     seed: int = field(default=0, metadata={"help": "Random seed"})
     num_calib_samples: int = field(default=128, metadata={"help": "Number of calibration samples"})
     calib_dataset: str = field(default="wikitext2", metadata={"help": "Calibration dataset"})
@@ -302,6 +304,7 @@ def main():
         rank_budget=quant_args.rank_budget,
         rank_depth_ramp=quant_args.rank_depth_ramp,
         rank_type_weights=quant_args.rank_type_weights,
+        rank_max_ratio=quant_args.rank_max_ratio,
         seed=quant_args.seed,
         num_calib_samples=quant_args.num_calib_samples,
         calib_dataset=quant_args.calib_dataset,

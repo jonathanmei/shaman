@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Non-uniform rank allocation: ramp, type weights, and parity versus full budget</title>
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], tags: 'ams' },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18211d;
+      --muted: #5d6b63;
+      --paper: #f4f1e8;
+      --panel: #fffdf7;
+      --line: #d7d1c3;
+      --green: #155f4a;
+      --green-soft: #dcebe3;
+      --amber: #9a5b16;
+      --amber-soft: #f6e8cf;
+      --blue: #315d8a;
+      --blue-soft: #e2ebf3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 16px/1.58 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(1040px, calc(100% - 40px)); margin: 48px auto 80px; }
+    header { border-top: 8px solid var(--green); padding: 34px 0 22px; }
+    h1, h2, h3 { font-family: Georgia, "Times New Roman", serif; line-height: 1.12; }
+    h1 { max-width: 850px; margin: 0 0 14px; font-size: clamp(2rem, 5vw, 3.4rem); letter-spacing: -0.04em; }
+    h2 { margin: 0 0 18px; font-size: 1.8rem; }
+    h3 { margin: 22px 0 8px; font-size: 1.2rem; }
+    p { margin: 0 0 14px; }
+    code { background: #ebe6da; padding: .08em .32em; border-radius: 4px; font-size: .92em; }
+    .dek { max-width: 790px; color: var(--muted); font-size: 1.12rem; }
+    .stamp { margin-top: 18px; color: var(--muted); font-size: .88rem; letter-spacing: .06em; text-transform: uppercase; }
+    section { margin-top: 28px; padding: 28px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+    .callout { margin: 16px 0; padding: 16px 20px; border-left: 5px solid var(--amber); background: var(--amber-soft); }
+    .callout.key { border-left-color: var(--green); background: var(--green-soft); }
+    .callout.note { border-left-color: var(--blue); background: var(--blue-soft); }
+    ul, ol { margin: 10px 0 14px; padding-left: 1.25rem; }
+    li + li { margin-top: 7px; }
+    table { width: 100%; border-collapse: collapse; font-size: .93rem; margin: 12px 0 18px; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: .78rem; letter-spacing: .05em; text-transform: uppercase; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .small { color: var(--muted); font-size: .9rem; }
+    mjx-container[display="true"] { margin: 14px 0 !important; overflow-x: auto; overflow-y: hidden; }
+    @media (max-width: 760px) {
+      main { width: min(100% - 24px, 1040px); margin-top: 20px; }
+      section { padding: 20px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Non-uniform rank allocation: what the depth ramp and the type weights do, and why the full budget lost to parity</h1>
+    <p class="dek">A short note on the rank allocator added on branch <code>kd-norms-fact-stab</code> (<code>utils.calculate_ranks</code> / <code>allocate_ranks</code>): the per-layer bit multipliers, the budget matching, the Qwen3-0.6B result, and two hypotheses for the parity-versus-full gap.</p>
+    <p class="stamp">NanoQuant · Qwen3 · 1.0 bpw · 9 September 2026</p>
+  </header>
+
+  <section>
+    <h2>1. Setup: from a bit budget to a rank</h2>
+    <p>Layer \(\ell\) sits in decoder block \(b_\ell \in \{0,\dots,B-1\}\), has shape \(a_\ell \times n_\ell\) (out × in) and \(N_\ell = a_\ell n_\ell\) weights. With the two 16-bit scale vectors of the paper's export, a rank-\(r\) factorisation costs</p>
+    \[
+      \operatorname{bits}_\ell(r) \;=\; r\,(a_\ell + n_\ell) \;+\; 16\,(a_\ell + n_\ell),
+      \tag{1}
+    \]
+    <p>so a per-layer budget of \(\beta_\ell\) bits per weight corresponds to the continuous rank</p>
+    \[
+      r^\star_\ell \;=\; \frac{\beta_\ell\, N_\ell}{a_\ell + n_\ell} \;-\; 16 .
+      \tag{2}
+    \]
+    <p>The paper's rule (Appendix F) is \(\beta_\ell = \beta = 1.0\) for every layer, followed by flooring \(r^\star_\ell\) to a multiple of 32. The flooring is why "1.0 bpw" is 0.973 bpw at 0.6B and 0.986 at 1.7B/4B: about 1.4–2.7 % of the budget is never spent.</p>
+  </section>
+
+  <section>
+    <h2>2. Ramp and type: a multiplier on the per-layer budget</h2>
+    <p>Both levers are a single multiplicative factor on \(\beta\):</p>
+    \[
+      \beta_\ell \;=\; \beta\, c\, m_\ell,
+      \qquad
+      m_\ell \;=\; \underbrace{\exp\!\Big(\rho\,\big(\tfrac{b_\ell}{B-1} - \tfrac12\big)\Big)}_{\text{depth ramp}}
+      \;\cdot\;
+      \underbrace{w_{t(\ell)}}_{\text{type weight}},
+      \qquad
+      c \;=\; \frac{\sum_\ell N_\ell}{\sum_\ell m_\ell N_\ell}.
+      \tag{3}
+    \]
+    <h3>Depth ramp \(\rho\)</h3>
+    <p>A geometric ramp over depth, symmetric in log space around the middle block, so \(\rho\) is the log-ratio of the last block's budget to the first block's. With \(\rho = 0.6\) the first block gets \(e^{-0.3} \approx 0.74\times\) and the last block \(e^{0.3} \approx 1.35\times\) the mean budget, a ratio of \(e^{0.6} \approx 1.8\). Motivation: in the 4B diag run the last 8 of 36 blocks produced half of the pre-KD perplexity damage (0.49 PPL per block versus 0.14 for blocks 0–27), while every block had the same rank.</p>
+    <h3>Type weights \(w_t\)</h3>
+    <p>A fixed multiplier per sub-layer type \(t(\ell) \in \{\)q, k, v, o, gate, up, down\(\}\), set from the median relative block-loss jump caused by binarising that layer type over the 27 logged 4B blocks:</p>
+    <table>
+      <thead><tr><th>type</th><th class="num">median relative block-loss jump at ADMM</th><th class="num">\(w_t\)</th></tr></thead>
+      <tbody>
+        <tr><td>mlp.down_proj</td><td class="num">+44 %</td><td class="num">1.15</td></tr>
+        <tr><td>mlp.up_proj</td><td class="num">+32 %</td><td class="num">1.05</td></tr>
+        <tr><td>mlp.gate_proj</td><td class="num">+23 %</td><td class="num">1.00</td></tr>
+        <tr><td>self_attn.o_proj</td><td class="num">+10 %</td><td class="num">1.00</td></tr>
+        <tr><td>self_attn.v_proj</td><td class="num">+10 % (+600 % in the first third of the network)</td><td class="num">1.10</td></tr>
+        <tr><td>self_attn.k_proj</td><td class="num">+2 %</td><td class="num">0.90</td></tr>
+        <tr><td>self_attn.q_proj</td><td class="num">+1.5 %</td><td class="num">0.85</td></tr>
+      </tbody>
+    </table>
+    <div class="callout note">
+      <strong>The multipliers only move bits, they never add them.</strong> The constant \(c\) in (3) renormalises so that \(\sum_\ell \beta_\ell N_\ell = \beta \sum_\ell N_\ell\): the continuous budgets sum to exactly the uniform rule's target, whatever \(\rho\) and \(w\) are.
+    </div>
+  </section>
+
+  <section>
+    <h2>3. Budget matching in steps of 32</h2>
+    <p>Each rank starts at \(r^\star_\ell\) of (2) floored to a multiple of 32 and clamped to \([32, \min(a_\ell, n_\ell)]\). The allocator then moves ranks in \(\pm 32\) steps toward a total-bit target \(T\), always choosing the layer with the largest <em>relative excess</em></p>
+    \[
+      \varepsilon_\ell \;=\; \frac{r_\ell - r^\star_\ell}{r^\star_\ell}
+      \tag{4}
+    \]
+    <p>to shrink when over budget, and the layer with the most negative \(\varepsilon_\ell\) (whose step still fits) to grow when under budget. Two targets are offered:</p>
+    <ul>
+      <li><strong>parity</strong> — \(T\) is the number of bits the uniform rule <em>actually</em> spends after its own flooring (0.9729 bpw at 0.6B), so arms are comparable at identical actual bpw;</li>
+      <li><strong>full</strong> — \(T = \beta \sum_\ell N_\ell\), i.e. exactly 1.0 bpw, spending the flooring remainder.</li>
+    </ul>
+    <p>Concretely at Qwen3-0.6B (28 blocks), with \(\rho = 0.6\) and the type weights above:</p>
+    <table>
+      <thead><tr><th>allocation</th><th class="num">q</th><th class="num">k</th><th class="num">v</th><th class="num">o</th><th class="num">gate</th><th class="num">up</th><th class="num">down</th></tr></thead>
+      <tbody>
+        <tr><td>uniform (every block)</td><td class="num">640</td><td class="num">480</td><td class="num">480</td><td class="num">640</td><td class="num">736</td><td class="num">736</td><td class="num">736</td></tr>
+        <tr><td>parity, block 0</td><td class="num">384</td><td class="num">288</td><td class="num">384</td><td class="num">448</td><td class="num">512</td><td class="num">544</td><td class="num">608</td></tr>
+        <tr><td>parity, block 27</td><td class="num">736</td><td class="num">576</td><td class="num">704</td><td class="num">864</td><td class="num">960</td><td class="num">1024*</td><td class="num">1024*</td></tr>
+      </tbody>
+    </table>
+    <p class="small">* capped at \(\min(a_\ell, n_\ell) = 1024\): the MLP layers of the last blocks are saturated.</p>
+  </section>
+
+  <section>
+    <h2>4. Result at 0.6B (2026-09-09, KL factors, \(p = \tfrac12\), fresh input factor, refresh every 7 blocks)</h2>
+    <table>
+      <thead><tr><th>arm</th><th>job</th><th class="num">actual bpw</th><th class="num">pre-KD PPL (block 27)</th><th class="num">WikiText-2 PPL</th></tr></thead>
+      <tbody>
+        <tr><td>control (uniform)</td><td>5616769</td><td class="num">0.9729</td><td class="num">27.35</td><td class="num">25.48</td></tr>
+        <tr><td>ramp \(\rho = 0.6\)</td><td>5616770</td><td class="num">0.9729</td><td class="num">25.31</td><td class="num">24.31</td></tr>
+        <tr><td>type weights</td><td>5616771</td><td class="num">0.9729</td><td class="num">25.55</td><td class="num">24.12</td></tr>
+        <tr><td><strong>ramp + type, parity</strong></td><td>5616772</td><td class="num">0.9728</td><td class="num">24.19</td><td class="num"><strong>23.25</strong></td></tr>
+        <tr><td>ramp + type, full</td><td>5616773</td><td class="num">1.0000</td><td class="num">25.08</td><td class="num">24.15</td></tr>
+      </tbody>
+    </table>
+    <div class="callout key">
+      Both levers help alone and they stack: the combined parity arm is 2.2 PPL (−8.7 %) below the same-code control at identical bits, 16 % below the paper's 27.56, and well below the previous 0.6B best of 26.07. The ramp arm is far worse on the early blocks by construction (block 0: 24.5 versus 16.3) and overtakes the control around block 21, which is the predicted mechanism.
+    </div>
+  </section>
+
+  <section>
+    <h2>5. Why did the full budget (24.15) lose to parity (23.25) with 2.7 % more bits?</h2>
+    <p>Diffing the two allocations for 0.6B: <em>full</em> differs from <em>parity</em> in 120 of the 196 layers, each by one 32-step upward. Where those steps went is the first hypothesis.</p>
+    <h3>Hypothesis 1: the remainder landed where the marginal bit is worth least</h3>
+    <p>The fill rule (4) is sensitivity-blind. It grows whichever layer has the most negative \(\varepsilon_\ell\), i.e. the layer whose flooring lost the most <em>relative</em> to its target. That systematically favours</p>
+    <ul>
+      <li><strong>small-rank layers</strong>, where 32 is a large fraction of \(r^\star_\ell\): 22 k-projections and 20 q-projections grew, against 12 down-projections;</li>
+      <li><strong>early blocks</strong>, where the ramp pushed \(r^\star_\ell\) down: 5–7 layers grew in each of blocks 0–11 versus 1–3 in blocks 25–27;</li>
+      <li>and it <strong>cannot</strong> grow the late-block MLP layers at all, because up and down are already capped at \(\min(a_\ell, n_\ell) = 1024\) there.</li>
+    </ul>
+    <p>So the extra 2.7 % of bits went preferentially to q/k in early blocks — the layers and depths the ramp and type weights had just judged least valuable. The block trajectory agrees: <em>full</em> led <em>parity</em> early (block 0: 21.2 vs 23.6) and had lost by block 27 (25.08 vs 24.19). The direct test is a sensitivity-weighted fill (grow the layer with the largest \(m_\ell\)-weighted deficit, or restrict the remainder to the last third of the blocks).</p>
+    <h3>Hypothesis 2: single-run noise</h3>
+    <p>Run-to-run spread of a full 0.6B reconstruction is about \(\pm 0.5\) PPL. The two arms differ in 120 layers' ADMM problems and therefore in every block checkpoint, so they are effectively independent draws; a 0.9 gap is roughly two sigma. The ordering control \(>\) ramp \(\approx\) type \(>\) both is well outside that spread, the parity-versus-full gap is not, and a second seed would settle it.</p>
+    <h3>A smaller third possibility</h3>
+    <p>More rank in an early block changes its ADMM solution and hence the quantised-prefix activations that every later layer is tuned against. Under the sequential seven-stages-per-block schedule, extra early capacity is not a free improvement: the later blocks re-fit to a different prefix, and the end-to-end effect can trade against them.</p>
+    <p class="small">Companion documents: <code>results.md</code> (all runs), <code>admm_block_tuning_curvature.html</code>, <code>curvature_tempering_theory.md</code>.</p>
+  </section>
+</main>
+</body>
+</html>

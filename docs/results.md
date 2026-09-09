@@ -399,3 +399,38 @@ change `fact_binary_lr`. Control: `qwen3_0p6b_grid_kl_full_p05.json` (14.78 / 14
   (normalised @1e-5, @1e-6) costs 0.1–0.2 PPL, and a larger margin-aware flip budget (normalised @1e-4) costs the
   same, so the flips the current tuner makes are net useful and the rising training loss seen for `o_proj` is not
   hurting the held-out perplexity at this scale. `fact_latent_normalize` stays available but off.
+
+## Non-uniform rank allocation and tail-block logit objective (2026-09-09, Qwen3-0.6B, full runs)
+
+Recipe for all arms: KL factors, ADMM p = ½, fresh input factor, refresh every 7 blocks, diag block loss, scale-only
+KD (`configs/qwen3_0p6b_kl_ra_*.json`, `qwen3_0p6b_kl_tail4*.json`). Mechanics and the hypotheses below are written
+up in `rank_allocation_note.html`. Rank allocation: per-layer bit multiplier = depth ramp exp(ρ(b/(B−1) − ½)) ×
+per-type weight (q 0.85, k 0.9, v 1.1, o 1.0, gate 1.0, up 1.05, down 1.15, from the median block-loss jump each
+type's binarisation caused in the 4B logs), renormalised to the uniform rule's total bits ("parity") or to exactly
+1.0 bpw ("full"). Tail objective: the last K blocks are reconstructed against the FP suffix's logits (forward KL,
+`tail_logit_blocks`) instead of the weighted block MSE, optionally mixed with it (`tail_logit_mix`).
+
+| arm | job | actual bpw | pre-KD PPL (block 27) | **WikiText-2 PPL** |
+|---|---|---|---|---|
+| control (uniform ranks) | 5616769 | 0.9729 | 27.35 | 25.48 |
+| depth ramp ρ = 0.6 | 5616770 | 0.9729 | 25.31 | 24.31 |
+| type weights | 5616771 | 0.9729 | 25.55 | 24.12 |
+| **ramp + type, parity** | 5616772 | 0.9728 | 24.19 | **23.25** |
+| ramp + type, full 1.0 bpw | 5616773 | 1.0000 | 25.08 | 24.15 |
+| tail K = 4, pure KL | 5616774 | 0.9729 | 24.79 | 24.57 |
+| tail K = 4, mix 0.5 | 5616775 | 0.9729 | 25.36 | 24.55 |
+
+- **Rank allocation is the largest single gain so far**: −2.2 PPL (−8.7 %) against the same-code control at
+  identical bits, 16 % below the paper's 27.56 and well below the previous 0.6B best (26.07). Ramp and type weights
+  each help alone and stack. The ramp arm is far worse on early blocks by construction (block 0: 24.5 vs 16.3) and
+  overtakes the control around block 21, the predicted mechanism (half of the 4B pre-KD damage sat in the last 8 of
+  36 blocks).
+- **Spending the rounding remainder (full budget) did not add to it** (24.15 vs 23.25). The fill rule is
+  sensitivity-blind: it grew 120 layers by one 32-step, skewed to q/k and to blocks 0–11, while the late-block MLP
+  layers were already capped at rank min(in, out) = 1024; part of the gap is single-run noise (±0.5).
+- **The tail-block logit objective is the second real lever**: −0.9 PPL post-KD (−2.6 pre-KD) for both variants;
+  the arms track the control exactly through block 23 and separate over the last four blocks. Pure KL and the
+  0.5 mix are indistinguishable.
+- Cost: unchanged per block for the ranks; the tail objective adds ~25 % to the last four blocks at 0.6B.
+- Follow-ups running: rank ceiling lifted to 2 × min(in, out) (`rank_max_ratio`) at ρ = 0.6 and ρ = 1.0, ρ = 1.0
+  capped, ranks + tail combined; 4B with the parity allocation (job 5617467).

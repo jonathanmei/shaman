@@ -129,9 +129,29 @@ def test_full_budget_spends_the_rounding_remainder():
     assert acc["factorized_bpw"] > 0.99
 
 
+def test_rank_max_ratio_lets_late_blocks_exceed_min_dim():
+    model = _model(8)
+    strong = _cfg(rank_budget="parity", rank_depth_ramp=1.2, rank_type_weights="down_proj:1.3,up_proj:1.2")
+    capped = U.calculate_ranks(model, NAMES, strong)
+    lifted = U.calculate_ranks(model, NAMES, dict(strong, rank_max_ratio=2.0))
+    last_capped, last_lifted = _by_block(capped)[7], _by_block(lifted)[7]
+    assert last_capped["mlp.down_proj"] == 1024 == last_capped["mlp.up_proj"]  # min(3072, 1024), the legacy cap
+    assert last_lifted["mlp.down_proj"] > 1024 and last_lifted["mlp.up_proj"] > 1024
+    assert max(lifted.values()) <= 2 * 1024
+    assert all(r % 32 == 0 for r in lifted.values())
+    assert abs(_total_bits(model, lifted) - _total_bits(model, capped)) <= 32 * (3072 + 1024)  # same parity target
+    # ratio 1.0 is the legacy cap exactly; ratios below 1 are rejected
+    assert U.calculate_ranks(model, NAMES, dict(strong, rank_max_ratio=1.0)) == capped
+    with pytest.raises(ValueError):
+        U.calculate_ranks(model, NAMES, dict(strong, rank_max_ratio=0.5))
+    # the uniform rule never reaches min(a, n), so the ratio does not change it
+    assert U.calculate_ranks(model, NAMES, _cfg(rank_max_ratio=2.0)) == U.calculate_ranks(model, NAMES, _cfg())
+
+
 def test_config_plumbing_and_cache_keys():
     cfg = NanoQuantConfig(model_id="t")
     assert cfg["rank_budget"] == "uniform" and cfg["rank_depth_ramp"] == 0.0 and cfg["rank_type_weights"] == ""
+    assert cfg["rank_max_ratio"] == 1.0
     base = NanoQuantConfig(model_id="tiny/model", num_calib_samples=4, seqlen=16)
 
     def over(**kw):
@@ -139,10 +159,13 @@ def test_config_plumbing_and_cache_keys():
         c.update(kw)
         return c
 
-    for field, value in (("rank_budget", "full"), ("rank_depth_ramp", 0.5), ("rank_type_weights", "v_proj:1.2")):
+    for field, value in (("rank_budget", "full"), ("rank_depth_ramp", 0.5), ("rank_type_weights", "v_proj:1.2"),
+                         ("rank_max_ratio", 2.0)):
         assert C.chain_keys(base, 2)[0] != C.chain_keys(over(**{field: value}), 2)[0], field
-    pipeline.validate_config(over(rank_budget="parity", rank_depth_ramp=0.5, rank_type_weights="v_proj:1.2"))
+    pipeline.validate_config(over(rank_budget="parity", rank_depth_ramp=0.5, rank_type_weights="v_proj:1.2",
+                                  rank_max_ratio=2.0))
     for bad in ({"rank_budget": "banana"}, {"rank_depth_ramp": 0.5}, {"rank_type_weights": "v_proj:x",
-                                                                       "rank_budget": "parity"}):
+                                                                       "rank_budget": "parity"},
+                {"rank_max_ratio": 0.9}):
         with pytest.raises(ValueError):
             pipeline.validate_config(over(**bad))

@@ -46,6 +46,7 @@ class NanoQuantConfigDataclass:
     rank_budget: str = "uniform"
     rank_depth_ramp: float = 0.0
     rank_type_weights: str = ""
+    rank_max_ratio: float = 1.0
     # calib
     seed: int = 0
     num_calib_samples: int = 128

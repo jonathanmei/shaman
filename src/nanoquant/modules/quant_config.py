@@ -12,6 +12,8 @@ def NanoQuantConfig(
     rank_budget: str = "uniform",
     rank_depth_ramp: float = 0.0,
     rank_type_weights: str = "",
+    # rank ceiling as a multiple of min(in, out) (1.0 = legacy cap; binary factors stay meaningful above it)
+    rank_max_ratio: float = 1.0,
     # calib
     seed: int = 0,
     num_calib_samples: int = 128,
@@ -116,6 +118,7 @@ def NanoQuantConfig(
         "rank_budget": rank_budget,
         "rank_depth_ramp": rank_depth_ramp,
         "rank_type_weights": rank_type_weights,
+        "rank_max_ratio": rank_max_ratio,
         # calibration
         "seed": seed,
         "num_calib_samples": num_calib_samples,

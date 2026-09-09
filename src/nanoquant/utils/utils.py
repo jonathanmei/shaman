@@ -203,12 +203,13 @@ def _continuous_rank(a: int, b: int, bits: float, num_scales: int = 2):
     return (total_budget_bits / param_sum) - SCALE_BITS
 
 
-def _floor_rank(rank, in_features: int, out_features: int, min_rank: int = RANK_STEP) -> int:
-    """Legacy rounding: floor to a multiple of 32, at least ``min_rank``, at most ``min(in, out)``."""
+def _floor_rank(rank, in_features: int, out_features: int, min_rank: int = RANK_STEP,
+                max_rank: int | None = None) -> int:
+    """Legacy rounding: floor to a multiple of 32, at least ``min_rank``, at most ``max_rank`` (default ``min(in, out)``)."""
     curr_rank = int(rank) if rank is not None else 0
     curr_rank = (curr_rank // RANK_STEP) * RANK_STEP
     curr_rank = max(curr_rank, min_rank)
-    return min(curr_rank, min(in_features, out_features))
+    return min(curr_rank, min(in_features, out_features) if max_rank is None else max_rank)
 
 
 def parse_type_weights(spec: str) -> dict[str, float]:
@@ -248,7 +249,7 @@ def _type_weight(name: str, weights: dict[str, float]) -> float:
 
 def allocate_ranks(shapes: dict[str, tuple[int, int]], n_blocks: int, bits: float, num_scales: int,
                    depth_ramp: float, type_weights: dict[str, float], budget: str,
-                   legacy: dict[str, int]) -> dict[str, int]:
+                   legacy: dict[str, int], max_ratio: float = 1.0) -> dict[str, int]:
     """Budget-matched non-uniform rank allocation.
 
     Every layer ``l`` gets a bit-budget multiplier ``m_l = exp(ramp (b_l/(B-1) - 1/2)) * w_type(l)`` (block index
@@ -257,7 +258,12 @@ def allocate_ranks(shapes: dict[str, tuple[int, int]], n_blocks: int, bits: floa
     the bit target: ``budget="parity"`` targets the bits the legacy uniform rule actually spends (so arms are
     comparable at identical actual bpw), ``budget="full"`` targets ``bits`` per weight exactly (spending the
     remainder that the 32-multiple rounding leaves idle). Steps are taken on the layer whose rank is furthest
-    from its continuous target in relative terms, never below 32 nor above ``min(in, out)``.
+    from its continuous target in relative terms, never below 32 nor above ``max_ratio * min(in, out)``.
+
+    Ranks above ``min(in, out)`` are meaningful for binary factors: the real rank of the sign product saturates
+    there, but the set of representable matrices keeps growing with the rank (each entry of the product is a sum
+    of ``rank`` terms of ±1), and the ADMM solves stay well posed through their ridge/proximal terms. The ratio
+    bounds the ``rank^3`` cost of the Mahalanobis ADMM's eigendecompositions.
 
     Parameters
     ----------
@@ -277,6 +283,8 @@ def allocate_ranks(shapes: dict[str, tuple[int, int]], n_blocks: int, bits: floa
         ``"parity"`` or ``"full"``.
     legacy : dict
         Ranks of the uniform rule (defines the parity target).
+    max_ratio : float
+        Rank ceiling as a multiple of ``min(in, out)`` (``1.0`` = the legacy cap), floored to a multiple of 32.
 
     Returns
     -------
@@ -285,6 +293,8 @@ def allocate_ranks(shapes: dict[str, tuple[int, int]], n_blocks: int, bits: floa
     """
     if budget not in ("parity", "full"):
         raise ValueError(f"Unknown rank_budget for allocate_ranks: {budget}")
+    if max_ratio < 1.0:
+        raise ValueError("rank_max_ratio must be >= 1")
     known = {k.split(".", 1)[1] for k in shapes} | {k.split(".", 1)[1].rsplit(".", 1)[-1] for k in shapes}
     unknown = [t for t in type_weights if t not in known]
     if unknown:
@@ -298,8 +308,9 @@ def allocate_ranks(shapes: dict[str, tuple[int, int]], n_blocks: int, bits: floa
     weights_total = sum(a * b for a, b in shapes.values())
     norm = weights_total / sum(mult[k] * a * b for k, (a, b) in shapes.items())
     target = {k: max(_continuous_rank(a, b, bits * mult[k] * norm, num_scales), 1.0) for k, (a, b) in shapes.items()}
-    ranks = {k: _floor_rank(target[k], a, b) for k, (a, b) in shapes.items()}
-    lo, hi = RANK_STEP, {k: min(a, b) for k, (a, b) in shapes.items()}
+    lo = RANK_STEP
+    hi = {k: max(min(a, b), (int(max_ratio * min(a, b)) // RANK_STEP) * RANK_STEP) for k, (a, b) in shapes.items()}
+    ranks = {k: min(_floor_rank(target[k], a, b, max_rank=hi[k]), hi[k]) for k, (a, b) in shapes.items()}
     step_bits = {k: RANK_STEP * (a + b) + (SCALE_BITS * RANK_STEP if num_scales == 3 else 0)
                  for k, (a, b) in shapes.items()}
     if budget == "parity":
@@ -348,9 +359,13 @@ def calculate_ranks(model, layers_to_analyze, quant_config):
         raise ValueError(f"Unknown rank_budget: {budget}")
     ramp = float(quant_config.get('rank_depth_ramp', 0.0) or 0.0)
     type_weights = parse_type_weights(quant_config.get('rank_type_weights', '') or '')
+    max_ratio = float(quant_config.get('rank_max_ratio', 1.0) or 1.0)
+    if max_ratio < 1.0:
+        raise ValueError("rank_max_ratio must be >= 1")
 
     print(f"Rank calculation: Bits = ({bits:.2f}), Scales: {num_scales}, budget: {budget}"
-          + (f", depth ramp {ramp:g}" if ramp else "") + (f", type weights {type_weights}" if type_weights else ""))
+          + (f", depth ramp {ramp:g}" if ramp else "") + (f", type weights {type_weights}" if type_weights else "")
+          + (f", rank ceiling {max_ratio:g} x min(in, out)" if max_ratio != 1.0 else ""))
     blocks = get_decoder_layers(model)
     shapes: dict[str, tuple[int, int]] = {}
     for i, layer in enumerate(blocks):
@@ -363,7 +378,8 @@ def calculate_ranks(model, layers_to_analyze, quant_config):
         if ramp or type_weights:
             raise ValueError("rank_depth_ramp / rank_type_weights require rank_budget='parity' or 'full'")
         return legacy
-    ranks = allocate_ranks(shapes, len(blocks), bits, num_scales, ramp, type_weights, budget, legacy)
+    ranks = allocate_ranks(shapes, len(blocks), bits, num_scales, ramp, type_weights, budget, legacy,
+                           max_ratio=max_ratio)
     changed = sum(ranks[k] != legacy[k] for k in ranks)
     print(f"Rank allocation: {changed}/{len(ranks)} layers differ from the uniform rule; "
           f"ranks {min(ranks.values())}..{max(ranks.values())}")

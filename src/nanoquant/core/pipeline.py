@@ -64,6 +64,8 @@ def validate_config(quant_config: dict) -> None:
     if budget not in RANK_BUDGETS:
         raise ValueError(f"Unknown rank_budget: {budget}")
     parse_type_weights(quant_config.get("rank_type_weights", "") or "")  # raises on malformed entries
+    if float(quant_config.get("rank_max_ratio", 1.0) or 1.0) < 1.0:
+        raise ValueError("rank_max_ratio must be >= 1")
     if budget == "uniform" and (float(quant_config.get("rank_depth_ramp", 0.0) or 0.0)
                                 or (quant_config.get("rank_type_weights", "") or "").strip()):
         raise ValueError("rank_depth_ramp / rank_type_weights require rank_budget='parity' or 'full'")
