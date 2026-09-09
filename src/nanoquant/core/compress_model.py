@@ -36,6 +36,7 @@ from ..utils.utils import (
 )
 from .curvature import format_spectrum
 from .importance import (
+    PLAIN_COV_KEY,
     collect_stats,
     get_shrunk_stats,
     register_stats,
@@ -71,7 +72,18 @@ def refresh_block_curvature(model, dataloader, dev: str, quant_config: dict) -> 
     layers = {n: m for n, m in model.named_modules() if isinstance(m, torch.nn.Linear) and "lm_head" not in n}
     if not layers:
         return 0
-    init = {key: {n: getattr(m, key) for n, m in layers.items() if hasattr(m, key)} for key in ("i_cov", "o_cov")}
+    # Detach the current dense factors to the CPU and drop them from the modules: collect_stats moves the whole
+    # model to the device, and at 4B the remaining layers' factors alone are ~36 GB. The collector moves the
+    # warm-start factors to the device one layer group at a time and register_stats re-attaches the new ones.
+    init: dict[str, dict[str, torch.Tensor]] = {"i_cov": {}, "o_cov": {}}
+    for n, m in model.named_modules():
+        for key in ("i_cov", "o_cov"):
+            if hasattr(m, key):
+                if n in layers:
+                    init[key][n] = getattr(m, key).detach().to("cpu")
+                delattr(m, key)
+        if hasattr(m, PLAIN_COV_KEY):
+            delattr(m, PLAIN_COV_KEY)
     with torch.enable_grad():
         raw = collect_stats(model, dataloader, dev, strategy=quant_config['calib_strategy'], curvature='kron',
                             fit=quant_config.get('kron_fit', 'frobenius'),

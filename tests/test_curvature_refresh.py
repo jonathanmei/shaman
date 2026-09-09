@@ -141,7 +141,18 @@ def test_refresh_block_curvature_skips_quantised_layers(monkeypatch):
     stale = model.model.layers[1][0].i_cov.clone()
     cfg = NanoQuantConfig(model_id="t", curvature="kron", calib_strategy="dbf", calib_shrinkage=0.2,
                           curvature_refresh_iters=1)
+    seen = {}
+    real_collect = compress_model.collect_stats
+
+    def spy_collect(model_, *a, **k):
+        # the modules must not carry their dense factors while the model is moved to the device
+        seen["buffers_left"] = sum(hasattr(m, "i_cov") for m in model_.modules())
+        seen["init_layers"] = sorted(k["init_factors"]["i_cov"])
+        return real_collect(model_, *a, **k)
+
+    monkeypatch.setattr(compress_model, "collect_stats", spy_collect)
     n = compress_model.refresh_block_curvature(model, dataloader, "cpu", cfg)
+    assert seen["buffers_left"] == 0 and len(seen["init_layers"]) == 3
     assert n == 3  # three remaining nn.Linear layers
     fresh = model.model.layers[1][0].i_cov
     assert fresh.shape == stale.shape and not torch.allclose(fresh, stale)
