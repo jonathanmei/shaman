@@ -352,3 +352,50 @@ configs `qwen3_1p7b_kron_2scale_kl_refresh.json` (p = 1) and `qwen3_1p7b_kron_2s
   factors were computed on the CPU; fixed on the branch by inverting on the accumulation device (uncommitted at the
   time of writing, see the pending-state note). The p = 0.5 arm came within minutes of the 4-hour limit for that
   reason.
+
+## KD-stage screen at 4B on the cached pre-KD model (2026-09-09, branch `kd-norms-fact-stab`)
+
+Motivation: cheapest of the five levers ranked after the 4B result (2026-09-09 brainstorm). The KD stage is nearly
+deterministic given the pre-KD model (noise ≈ 0.02 at 0.6B), so three cheap KD changes were screened on the cached
+4B pre-KD model of job 5616745 (`pre_kd_checkpoint`, `cache/model/4259d0d2…`): residual-stream feature distillation
+at weight 1 (−0.2 at 0.6B), training the 145 RMSNorm / q_norm / k_norm weight vectors alongside the 504 scale
+vectors (`model_kd_norm_weights`, lr 1e-5; zero bit cost), and best-epoch selection on WikiText-2 *validation*
+perplexity (`model_kd_select_best`). Calibration data stays at the paper's 128 sequences. Configs
+`configs/qwen3_4b_kl_kd*.json`, ~25 min per arm incl. zero-shot.
+
+| arm | job | KD loss ep8 | test PPL after epochs 1 / 4 / 6 / 8 | **WikiText-2 PPL** | zero-shot mean |
+|---|---|---|---|---|---|
+| control (scales only) | 5616760 | 2.186 | 14.21 / 14.12 / 14.10 / 14.11 | 14.106 | 0.463 |
+| feature-KD w = 1 | 5616761 | | | 14.133 | 0.463 |
+| + norm weights | 5616762 | 2.186 | 14.21 / 14.12 / 14.11 / 14.10 | 14.103 | 0.465 |
+| best epoch on validation | 5616763 | | validation 14.50 → 14.39 (ep 6), still falling | 14.106 | 0.463 |
+| all three | 5616764 | 2.189 (KL) | 14.24 / 14.14 / 14.13 / 14.12 | 14.124 | 0.461 |
+
+- **Null result at 4B.** All arms lie within ±0.03 of the control (14.106, reproducing 14.11). The feature term's
+  −0.2 at 0.6B does not transfer; the extra normalisation parameters change nothing; validation perplexity is still
+  decreasing at epoch 6, so the last epoch is already the best and early stopping has nothing to restore. Scale-only
+  KD at 4B is saturated with respect to these levers.
+- Ledger caveat: the `git_commit` of these rows reads 884e1cb because the shared cluster checkout advanced to the
+  track-B commit while they ran; the code that ran is eaafbac (the commit hash is read when the ledger line is
+  written).
+
+## Factor-tuning stabilisation screen (2026-09-09, Qwen3-0.6B, 4 blocks, KL factors, p = ½)
+
+Motivation: in the 4B logs `tune_fact` recovers almost none of the block-loss jump caused by binarising v/o/down
+(and the training block loss sometimes rises during the stage), while 1.4–1.9 % of latent signs flip per pass with
+Adam's ±lr first steps on latents of median magnitude ≈ 2e-3, the mechanism that broke latent KD. Arms rescale the
+fresh ADMM latents row-wise to unit mean magnitude before tuning (`fact_latent_normalize`, forward unchanged) and/or
+change `fact_binary_lr`. Control: `qwen3_0p6b_grid_kl_full_p05.json` (14.78 / 14.81 / 14.88 in three runs).
+
+| arm | job | flips per layer | block 3 PPL |
+|---|---|---|---|
+| control (lr 1e-5) | 5615855 / 5615858 / 5615863 | 1.4–1.9 % | 14.78 / 14.81 / 14.88 |
+| normalised latents, lr 1e-5 | 5616765 | ~1e-4 | 15.04 |
+| lr 1e-6 | 5616766 | | 14.89 |
+| normalised, lr 1e-6 | 5616767 | ~0 | 14.92 |
+| normalised, lr 1e-4 | 5616768 | | 15.07 |
+
+- **Null (slightly negative).** Every stabilised arm is at or above the control range. Suppressing the flips
+  (normalised @1e-5, @1e-6) costs 0.1–0.2 PPL, and a larger margin-aware flip budget (normalised @1e-4) costs the
+  same, so the flips the current tuner makes are net useful and the rising training loss seen for `o_proj` is not
+  hurting the held-out perplexity at this scale. `fact_latent_normalize` stays available but off.
