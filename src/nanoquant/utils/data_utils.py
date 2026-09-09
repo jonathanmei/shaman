@@ -51,15 +51,18 @@ def get_calib_loader(dataset_path, tokenizer, n_samples=128, seed=0, seqlen=2048
     return dataloader
 
 
-def get_test_loaders(name, seqlen=2048, model_name=''):
+def get_test_loaders(name, seqlen=2048, model_name='', split='test'):
     """
     Loads standard evaluation datasets like Wikitext2 and C4.
+
+    ``split`` selects the WikiText-2 split (``"test"`` for the reported perplexity, ``"validation"`` for
+    model selection); it is ignored for C4.
     """
     tokenizer = load_tokenizer(model_name)
 
     if 'wikitext2' in name:
         # Correct dataset name to 'wikitext' and config to 'wikitext-2-raw-v1'
-        testdata = datasets.load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='test')
+        testdata = datasets.load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split=split)
         testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
     elif 'c4' in name:
         testdata = datasets.load_dataset('allenai/c4',

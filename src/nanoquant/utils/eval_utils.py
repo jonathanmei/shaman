@@ -88,18 +88,19 @@ def evaluate_ppl(model, testenc, dev, dataset_name, args=None, verbose=True):
 
 
 @torch.no_grad()
-def evaluate_ppl_after_block(model, model_name, dev, get_test_ppl=True):
+def evaluate_ppl_after_block(model, model_name, dev, get_test_ppl=True, split="test"):
     """
     Function to evaluate PPL after block-wise processing during the compression stage.
-    It internally calls the core `evaluate_ppl` function.
+    It internally calls the core `evaluate_ppl` function on the WikiText-2 ``split`` (``"test"`` or
+    ``"validation"``).
     """
     test_ppl = None
 
     # Evaluate PPL on the test dataset
     if get_test_ppl:
         from ..utils.data_utils import get_test_loaders
-        _, test_loader = get_test_loaders("wikitext2", model_name=model_name, seqlen=model.seqlen)
-        test_ppl = evaluate_ppl(model, test_loader, dev, "wikitext2", None, verbose=False)
+        _, test_loader = get_test_loaders("wikitext2", model_name=model_name, seqlen=model.seqlen, split=split)
+        test_ppl = evaluate_ppl(model, test_loader, dev, f"wikitext2-{split}", None, verbose=False)
 
     return test_ppl
 

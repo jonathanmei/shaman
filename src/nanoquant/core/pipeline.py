@@ -91,6 +91,8 @@ def validate_config(quant_config: dict) -> None:
     if float(quant_config.get("model_kd_feature_weight", 0.0) or 0.0) > 0 \
             and quant_config.get("model_kd_teacher", "ram") != "online":
         raise ValueError("model_kd_feature_weight > 0 requires model_kd_teacher='online'")
+    if quant_config.get("model_kd_norm_weights", False) and float(quant_config.get("model_kd_norm_lr", 0.0)) <= 0:
+        raise ValueError("model_kd_norm_weights=true requires model_kd_norm_lr > 0")
     override = quant_config.get("pre_kd_checkpoint") or ""
     if override and not os.path.isfile(override):
         raise ValueError(f"pre_kd_checkpoint does not exist: {override}")

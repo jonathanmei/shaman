@@ -177,6 +177,10 @@ class TuneArguments:
     fact_bias_lr: float = field(default=1e-5, metadata={"help": "LR for factorized bias parameters"})
     fact_batch_size: int = field(default=1, metadata={"help": "Batch size for factorized tuning"})
     fact_epochs: int = field(default=8, metadata={"help": "Epochs for factorized tuning"})
+    fact_latent_normalize: bool = field(
+        default=False,
+        metadata={"help": "Rescale each latent row of the freshly factorised layer to unit mean magnitude before "
+                          "factor tuning (sign-preserving; one lr = one flip budget per row)"})
     retain_latent: bool = field(
         default=False,
         metadata={"help": "Keep the (frozen) latent factors after block tuning; required by model_kd_mode=scales_latent"})
@@ -195,6 +199,13 @@ class TuneArguments:
     model_kd_feature_weight: float = field(
         default=0.0, metadata={"help": "Weight of the residual-stream feature distillation term in KD (0 = off; "
                                        "requires model_kd_teacher=online)"})
+    model_kd_norm_weights: bool = field(
+        default=False, metadata={"help": "Also train the weights of every normalisation layer (RMSNorm/LayerNorm) "
+                                         "during KD"})
+    model_kd_norm_lr: float = field(default=1e-5, metadata={"help": "LR of the normalisation weights during KD"})
+    model_kd_select_best: bool = field(
+        default=False, metadata={"help": "Evaluate WikiText-2 validation perplexity after every KD epoch and keep "
+                                         "the best epoch's parameters"})
     pre_kd_checkpoint: str = field(
         default="", metadata={"help": "Explicit pre-KD checkpoint to load instead of the keyed cache artifact"})
     model_kd_batch_size: int = field(default=1, metadata={"help": "Batch size for model KD"})
@@ -318,6 +329,7 @@ def main():
         fact_bias_lr=tune_args.fact_bias_lr,
         fact_batch_size=tune_args.fact_batch_size,
         fact_epochs=tune_args.fact_epochs,
+        fact_latent_normalize=tune_args.fact_latent_normalize,
         retain_latent=tune_args.retain_latent,
         tune_model=tune_args.tune_model,
         model_kd_lr=tune_args.model_kd_lr,
@@ -326,6 +338,9 @@ def main():
         model_kd_latent_normalize=tune_args.model_kd_latent_normalize,
         model_kd_eval_every_epoch=tune_args.model_kd_eval_every_epoch,
         model_kd_feature_weight=tune_args.model_kd_feature_weight,
+        model_kd_norm_weights=tune_args.model_kd_norm_weights,
+        model_kd_norm_lr=tune_args.model_kd_norm_lr,
+        model_kd_select_best=tune_args.model_kd_select_best,
         pre_kd_checkpoint=tune_args.pre_kd_checkpoint,
         model_kd_batch_size=tune_args.model_kd_batch_size,
         model_kd_epochs=tune_args.model_kd_epochs,

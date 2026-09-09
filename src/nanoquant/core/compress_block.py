@@ -18,7 +18,7 @@ from ..utils.utils import cleanup_memory, find_layers, set_seed
 from .admm_dbf import factorize_admm_dbf
 from .admm_nq import factorize_admm_nanoquant
 from .curvature import condition_curvature, spectrum_summary
-from .latent import hard_sign, sign_flips
+from .latent import hard_sign, normalize_latents, sign_flips
 
 
 @torch.jit.script
@@ -480,8 +480,11 @@ def tune_fact(block, target_linear, block_inputs, block_target_outputs, curvatur
               quant_config):
     """Tune the latent binary factors and scales of ``target_linear`` (STE forward), then harden it.
 
-    The number of sign flips relative to the ADMM initialisation is logged; with ``retain_latent`` the
-    frozen latents are kept on the layer for a later latent-aware KD stage.
+    With ``fact_latent_normalize`` the ADMM latents (tiny: median ``|latent|`` of order 1e-3) are first rescaled
+    row-wise to unit mean magnitude, which leaves the STE forward unchanged and makes ``fact_binary_lr`` a
+    flip budget rather than a flip-everything switch. The number of sign flips relative to the ADMM
+    initialisation is logged; with ``retain_latent`` the frozen latents are kept on the layer for a later
+    latent-aware KD stage.
     """
     set_seed(quant_config['seed'])
     batch_size = quant_config['fact_batch_size']
@@ -491,6 +494,8 @@ def tune_fact(block, target_linear, block_inputs, block_target_outputs, curvatur
     binary_lr = quant_config['fact_binary_lr']
     scale_lr = quant_config['fact_scale_lr']
     bias_lr = quant_config['fact_bias_lr']
+    if quant_config.get('fact_latent_normalize', False):
+        normalize_latents(target_linear)
     param_config = get_param_group_config(block, binary_lr=binary_lr, scale_lr=scale_lr, bias_lr=bias_lr)
     optimizer = AdamW(param_config, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-4 * scale_lr)

@@ -70,6 +70,9 @@ def NanoQuantConfig(
     fact_bias_lr: float = 1e-5,
     fact_batch_size: int = 1,
     fact_epochs: int = 8,
+    # rescale each latent row of the freshly factorised layer to unit mean magnitude before factor tuning
+    # (sign-preserving), so that fact_binary_lr means the same flip budget in every layer and row
+    fact_latent_normalize: bool = False,
     # keep the continuous latent factors (frozen) after block tuning; required by model_kd_mode="scales_latent"
     retain_latent: bool = False,
     # tune_model
@@ -85,6 +88,11 @@ def NanoQuantConfig(
     model_kd_eval_every_epoch: bool = False,
     # weight of the residual-stream feature-distillation term added to the logit KL (0 = off; online teacher)
     model_kd_feature_weight: float = 0.0,
+    # also train the weights of every normalisation layer (RMSNorm / LayerNorm) during KD, at model_kd_norm_lr
+    model_kd_norm_weights: bool = False,
+    model_kd_norm_lr: float = 1e-5,
+    # evaluate WikiText-2 *validation* perplexity after every KD epoch and keep the best epoch's parameters
+    model_kd_select_best: bool = False,
     # explicit pre-KD checkpoint to load instead of the keyed cache artifact ("" = use the cache)
     pre_kd_checkpoint: str = "",
     # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)
@@ -145,6 +153,7 @@ def NanoQuantConfig(
         "fact_bias_lr": fact_bias_lr,
         "fact_batch_size": fact_batch_size,
         "fact_epochs": fact_epochs,
+        "fact_latent_normalize": fact_latent_normalize,
         "retain_latent": retain_latent,
         # tune_model
         "tune_model": tune_model,
@@ -156,6 +165,9 @@ def NanoQuantConfig(
         "model_kd_latent_normalize": model_kd_latent_normalize,
         "model_kd_eval_every_epoch": model_kd_eval_every_epoch,
         "model_kd_feature_weight": model_kd_feature_weight,
+        "model_kd_norm_weights": model_kd_norm_weights,
+        "model_kd_norm_lr": model_kd_norm_lr,
+        "model_kd_select_best": model_kd_select_best,
         "pre_kd_checkpoint": pre_kd_checkpoint,
         "model_kd_teacher": model_kd_teacher,
     }

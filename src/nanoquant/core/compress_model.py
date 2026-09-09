@@ -351,6 +351,74 @@ def _kd_parameters(model, kd_mode: str) -> tuple[list, list]:
     return scale_params, latent_params
 
 
+def _norm_parameters(model) -> list:
+    """Collect (and unfreeze) the parameters of every normalisation layer of ``model``.
+
+    Normalisation layers are recognised by type: ``torch.nn.LayerNorm`` or any module whose class name contains
+    ``"norm"`` (``Qwen3RMSNorm``, ``LlamaRMSNorm``, ...). They stay full precision in the deployed model, so
+    training them during KD costs no bits.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+
+    Returns
+    -------
+    list of torch.nn.Parameter
+    """
+    params = []
+    for module in model.modules():
+        if isinstance(module, torch.nn.LayerNorm) or "norm" in type(module).__name__.lower():
+            for param in module.parameters(recurse=False):
+                param.requires_grad = True
+                params.append(param)
+    return params
+
+
+class BestEpochTracker:
+    """Keep a CPU snapshot of the tuned parameters at the epoch with the lowest validation perplexity.
+
+    Attributes
+    ----------
+    ppl : float or None
+        Best validation perplexity seen so far.
+    epoch : int or None
+        Epoch that produced it.
+    """
+
+    def __init__(self) -> None:
+        self.ppl: float | None = None
+        self.epoch: int | None = None
+        self._params: list[torch.Tensor] | None = None
+
+    def update(self, ppl: float, epoch: int, params: list) -> bool:
+        """Record ``params`` if ``ppl`` improves on the best so far; return whether it did."""
+        if self.ppl is not None and ppl >= self.ppl:
+            return False
+        self.ppl, self.epoch = float(ppl), int(epoch)
+        self._params = [p.detach().cpu().clone() for p in params]
+        return True
+
+    @torch.no_grad()
+    def restore(self, params: list, last_epoch: int | None = None) -> bool:
+        """Copy the best snapshot back into ``params`` unless nothing was recorded or the best is the last epoch."""
+        if self._params is None or self.epoch == last_epoch:
+            return False
+        for p, s in zip(params, self._params):
+            p.data.copy_(s.to(p.device))
+        return True
+
+    def state_dict(self) -> dict:
+        return {"ppl": self.ppl, "epoch": self.epoch, "params": self._params}
+
+    @classmethod
+    def from_state_dict(cls, state: dict | None) -> BestEpochTracker:
+        tracker = cls()
+        if state:
+            tracker.ppl, tracker.epoch, tracker._params = state["ppl"], state["epoch"], state["params"]
+        return tracker
+
+
 def _finish_kd(model, kd_mode: str) -> None:
     """Leave KD: harden latents (``scales_latent``) or drop retained ones (``scales``); deployed forward for all."""
     for module in model.modules():
@@ -375,7 +443,10 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
 
     Latent mode logs the sign-margin distribution of the latents at the start and the fraction of flipped
     bits after every epoch; ``model_kd_eval_every_epoch`` additionally evaluates held-out perplexity per
-    epoch. The returned model is always hardened (no latents).
+    epoch. ``model_kd_norm_weights`` adds the normalisation-layer weights to the trainable set (own learning
+    rate ``model_kd_norm_lr``); ``model_kd_select_best`` evaluates WikiText-2 *validation* perplexity after
+    every epoch and restores the best epoch's parameters at the end. The returned model is always hardened
+    (no latents).
     """
     def kl_loss_fn(student_logits, teacher_logits, mask, temperature: float = 1.0) -> torch.Tensor:
         """
@@ -405,6 +476,8 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
         raise ValueError(f"Unknown model_kd_mode: {kd_mode}")
     latent_mode = kd_mode == "scales_latent"
     eval_every_epoch = bool(quant_config.get("model_kd_eval_every_epoch", False))
+    select_best = bool(quant_config.get("model_kd_select_best", False))
+    norm_weights = bool(quant_config.get("model_kd_norm_weights", False))
     feat_w = float(quant_config.get("model_kd_feature_weight", 0.0) or 0.0)
 
     # set seed
@@ -448,26 +521,27 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
     model.cuda()
 
     scale_params, latent_params = _kd_parameters(model, kd_mode)
-    params_to_tune = scale_params + latent_params
+    norm_params = _norm_parameters(model) if norm_weights else []
+    params_to_tune = scale_params + latent_params + norm_params
     print(f"Total number of scale parameters to tune: {len(scale_params)}"
-          + (f", latent parameters: {len(latent_params)}" if latent_mode else ""))
+          + (f", latent parameters: {len(latent_params)}" if latent_mode else "")
+          + (f", normalisation parameters: {len(norm_params)}" if norm_weights else ""))
     if not params_to_tune:
         print("No scales found to tune. Returning original model.")
         _finish_kd(model, kd_mode)
         model.eval()
         return model
 
+    param_groups = [{'params': scale_params, 'lr': quant_config['model_kd_lr']}]
     if latent_mode:
         if quant_config.get("model_kd_latent_normalize", False):
             normalize_latents(model)
             print("[latent] rows rescaled to unit mean magnitude (forward unchanged)")
         print(format_margin_stats(latent_margin_stats(model), title="latent margins at KD start"))
-        optimizer = AdamW([
-            {'params': scale_params, 'lr': quant_config['model_kd_lr']},
-            {'params': latent_params, 'lr': quant_config.get('model_kd_latent_lr', 1e-6)},
-        ])
-    else:
-        optimizer = AdamW(params_to_tune, lr=quant_config['model_kd_lr'])
+        param_groups.append({'params': latent_params, 'lr': quant_config.get('model_kd_latent_lr', 1e-6)})
+    if norm_params:
+        param_groups.append({'params': norm_params, 'lr': quant_config.get('model_kd_norm_lr', 1e-5)})
+    optimizer = AdamW(param_groups)
     epochs = quant_config["model_kd_epochs"]
     total_steps = epochs * len(dataloader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
@@ -475,6 +549,7 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
     # KD checkpoint / resume
     ck_key = kd_key(quant_config, len(get_decoder_layers(model))) if use_cache else None
     start_epoch = 1
+    best = BestEpochTracker()
     if ck_key is not None:
         ck = cache.load(KD_KIND, ck_key)
         if ck is not None and ck["epoch"] < epochs:
@@ -485,6 +560,7 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
             torch.set_rng_state(ck["torch_rng"])
             random.setstate(ck["py_rng"])
             start_epoch = ck["epoch"] + 1
+            best = BestEpochTracker.from_state_dict(ck.get("best"))
             print(f"[resume] KD restored after epoch {ck['epoch']}; continuing at epoch {start_epoch}")
 
     # -------------------------------------------
@@ -543,12 +619,18 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
             print(msg + f" ({time.time() - t_epoch:.0f}s)")
             if latent_mode:
                 print(format_flip_stats(latent_flip_stats(model), title=f"latent flips after epoch {epoch}"))
-            if eval_every_epoch:
+            if eval_every_epoch or select_best:
                 model.eval()
                 with torch.no_grad():
-                    ppl = evaluate_ppl_after_block(model, model_name=quant_config['model_id'], dev=dev)
+                    if eval_every_epoch:
+                        ppl = evaluate_ppl_after_block(model, model_name=quant_config['model_id'], dev=dev)
+                        print(f"Epoch {epoch} - Test Data PPL = {ppl:.3f}")
+                    if select_best:
+                        val_ppl = evaluate_ppl_after_block(model, model_name=quant_config['model_id'], dev=dev,
+                                                           split="validation")
+                        improved = best.update(val_ppl, epoch, params_to_tune)
+                        print(f"Epoch {epoch} - Validation PPL = {val_ppl:.3f}" + (" (best so far)" if improved else ""))
                 model.train()
-                print(f"Epoch {epoch} - Test Data PPL = {ppl:.3f}")
 
             if ck_key is not None:
                 cache.save(KD_KIND, ck_key, {
@@ -558,7 +640,13 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
                     "scheduler": scheduler.state_dict(),
                     "torch_rng": torch.get_rng_state(),
                     "py_rng": random.getstate(),
+                    "best": best.state_dict() if select_best else None,
                 })
+
+    if select_best and best.restore(params_to_tune, last_epoch=epochs):
+        print(f"[select-best] restored the parameters of epoch {best.epoch} (validation PPL {best.ppl:.3f})")
+    elif select_best and best.epoch is not None:
+        print(f"[select-best] last epoch {best.epoch} is the best (validation PPL {best.ppl:.3f})")
 
     # -------------------------------------------
     # 4) Cleanup

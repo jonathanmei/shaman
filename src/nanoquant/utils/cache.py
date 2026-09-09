@@ -47,9 +47,10 @@ BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits") + ADMM_FIELDS + (
     "admm_input_factor", "curvature_refresh_every", "curvature_refresh_iters",
     "block_loss", "block_loss_source", "block_loss_cond_max", "block_loss_power", "block_loss_mix",
     "tune_nonfact", "nonfact_lr", "nonfact_batch_size", "nonfact_epochs", "tune_fact", "fact_binary_lr",
-    "fact_scale_lr", "fact_bias_lr", "fact_batch_size", "fact_epochs", "retain_latent")
+    "fact_scale_lr", "fact_bias_lr", "fact_batch_size", "fact_epochs", "fact_latent_normalize", "retain_latent")
 KD_FIELDS: tuple[str, ...] = ("model_kd_lr", "model_kd_latent_lr", "model_kd_batch_size", "model_kd_epochs",
                               "model_kd_mode", "model_kd_latent_normalize", "model_kd_feature_weight",
+                              "model_kd_norm_weights", "model_kd_norm_lr", "model_kd_select_best",
                               "pre_kd_checkpoint")
 TEACHER_FIELDS: tuple[str, ...] = ("model_id", "seqlen", "calib_dataset", "num_calib_samples", "seed")
 

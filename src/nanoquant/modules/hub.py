@@ -100,6 +100,7 @@ class NanoQuantConfigDataclass:
     fact_bias_lr: float = 1e-5
     fact_batch_size: int = 1
     fact_epochs: int = 8
+    fact_latent_normalize: bool = False
     # keep the continuous latent factors (frozen) after block tuning; required by model_kd_mode="scales_latent"
     retain_latent: bool = False
     # tune_model
@@ -112,6 +113,9 @@ class NanoQuantConfigDataclass:
     model_kd_latent_normalize: bool = False
     model_kd_eval_every_epoch: bool = False
     model_kd_feature_weight: float = 0.0
+    model_kd_norm_weights: bool = False
+    model_kd_norm_lr: float = 1e-5
+    model_kd_select_best: bool = False
     pre_kd_checkpoint: str = ""
     # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)
     model_kd_teacher: str = "ram"
