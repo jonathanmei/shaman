@@ -113,6 +113,29 @@ def get_decoder_layers(model):
     raise AttributeError(f"Could not find decoder layers for model architecture '{model_type}'.")
 
 
+def get_final_norm_and_head(model) -> tuple[nn.Module, nn.Module]:
+    """Final normalisation layer and LM head of a causal LM (the suffix after the last decoder block).
+
+    Parameters
+    ----------
+    model : nn.Module
+        Hugging Face causal LM.
+
+    Returns
+    -------
+    tuple of nn.Module
+        ``(final_norm, lm_head)``.
+    """
+    model_type = model.config.model_type
+    if model_type in ["llama", "mistral", "mixtral", "mobilellm", "qwen3"] or model_type.startswith("gemma"):
+        return model.model.norm, model.lm_head
+    if model_type == "opt":
+        return model.model.decoder.final_layer_norm, model.lm_head
+    if model_type == "gpt2":
+        return model.transformer.ln_f, model.lm_head
+    raise ValueError(f"Could not find the final norm / LM head for model architecture '{model_type}'.")
+
+
 def get_decoder_layer_cls_name(model: nn.Module) -> list[str]:
     """Helper to get the class name of the decoder blocks (to prevent accelerate from splitting blocks)."""
     try:

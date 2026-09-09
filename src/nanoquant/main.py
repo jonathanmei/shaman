@@ -180,6 +180,12 @@ class TuneArguments:
         default=False,
         metadata={"help": "Log input-factor drift, Mahalanobis weight errors (stale vs fresh factor) and the "
                           "block-loss change of every ADMM solution (two extra block forward passes per layer)"})
+    tail_logit_blocks: int = field(
+        default=0, metadata={"help": ">0: reconstruct the last N blocks against the FP suffix's logits (forward KL) "
+                                     "instead of the block loss"})
+    tail_logit_mix: float = field(
+        default=1.0, metadata={"help": "Weight of the logit KL in the tail-block loss (1 = pure KL; <1 mixes in the "
+                                       "block loss, both normalised by their first-step values)"})
     tune_fact: bool = field(default=True, metadata={"help": "Tune factorized layers"})
     fact_binary_lr: float = field(default=1e-5, metadata={"help": "LR for factorized binary parameters"})
     fact_scale_lr: float = field(default=1e-5, metadata={"help": "LR for factorized scale parameters"})
@@ -335,6 +341,8 @@ def main():
         curvature_refresh_every=tune_args.curvature_refresh_every,
         curvature_refresh_iters=tune_args.curvature_refresh_iters,
         block_diagnostics=tune_args.block_diagnostics,
+        tail_logit_blocks=tune_args.tail_logit_blocks,
+        tail_logit_mix=tune_args.tail_logit_mix,
         tune_fact=tune_args.tune_fact,
         fact_binary_lr=tune_args.fact_binary_lr,
         fact_scale_lr=tune_args.fact_scale_lr,

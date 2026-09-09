@@ -7,7 +7,6 @@ import random
 import time
 
 import torch
-import torch.nn.functional as F
 from tqdm import trange
 
 from ..core.compress_block import (
@@ -31,6 +30,7 @@ from ..utils.utils import (
     cleanup_memory,
     find_layers,
     get_decoder_layers,
+    get_final_norm_and_head,
     get_layers_to_factorize,
     set_seed,
 )
@@ -50,6 +50,7 @@ from .latent import (
     normalize_latents,
 )
 from .resume import restore_prefix, save_block_checkpoint, save_progress
+from .tail import TailLogitObjective, kd_kl_loss
 from .teacher import TeacherLogits
 
 KD_KIND = "kd"
@@ -193,6 +194,8 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
     diagnostics = bool(quant_config.get('block_diagnostics', False))
     num_samples = quant_config['num_calib_samples']
     refresh_every = int(quant_config.get('curvature_refresh_every', 0) or 0)
+    tail_blocks = int(quant_config.get('tail_logit_blocks', 0) or 0)
+    tail_mix = float(quant_config.get('tail_logit_mix', 1.0))
 
     # block reconstruction loop
     for i in trange(start, stop, initial=start, total=stop, desc="Compressing Layers"):
@@ -227,6 +230,14 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
         # move data to GPU
         tuning_inputs = tuning_inputs.to(dev)
         target_outputs = target_outputs.to(dev)
+        # logit-level objective through the FP suffix for the last `tail_logit_blocks` blocks
+        tail = None
+        if tail_blocks > 0 and i >= n_blocks - tail_blocks:
+            fp_norm, fp_head = get_final_norm_and_head(fp_model)
+            tail = TailLogitObjective(list(fp_blocks[i + 1:]), fp_norm, fp_head, target_outputs, kwargs, device=dev,
+                                      mix=tail_mix)
+            print(f"\t\t[tail] block {i}: logit-level objective through {n_blocks - i - 1} FP suffix blocks"
+                  + (f", mix {tail_mix:g} with the block loss" if tail_mix < 1.0 else ""))
         # compress each linear layer
         memo_hits = 0
         for name in layers_to_factorize:
@@ -234,7 +245,7 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             # 1/3) tune non-factorized, full-precision weights to absorb quant error
             if quant_config['tune_nonfact']:
                 print(f"\t(1/3) Block {i+1}/{n_blocks}, {name} | Tuning Non-Factorized Weights...")
-                tune_nonfact(q_block, tuning_inputs, target_outputs, curvature, kwargs, quant_config)
+                tune_nonfact(q_block, tuning_inputs, target_outputs, curvature, kwargs, quant_config, tail=tail)
                 cleanup_memory()
             # 2/3) ADMM to factorize/initialize low-rank binary matrices and scales
             print(f"\t(2/3) Block {i+1}/{n_blocks}, {name} | Initialization via ADMM...")
@@ -282,7 +293,8 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             # 3/3) tune low-rank binary and scales
             if quant_config['tune_fact']:
                 print(f"\t(3/3) Block {i+1}/{n_blocks}, {name} | Tuning Factorized Weights...")
-                tune_fact(q_block, nano_linear, tuning_inputs, target_outputs, curvature, kwargs, quant_config)
+                tune_fact(q_block, nano_linear, tuning_inputs, target_outputs, curvature, kwargs, quant_config,
+                          tail=tail)
                 cleanup_memory()
             cleanup_memory()
         if cache is not None and cache.enabled:
@@ -301,7 +313,7 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
                 compressed_inputs[j:j + 1] = batch_output.cpu().detach()
         q_blocks[i] = q_block.cpu()
 
-        del q_block, fp_block, target_outputs, curvature
+        del q_block, fp_block, target_outputs, curvature, tail
         cleanup_memory()
 
         # checkpoint the reconstructed blocks and the activations entering block i+1
@@ -448,29 +460,6 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
     every epoch and restores the best epoch's parameters at the end. The returned model is always hardened
     (no latents).
     """
-    def kl_loss_fn(student_logits, teacher_logits, mask, temperature: float = 1.0) -> torch.Tensor:
-        """
-        Standard Forward KL (FKL): KL(Teacher || Student)
-
-        Description:
-            - The standard objective for Knowledge Distillation.
-            - Has a 'Mean-seeking' property, forcing the student to cover the entire teacher distribution.
-            - Can lead to overestimation of low-probability regions (tail), potentially causing hallucinations in LLMs.
-
-        Reference:
-            Hinton et al. (2015). Distilling the Knowledge in a Neural Network.
-        """
-        teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
-        student_logprobs = F.log_softmax(student_logits / temperature, dim=-1)
-
-        inf_mask = torch.isinf(student_logits)
-        prod = torch.masked_fill(teacher_probs * student_logprobs, inf_mask, 0)
-        x = torch.sum(prod, dim=-1).view(-1)
-
-        # Minimize -x (which is CE)
-        loss = -torch.sum(x * mask.view(-1), dim=0) / (torch.sum(mask.view(-1), dim=0) + 1e-8)
-        return (temperature**2) * loss
-
     kd_mode = quant_config.get("model_kd_mode", "scales")
     if kd_mode not in ("scales", "scales_latent"):
         raise ValueError(f"Unknown model_kd_mode: {kd_mode}")
@@ -594,7 +583,7 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
                     teacher_logits = teacher.get(idx, batch)
                 student_logits = student_outputs.logits if hasattr(student_outputs, "logits") else student_outputs
 
-                kl = kl_loss_fn(student_logits, teacher_logits, mask)
+                kl = kd_kl_loss(student_logits, teacher_logits, mask)
                 loss = kl
                 if feat_w > 0:
                     feat = feature_loss(student_outputs.hidden_states, teacher_hidden, mask)

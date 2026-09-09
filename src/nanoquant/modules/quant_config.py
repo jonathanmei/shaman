@@ -69,6 +69,10 @@ def NanoQuantConfig(
     curvature_refresh_iters: int = 1,
     # log input-factor drift, Mahalanobis weight errors and the block-loss change of every ADMM solution
     block_diagnostics: bool = False,
+    # >0: reconstruct the last N blocks against the logits of the FP suffix (forward KL) instead of the block loss;
+    # tail_logit_mix < 1 mixes the two (each normalised by its first-step value)
+    tail_logit_blocks: int = 0,
+    tail_logit_mix: float = 1.0,
     # tune_fact
     tune_fact: bool = True,
     fact_binary_lr: float = 1e-5,
@@ -155,6 +159,8 @@ def NanoQuantConfig(
         "curvature_refresh_every": curvature_refresh_every,
         "curvature_refresh_iters": curvature_refresh_iters,
         "block_diagnostics": block_diagnostics,
+        "tail_logit_blocks": tail_logit_blocks,
+        "tail_logit_mix": tail_logit_mix,
         # tune_fact
         "tune_fact": tune_fact,
         "fact_binary_lr": fact_binary_lr,

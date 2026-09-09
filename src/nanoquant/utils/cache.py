@@ -45,7 +45,7 @@ ADMM_FIELDS: tuple[str, ...] = ("admm_type", "admm_outer_iters", "admm_inner_ite
 # logging share their per-block checkpoints with the plain full chain.
 BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits", "rank_budget", "rank_depth_ramp",
                                  "rank_type_weights") + ADMM_FIELDS + (
-    "admm_input_factor", "curvature_refresh_every", "curvature_refresh_iters",
+    "admm_input_factor", "curvature_refresh_every", "curvature_refresh_iters", "tail_logit_blocks", "tail_logit_mix",
     "block_loss", "block_loss_source", "block_loss_cond_max", "block_loss_power", "block_loss_mix",
     "tune_nonfact", "nonfact_lr", "nonfact_batch_size", "nonfact_epochs", "tune_fact", "fact_binary_lr",
     "fact_scale_lr", "fact_bias_lr", "fact_batch_size", "fact_epochs", "fact_latent_normalize", "retain_latent")
@@ -60,8 +60,8 @@ SOURCE_GROUPS: dict[str, tuple[str, ...]] = {
     "stats": ("core/importance.py",),
     "admm": ("core/admm_nq.py", "core/admm_dbf.py", "core/compress_block.py", "core/curvature.py"),
     "blocks": ("core/admm_nq.py", "core/admm_dbf.py", "core/compress_block.py", "core/compress_model.py",
-               "modules/linear.py", "core/curvature.py"),
-    "kd": ("core/compress_model.py", "core/teacher.py"),
+               "modules/linear.py", "core/curvature.py", "core/tail.py"),
+    "kd": ("core/compress_model.py", "core/teacher.py", "core/tail.py"),
     "curvature": ("core/curvature.py",),
 }
 

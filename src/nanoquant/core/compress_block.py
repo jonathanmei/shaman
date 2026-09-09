@@ -19,6 +19,7 @@ from .admm_dbf import factorize_admm_dbf
 from .admm_nq import factorize_admm_nanoquant
 from .curvature import condition_curvature, spectrum_summary
 from .latent import hard_sign, normalize_latents, sign_flips
+from .tail import TailLogitObjective
 
 
 @torch.jit.script
@@ -273,45 +274,68 @@ def get_param_group_config(target_module, binary_lr=1e-5, scale_lr=1e-5, bias_lr
 
 
 def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, curvature: BlockCurvature, kwargs,
-               batch_size: int, epochs: int, num_samples: int) -> None:
+               batch_size: int, epochs: int, num_samples: int, tail: TailLogitObjective | None = None) -> None:
     """Shared epoch loop of :func:`tune_nonfact` and :func:`tune_fact`.
 
     Minimises the selected block loss (diagonal or dense, see :class:`BlockCurvature`) with gradient
     accumulation over ``batch_size`` samples and logs **both** losses every epoch, so that the
     objective actually optimised and the other one can be compared across runs.
+
+    With a ``tail`` objective (:class:`~nanoquant.core.tail.TailLogitObjective`, last blocks only) the loss is
+    the logit-level KL through the FP suffix instead; ``tail.mix < 1`` mixes it with the block loss, each term
+    divided by its value at the first step so that ``mix`` is a plain weight: ``mix * KL/KL_0 + (1 - mix) *
+    blk/blk_0``. The per-epoch log then shows the mean KL (teacher cross-entropy) and the block losses.
     """
     device = block_target_outputs.device
     numel = block_target_outputs.numel()
     importance, dense = curvature.importance, curvature.dense
     t0 = time.time()
+    ref_kl = ref_blk = None
     for epoch in range(epochs):
         data_idx = torch.randperm(num_samples, device="cpu", dtype=torch.long)
         epoch_diag = torch.zeros(1, device=device)
         epoch_dense = torch.zeros(1, device=device)
+        epoch_kl = torch.zeros(1, device=device)
         for i in range(num_samples):
             idx = data_idx[i].item()
             y = block(block_inputs[idx:idx + 1], **kwargs)[0]
             tgt = block_target_outputs[idx:idx + 1]
             if curvature.optimize_dense:
-                loss = fused_weighted_mahalanobis(y, tgt, dense)
+                blk_loss = fused_weighted_mahalanobis(y, tgt, dense)
                 with torch.no_grad():
                     other = fused_weighted_mse(y.detach(), tgt, importance)
-                epoch_dense += loss.detach()
+                epoch_dense += blk_loss.detach()
                 epoch_diag += other
             else:
-                loss = fused_weighted_mse(y, tgt, importance)
+                blk_loss = fused_weighted_mse(y, tgt, importance)
                 if dense is not None:
                     with torch.no_grad():
                         epoch_dense += fused_weighted_mahalanobis(y.detach(), tgt, dense)
-                epoch_diag += loss.detach()
+                epoch_diag += blk_loss.detach()
+            if tail is None:
+                loss = blk_loss
+            else:
+                kl = tail.kl(y, idx)
+                epoch_kl += kl.detach()
+                if tail.mix >= 1.0:
+                    loss = kl
+                else:
+                    if ref_kl is None:
+                        ref_kl = kl.detach().clamp_min(1e-12)
+                        ref_blk = blk_loss.detach().clamp_min(1e-30)
+                    loss = tail.mix * kl / ref_kl + (1.0 - tail.mix) * blk_loss / ref_blk
             (loss / batch_size).backward()
             if (i + 1) % batch_size == 0 or (i + 1) == num_samples:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
         cleanup_memory()
-        main = epoch_dense if curvature.optimize_dense else epoch_diag
-        msg = f"\t\t(Epoch {epoch+1:02d}/{epochs:02d}) Block Loss: {(main / numel).item():.4e}"
+        if tail is not None:
+            msg = (f"\t\t(Epoch {epoch+1:02d}/{epochs:02d}) KL {(epoch_kl / num_samples).item():.4f}"
+                   + (f" (mix {tail.mix:g})" if tail.mix < 1.0 else ""))
+        else:
+            main = epoch_dense if curvature.optimize_dense else epoch_diag
+            msg = f"\t\t(Epoch {epoch+1:02d}/{epochs:02d}) Block Loss: {(main / numel).item():.4e}"
         msg += f" | diag {(epoch_diag / numel).item():.4e}"
         if dense is not None:
             msg += f" | dense {(epoch_dense / numel).item():.4e}"
@@ -321,7 +345,8 @@ def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, 
 
 
 @torch.enable_grad()
-def tune_nonfact(block, block_inputs, block_target_outputs, curvature: BlockCurvature, kwargs, quant_config):
+def tune_nonfact(block, block_inputs, block_target_outputs, curvature: BlockCurvature, kwargs, quant_config,
+                 tail: TailLogitObjective | None = None):
     """Tune the still full-precision linear layers of ``block`` to absorb the quantisation error so far."""
     set_seed(quant_config['seed'])
     batch_size = quant_config['nonfact_batch_size']
@@ -338,7 +363,7 @@ def tune_nonfact(block, block_inputs, block_target_outputs, curvature: BlockCurv
     optimizer = AdamW(params, lr=lr, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-4 * lr)
     _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, curvature, kwargs, batch_size, epochs,
-               num_samples)
+               num_samples, tail=tail)
     for p in params:
         p.requires_grad = False
     block.zero_grad(set_to_none=True)
@@ -477,7 +502,7 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
 
 @torch.enable_grad()
 def tune_fact(block, target_linear, block_inputs, block_target_outputs, curvature: BlockCurvature, kwargs,
-              quant_config):
+              quant_config, tail: TailLogitObjective | None = None):
     """Tune the latent binary factors and scales of ``target_linear`` (STE forward), then harden it.
 
     With ``fact_latent_normalize`` the ADMM latents (tiny: median ``|latent|`` of order 1e-3) are first rescaled
@@ -502,7 +527,7 @@ def tune_fact(block, target_linear, block_inputs, block_target_outputs, curvatur
     with torch.no_grad():
         init_signs = {n: hard_sign(p.detach()) for n, p in target_linear.named_parameters() if "latent" in n}
     _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, curvature, kwargs, batch_size, epochs,
-               num_samples)
+               num_samples, tail=tail)
     with torch.no_grad():
         flips = sum(sign_flips(getattr(target_linear, n), s) for n, s in init_signs.items())
         total = sum(s.numel() for s in init_signs.values())

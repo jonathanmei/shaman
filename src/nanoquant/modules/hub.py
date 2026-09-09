@@ -104,6 +104,8 @@ class NanoQuantConfigDataclass:
     fact_batch_size: int = 1
     fact_epochs: int = 8
     fact_latent_normalize: bool = False
+    tail_logit_blocks: int = 0
+    tail_logit_mix: float = 1.0
     # keep the continuous latent factors (frozen) after block tuning; required by model_kd_mode="scales_latent"
     retain_latent: bool = False
     # tune_model

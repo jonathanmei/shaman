@@ -95,6 +95,10 @@ def validate_config(quant_config: dict) -> None:
         raise ValueError("max_blocks must be >= 0")
     if int(quant_config.get("curvature_refresh_every", 0) or 0) < 0:
         raise ValueError("curvature_refresh_every must be >= 0")
+    if int(quant_config.get("tail_logit_blocks", 0) or 0) < 0:
+        raise ValueError("tail_logit_blocks must be >= 0")
+    if not 0.0 <= float(quant_config.get("tail_logit_mix", 1.0)) <= 1.0:
+        raise ValueError("tail_logit_mix must lie in [0, 1]")
     if int(quant_config.get("curvature_refresh_every", 0) or 0) > 0 and curvature != "kron":
         raise ValueError("curvature_refresh_every > 0 requires curvature='kron'")
     if float(quant_config.get("model_kd_feature_weight", 0.0) or 0.0) > 0 \
