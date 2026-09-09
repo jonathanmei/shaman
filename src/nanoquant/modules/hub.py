@@ -43,6 +43,9 @@ class NanoQuantConfigDataclass:
     model_id: str = "meta-llama/Llama-2-7b-hf"
     # quant precision
     bits: float = 1.0
+    rank_budget: str = "uniform"
+    rank_depth_ramp: float = 0.0
+    rank_type_weights: str = ""
     # calib
     seed: int = 0
     num_calib_samples: int = 128

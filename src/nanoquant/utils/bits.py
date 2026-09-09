@@ -22,29 +22,14 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from .utils import calculate_ranks, find_layers, get_decoder_layers, has_mid_scale
-
-SCALE_BITS = 16
-
-
-def layer_bits(in_features: int, out_features: int, rank: int, num_scales: int) -> int:
-    """Storage bits of one factorised layer: ``rank (in + out)`` binary entries plus 16-bit scales.
-
-    Parameters
-    ----------
-    in_features, out_features : int
-        Layer shape.
-    rank : int
-        Factorisation rank.
-    num_scales : int
-        2 (pre, post) or 3 (pre, mid, post).
-
-    Returns
-    -------
-    int
-    """
-    scale_entries = in_features + out_features + (rank if num_scales == 3 else 0)
-    return rank * (in_features + out_features) + SCALE_BITS * scale_entries
+from .utils import (  # layer_bits / SCALE_BITS live in utils (shared with the rank allocator) and are re-exported
+    SCALE_BITS,
+    calculate_ranks,
+    find_layers,
+    get_decoder_layers,
+    has_mid_scale,
+    layer_bits,
+)
 
 
 def static_accounting(model: nn.Module, layers_to_factorize: Iterable[str], quant_config: dict) -> dict:

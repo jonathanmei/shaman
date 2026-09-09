@@ -6,6 +6,12 @@ def NanoQuantConfig(
     model_id: str = "meta-llama/Llama-2-7b-hf",
     # quant precision
     bits: float = 1.0,
+    # rank allocation: "uniform" (legacy per-layer rule), "parity" (non-uniform, same total bits as uniform) or
+    # "full" (non-uniform, exactly `bits` per weight incl. the rounding remainder); multipliers on the per-layer bit
+    # budget: log-ratio last/first block (depth ramp) and per-layer-type weights ("v_proj:1.2,down_proj:1.15")
+    rank_budget: str = "uniform",
+    rank_depth_ramp: float = 0.0,
+    rank_type_weights: str = "",
     # calib
     seed: int = 0,
     num_calib_samples: int = 128,
@@ -103,6 +109,9 @@ def NanoQuantConfig(
         "model_id": model_id,
         # quant precision
         "bits": bits,
+        "rank_budget": rank_budget,
+        "rank_depth_ramp": rank_depth_ramp,
+        "rank_type_weights": rank_type_weights,
         # calibration
         "seed": seed,
         "num_calib_samples": num_calib_samples,

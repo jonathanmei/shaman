@@ -18,10 +18,12 @@ from ..utils.cache import ArtifactCache, atomic_save, chain_keys, stats_key
 from ..utils.data_utils import get_calib_loader, prepare_dataset
 from ..utils.load_utils import load_compressed_model, load_model, load_tokenizer
 from ..utils.utils import (
+    RANK_BUDGETS,
     cleanup_memory,
     get_decoder_layers,
     get_layers_to_factorize,
     has_mid_scale,
+    parse_type_weights,
 )
 from .compress_model import compress_block_recon, compress_model_recon
 from .importance import (
@@ -58,6 +60,13 @@ def validate_config(quant_config: dict) -> None:
     curvature = quant_config.get("curvature", "diag")
     if curvature not in CURVATURE_TYPES:
         raise ValueError(f"Unknown curvature: {curvature}")
+    budget = quant_config.get("rank_budget", "uniform") or "uniform"
+    if budget not in RANK_BUDGETS:
+        raise ValueError(f"Unknown rank_budget: {budget}")
+    parse_type_weights(quant_config.get("rank_type_weights", "") or "")  # raises on malformed entries
+    if budget == "uniform" and (float(quant_config.get("rank_depth_ramp", 0.0) or 0.0)
+                                or (quant_config.get("rank_type_weights", "") or "").strip()):
+        raise ValueError("rank_depth_ramp / rank_type_weights require rank_budget='parity' or 'full'")
     if quant_config.get("kron_fit", "frobenius") not in KRON_FITS:
         raise ValueError(f"Unknown kron_fit: {quant_config.get('kron_fit')}")
     if int(quant_config.get("admm_curvature_spike_rank", 0) or 0) < 0:

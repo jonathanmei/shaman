@@ -43,7 +43,8 @@ ADMM_FIELDS: tuple[str, ...] = ("admm_type", "admm_outer_iters", "admm_inner_ite
                                 "admm_curvature_power", "admm_curvature_cond_max", "admm_curvature_spike_rank")
 # ``max_blocks`` and ``block_diagnostics`` are deliberately absent: a truncated screening run and a run with extra
 # logging share their per-block checkpoints with the plain full chain.
-BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits") + ADMM_FIELDS + (
+BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits", "rank_budget", "rank_depth_ramp",
+                                 "rank_type_weights") + ADMM_FIELDS + (
     "admm_input_factor", "curvature_refresh_every", "curvature_refresh_iters",
     "block_loss", "block_loss_source", "block_loss_cond_max", "block_loss_power", "block_loss_mix",
     "tune_nonfact", "nonfact_lr", "nonfact_batch_size", "nonfact_epochs", "tune_fact", "fact_binary_lr",
