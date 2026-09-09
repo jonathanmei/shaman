@@ -315,12 +315,18 @@ configs `qwen3_1p7b_kron_2scale_kl_refresh.json` (p = 1) and `qwen3_1p7b_kron_2s
 | NKP, tempered + fresh R + refresh (previous best) | 5615752 | 11.44 | 12.46 | 14.49 | 18.02 | 2.489 → 2.457 | 17.28 | 0.446 | 2 h 09 |
 | KL, p = 1, fresh R + refresh | 5615872 | 11.25 | 12.16 | 14.11 | 17.78 | 2.494 → 2.462 | 17.04 | 0.436 | 3 h 00 |
 | KL, p = 0.5, fresh R + refresh | 5615873 | 11.20 | 12.12 | 14.05 | 17.69 | 2.492 → 2.458 | **16.72** | 0.448 | ~3 h 50 |
+| KL, p = 0.25, fresh R + refresh (2026-09-09) | 5616739 | 11.30 | 12.33 | 14.42 | 18.42 | 2.506 → 2.468 | 17.37 | 0.438 | 2 h 25 |
 
 - The KL estimator lowers the trajectory at every checkpoint relative to the tempered NKP factors (−0.2 to −0.4 PPL
   from block 7 on) and ends at 17.04; tempering the KL factors adds another −0.32 (16.72), so at 1.7B both
   mechanisms contribute, whereas at 0.6B tempering was redundant once the estimator was fixed. This matches the
   theory note: estimation error (argument 3) dominates at 0.6B; the use-side arguments (1)–(2) grow with width.
 - 16.72 is 13 % below the paper's 19.21 and 11 % below the diag baseline (18.76); zero-shot mean 0.448 vs 0.426.
+- **The tempering exponent is U-shaped with its optimum at the square root**: p = 1 → 17.04, p = 0.5 → 16.72,
+  p = 0.25 → 17.37 (worse than no tempering at every block from block 7 on). The literal per-factor Shampoo
+  exponent (¼) over-tempers here because the Kronecker fit targets the Fisher itself, not its square, so the
+  regret-optimal exponent is ½ per factor (theory note, argument 1). With the Cholesky-damped GPU inverses the
+  1.7B KL calibration took 9 minutes instead of 55.
 - Cost: the KL calibration at 1.7B took ~55 min instead of 10 because the damped inverses of the 2048–6144-wide
   factors were computed on the CPU; fixed on the branch by inverting on the accumulation device (uncommitted at the
   time of writing, see the pending-state note). The p = 0.5 arm came within minutes of the 4-hour limit for that

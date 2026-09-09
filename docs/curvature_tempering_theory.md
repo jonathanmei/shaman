@@ -75,6 +75,9 @@ tempering, the mechanism is estimation (3); if $p = 1/2$ is still needed on top,
 - **1.7B**: KL alone reaches 17.04 (tempered NKP: 17.46; tempered NKP + fresh input factor + refresh: 17.28), and
   tempering the KL factors adds a further −0.32 (16.72). Both mechanisms contribute at this width, consistent with
   (1)–(2) growing with the size of the perturbation and the uncertainty of the curvature.
+- **Exponent**: $p = 1/4$ on the KL factors gives 17.37, worse than both $p = 1$ and $p = 1/2$. The optimum sits
+  at the square root, as argument (1) predicts for a Kronecker fit of $F$ itself; Shampoo's per-factor ¼ belongs to
+  a fit of $F^2$ and over-tempers here.
 - **Spike-plus-flat** hurts for both estimators at 0.6B (+0.2 to +0.7): the bulk of these Fisher factors is not
   flat, so the Pro-KLShampoo projection discards structure the ADMM data term uses. The projection remains
   attractive for *cost* at large width (O(nr) instead of O(n²) per factor), but not for accuracy here.
