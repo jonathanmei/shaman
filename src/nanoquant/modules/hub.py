@@ -47,6 +47,10 @@ class NanoQuantConfigDataclass:
     rank_depth_ramp: float = 0.0
     rank_type_weights: str = ""
     rank_max_ratio: float = 1.0
+    # measured sensitivity for the non-uniform allocation: "none", "admm" or "svd"; probe grid and ADMM iterations
+    rank_sensitivity: str = "none"
+    rank_probe_ranks: str = "0.5,1.0,1.5"
+    rank_probe_iters: int = 50
     # calib
     seed: int = 0
     num_calib_samples: int = 128

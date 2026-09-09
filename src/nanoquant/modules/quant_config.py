@@ -14,6 +14,12 @@ def NanoQuantConfig(
     rank_type_weights: str = "",
     # rank ceiling as a multiple of min(in, out) (1.0 = legacy cap; binary factors stay meaningful above it)
     rank_max_ratio: float = 1.0,
+    # measured per-layer sensitivity driving the non-uniform allocation (requires rank_budget parity/full): "none"
+    # (ramp / type multipliers only), "admm" (short ADMM solves at rank_probe_ranks x uniform rank, rank_probe_iters
+    # outer iterations each, curvature-weighted weight error) or "svd" (tail energy of the whitened spectrum)
+    rank_sensitivity: str = "none",
+    rank_probe_ranks: str = "0.5,1.0,1.5",
+    rank_probe_iters: int = 50,
     # calib
     seed: int = 0,
     num_calib_samples: int = 128,
@@ -119,6 +125,9 @@ def NanoQuantConfig(
         "rank_depth_ramp": rank_depth_ramp,
         "rank_type_weights": rank_type_weights,
         "rank_max_ratio": rank_max_ratio,
+        "rank_sensitivity": rank_sensitivity,
+        "rank_probe_ranks": rank_probe_ranks,
+        "rank_probe_iters": rank_probe_iters,
         # calibration
         "seed": seed,
         "num_calib_samples": num_calib_samples,

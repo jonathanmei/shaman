@@ -14,15 +14,17 @@ import os
 import torch
 
 from ..utils.bits import format_accounting, model_accounting, static_accounting
-from ..utils.cache import ArtifactCache, atomic_save, chain_keys, stats_key
+from ..utils.cache import ArtifactCache, atomic_save, chain_keys, probe_key, stats_key
 from ..utils.data_utils import get_calib_loader, prepare_dataset
 from ..utils.load_utils import load_compressed_model, load_model, load_tokenizer
 from ..utils.utils import (
     RANK_BUDGETS,
+    RANK_SENSITIVITIES,
     cleanup_memory,
     get_decoder_layers,
     get_layers_to_factorize,
     has_mid_scale,
+    parse_probe_ranks,
     parse_type_weights,
 )
 from .compress_model import compress_block_recon, compress_model_recon
@@ -34,6 +36,7 @@ from .importance import (
     register_stats,
 )
 from .latent import drop_latents
+from .rank_probe import PROBE_KIND, measure_sensitivity
 from .resume import compressed_state_dict
 
 PRE_KD_KIND = "model"
@@ -69,6 +72,17 @@ def validate_config(quant_config: dict) -> None:
     if budget == "uniform" and (float(quant_config.get("rank_depth_ramp", 0.0) or 0.0)
                                 or (quant_config.get("rank_type_weights", "") or "").strip()):
         raise ValueError("rank_depth_ramp / rank_type_weights require rank_budget='parity' or 'full'")
+    sensitivity = quant_config.get("rank_sensitivity", "none") or "none"
+    if sensitivity not in RANK_SENSITIVITIES:
+        raise ValueError(f"Unknown rank_sensitivity: {sensitivity}")
+    if sensitivity != "none":
+        if budget == "uniform":
+            raise ValueError("rank_sensitivity requires rank_budget='parity' or 'full'")
+        parse_probe_ranks(quant_config.get("rank_probe_ranks", "0.5,1.0,1.5") or "")  # raises on malformed entries
+        if int(quant_config.get("rank_probe_iters", 50) or 0) < 1:
+            raise ValueError("rank_probe_iters must be >= 1")
+        if sensitivity == "admm" and quant_config.get("admm_type", "nanoquant") != "nanoquant":
+            raise ValueError("rank_sensitivity='admm' requires admm_type='nanoquant'")
     if quant_config.get("kron_fit", "frobenius") not in KRON_FITS:
         raise ValueError(f"Unknown kron_fit: {quant_config.get('kron_fit')}")
     if int(quant_config.get("admm_curvature_spike_rank", 0) or 0) < 0:
@@ -209,8 +223,19 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
         del raw_stats, shrunk_stats
         cleanup_memory()
 
+        # 1b) measured rank sensitivity (short ADMM solves at candidate ranks against the registered curvature)
+        sensitivity = None
+        if (quant_config.get("rank_sensitivity", "none") or "none") != "none":
+            layers = get_layers_to_factorize(model.config.model_type)
+            sensitivity = cache.load_or_compute(
+                PROBE_KIND, probe_key(quant_config),
+                lambda: measure_sensitivity(model, layers, quant_config, dev))
+            cleanup_memory()
+            print(format_accounting(static_accounting(fp_model, layers, quant_config, sensitivity=sensitivity),
+                                    title="bpw budget, measured"))
+
         # 2) block-wise reconstruction (resumable)
-        model = compress_block_recon(model, fp_model, dataloader, quant_config, cache=cache)
+        model = compress_block_recon(model, fp_model, dataloader, quant_config, cache=cache, sensitivity=sensitivity)
         if truncated:
             print(f"[screen] reconstructed the first {max_blocks}/{n_blocks} blocks only: "
                   f"pre-KD model not cached, KD skipped")

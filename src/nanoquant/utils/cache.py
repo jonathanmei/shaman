@@ -44,7 +44,8 @@ ADMM_FIELDS: tuple[str, ...] = ("admm_type", "admm_outer_iters", "admm_inner_ite
 # ``max_blocks`` and ``block_diagnostics`` are deliberately absent: a truncated screening run and a run with extra
 # logging share their per-block checkpoints with the plain full chain.
 BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits", "rank_budget", "rank_depth_ramp",
-                                 "rank_type_weights", "rank_max_ratio") + ADMM_FIELDS + (
+                                 "rank_type_weights", "rank_max_ratio", "rank_sensitivity", "rank_probe_ranks",
+                                 "rank_probe_iters") + ADMM_FIELDS + (
     "admm_input_factor", "curvature_refresh_every", "curvature_refresh_iters", "tail_logit_blocks", "tail_logit_mix",
     "block_loss", "block_loss_source", "block_loss_cond_max", "block_loss_power", "block_loss_mix",
     "tune_nonfact", "nonfact_lr", "nonfact_batch_size", "nonfact_epochs", "tune_fact", "fact_binary_lr",
@@ -54,15 +55,22 @@ KD_FIELDS: tuple[str, ...] = ("model_kd_lr", "model_kd_latent_lr", "model_kd_bat
                               "model_kd_norm_weights", "model_kd_norm_lr", "model_kd_select_best",
                               "pre_kd_checkpoint")
 TEACHER_FIELDS: tuple[str, ...] = ("model_id", "seqlen", "calib_dataset", "num_calib_samples", "seed")
+# the calibration-time rank-sensitivity probe: everything the short ADMM solves and their curvature-weighted
+# errors depend on (not the production iteration count or the eigh precision: the probe fixes its own)
+PROBE_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits", "seed", "admm_type", "admm_inner_iters", "admm_reg",
+                                 "admm_penalty_scheduler", "admm_mid_scale", "admm_curvature_power",
+                                 "admm_curvature_cond_max", "admm_curvature_spike_rank", "rank_max_ratio",
+                                 "rank_sensitivity", "rank_probe_ranks", "rank_probe_iters")
 
 # source files whose algorithm determines each stage's output (relative to the ``nanoquant`` package)
 SOURCE_GROUPS: dict[str, tuple[str, ...]] = {
     "stats": ("core/importance.py",),
     "admm": ("core/admm_nq.py", "core/admm_dbf.py", "core/compress_block.py", "core/curvature.py"),
     "blocks": ("core/admm_nq.py", "core/admm_dbf.py", "core/compress_block.py", "core/compress_model.py",
-               "modules/linear.py", "core/curvature.py", "core/tail.py"),
+               "modules/linear.py", "core/curvature.py", "core/tail.py", "core/rank_probe.py"),
     "kd": ("core/compress_model.py", "core/teacher.py", "core/tail.py"),
     "curvature": ("core/curvature.py",),
+    "rank_probe": ("core/rank_probe.py", "core/admm_nq.py", "core/curvature.py", "core/compress_block.py"),
 }
 
 
@@ -118,6 +126,15 @@ def chain_root(cfg: dict) -> str:
         "stats": stats_key(cfg),
         "fields": _subset(cfg, BLOCK_FIELDS),
         "code": fingerprint_sources("blocks"),
+    })
+
+
+def probe_key(cfg: dict) -> str:
+    """Key of the calibration-time rank-sensitivity probe (calibration key + the probe's ADMM inputs)."""
+    return hash_json({
+        "stats": stats_key(cfg),
+        "fields": _subset(cfg, PROBE_FIELDS),
+        "code": fingerprint_sources("rank_probe"),
     })
 
 

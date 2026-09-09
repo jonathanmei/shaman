@@ -64,6 +64,17 @@ class QuantArguments:
         default="", metadata={"help": "Per-layer-type bit-budget multipliers, e.g. 'v_proj:1.2,down_proj:1.15'"})
     rank_max_ratio: float = field(
         default=1.0, metadata={"help": "Rank ceiling as a multiple of min(in, out); 1.0 = legacy cap"})
+    rank_sensitivity: str = field(
+        default="none",
+        metadata={"help": "Measured per-layer sensitivity driving the non-uniform allocation: 'none' (ramp / type "
+                          "multipliers only), 'admm' (short ADMM solves at candidate ranks, curvature-weighted error) "
+                          "or 'svd' (tail energy of the whitened spectrum); requires rank_budget parity/full",
+                  "choices": ["none", "admm", "svd"]})
+    rank_probe_ranks: str = field(
+        default="0.5,1.0,1.5",
+        metadata={"help": "Multiples of the uniform rank at which each layer is probed (rank_sensitivity != none)"})
+    rank_probe_iters: int = field(
+        default=50, metadata={"help": "ADMM outer iterations per probe solve (rank_sensitivity='admm')"})
     seed: int = field(default=0, metadata={"help": "Random seed"})
     num_calib_samples: int = field(default=128, metadata={"help": "Number of calibration samples"})
     calib_dataset: str = field(default="wikitext2", metadata={"help": "Calibration dataset"})
@@ -305,6 +316,9 @@ def main():
         rank_depth_ramp=quant_args.rank_depth_ramp,
         rank_type_weights=quant_args.rank_type_weights,
         rank_max_ratio=quant_args.rank_max_ratio,
+        rank_sensitivity=quant_args.rank_sensitivity,
+        rank_probe_ranks=quant_args.rank_probe_ranks,
+        rank_probe_iters=quant_args.rank_probe_iters,
         seed=quant_args.seed,
         num_calib_samples=quant_args.num_calib_samples,
         calib_dataset=quant_args.calib_dataset,

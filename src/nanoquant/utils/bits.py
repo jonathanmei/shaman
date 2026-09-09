@@ -32,7 +32,8 @@ from .utils import (  # layer_bits / SCALE_BITS live in utils (shared with the r
 )
 
 
-def static_accounting(model: nn.Module, layers_to_factorize: Iterable[str], quant_config: dict) -> dict:
+def static_accounting(model: nn.Module, layers_to_factorize: Iterable[str], quant_config: dict,
+                      sensitivity: dict | None = None) -> dict:
     """Predict per-layer ranks/bits and the factorised-layer bpw from the rank-budget rule.
 
     Parameters
@@ -43,6 +44,8 @@ def static_accounting(model: nn.Module, layers_to_factorize: Iterable[str], quan
         Sub-layer names within each decoder block (see ``utils.get_layers_to_factorize``).
     quant_config : dict
         Quantisation config (``bits``, ``admm_type``, ``admm_mid_scale``).
+    sensitivity : dict, optional
+        Rank-probe artifact for the measured allocation (see ``utils.calculate_ranks``).
 
     Returns
     -------
@@ -51,7 +54,7 @@ def static_accounting(model: nn.Module, layers_to_factorize: Iterable[str], quan
         "factorized_bpw"}``.
     """
     layers_to_factorize = list(layers_to_factorize)
-    ranks = calculate_ranks(model, layers_to_factorize, quant_config)
+    ranks = calculate_ranks(model, layers_to_factorize, quant_config, sensitivity=sensitivity)
     num_scales = 3 if has_mid_scale(quant_config) else 2
     layers: dict[str, dict] = {}
     tot_bits = tot_w = 0

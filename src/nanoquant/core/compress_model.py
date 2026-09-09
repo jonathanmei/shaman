@@ -134,9 +134,13 @@ BLOCK_OUTPUT_LAYERS = ("mlp.down_proj", "fc2")
 
 
 @torch.no_grad()
-def compress_block_recon(model, fp_model, dataloader, quant_config, cache: ArtifactCache | None = None):
+def compress_block_recon(model, fp_model, dataloader, quant_config, cache: ArtifactCache | None = None,
+                         sensitivity: dict | None = None):
     """
     Compresses a model using a functional, sequential tune-then-factorize approach.
+
+    ``sensitivity`` is the calibration-time rank-probe artifact (``core.rank_probe.measure_sensitivity``) that the
+    measured rank allocation consumes; ``None`` with ``rank_sensitivity != "none"`` falls back to the uniform rule.
 
     With an enabled ``cache`` the loop is resumable: after every ``checkpoint_every_blocks`` blocks the
     reconstructed blocks and the activations entering the next block are stored under the run's chain
@@ -164,7 +168,7 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
     fp_blocks = get_decoder_layers(fp_model)
     layers_to_factorize = get_layers_to_factorize(model.config.model_type)
     # get admm ranks
-    admm_ranks = calculate_ranks(model, layers_to_factorize, quant_config)
+    admm_ranks = calculate_ranks(model, layers_to_factorize, quant_config, sensitivity=sensitivity)
     # get kwargs
     original_inputs, kwargs = cache_inputs_and_kwargs(fp_model, dataloader, dev)
     kwargs = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
