@@ -10,20 +10,44 @@ import torch
 import torch.nn.functional as F
 from tqdm import trange
 
-from ..core.compress_block import (block_curvature, evaluate_block_loss, factor_drift, factorize_and_replace,
-                                   format_drift, input_second_moment, mahalanobis_weight_error, tune_fact,
-                                   tune_nonfact)
-from .curvature import format_spectrum
-from .importance import collect_stats, get_shrunk_stats, register_stats, shrink_toward_identity
+from ..core.compress_block import (
+    block_curvature,
+    evaluate_block_loss,
+    factor_drift,
+    factorize_and_replace,
+    format_drift,
+    input_second_moment,
+    mahalanobis_weight_error,
+    tune_fact,
+    tune_nonfact,
+)
 from ..modules.linear import NanoQuantLinear
 from ..optimi import AdamW
 from ..utils.cache import ArtifactCache, chain_keys, chain_root, kd_key, teacher_key
 from ..utils.eval_utils import evaluate_ppl_after_block
 from ..utils.load_utils import cache_inputs_and_kwargs, load_tokenizer
-from ..utils.utils import (calculate_ranks, cleanup_memory, find_layers, get_decoder_layers, get_layers_to_factorize,
-                           set_seed)
-from .latent import (format_flip_stats, format_margin_stats, latent_flip_stats, latent_margin_stats,
-                     normalize_latents)
+from ..utils.utils import (
+    calculate_ranks,
+    cleanup_memory,
+    find_layers,
+    get_decoder_layers,
+    get_layers_to_factorize,
+    set_seed,
+)
+from .curvature import format_spectrum
+from .importance import (
+    collect_stats,
+    get_shrunk_stats,
+    register_stats,
+    shrink_toward_identity,
+)
+from .latent import (
+    format_flip_stats,
+    format_margin_stats,
+    latent_flip_stats,
+    latent_margin_stats,
+    normalize_latents,
+)
 from .resume import restore_prefix, save_block_checkpoint, save_progress
 from .teacher import TeacherLogits
 

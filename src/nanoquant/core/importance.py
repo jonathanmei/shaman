@@ -221,24 +221,36 @@ KRON_FITS = ("frobenius", "kl")
 
 @torch.no_grad()
 def _damped_inverse(M: torch.Tensor, rel: float = 1e-3) -> torch.Tensor:
-    """Inverse of a symmetric PSD matrix with its eigenvalues floored at ``rel * mean`` (fp64 internally)."""
+    """Tikhonov-damped inverse ``(M + rel * mean_diag(M) * I)^-1`` of a symmetric PSD matrix (fp64 internally).
+
+    A Cholesky solve is an order of magnitude cheaper than the eigendecomposition it replaces, which matters for
+    the 6144–9728-wide factors of the 1.7B and 4B models (hundreds of inversions per calibration pass).
+    """
     S = M.double()
     S = 0.5 * (S + S.mT)
-    lam, Q = torch.linalg.eigh(S)
-    lam = lam.clamp_min(rel * lam.mean().clamp_min(torch.finfo(torch.float64).tiny))
-    return ((Q / lam) @ Q.mT).to(M.dtype)
+    damp = rel * S.diagonal().mean().clamp_min(torch.finfo(torch.float64).tiny)
+    S.diagonal().add_(damp)
+    chol, info = torch.linalg.cholesky_ex(S)
+    if int(info.item()) != 0:  # not numerically SPD even after damping: fall back to the eigen floor
+        lam, Q = torch.linalg.eigh(S)
+        lam = lam.clamp_min(damp)
+        return ((Q / lam) @ Q.mT).to(M.dtype)
+    return torch.cholesky_inverse(chol).to(M.dtype)
 
 
-def _als_weights(prev: dict, fit: str) -> dict:
+def _als_weights(prev: dict, fit: str, device=None) -> dict:
     """Matrices handed to :func:`nkp_update` as ``L_prev``/``R_prev`` for the next ALS pass.
 
     The Frobenius fit weights token ``t`` by ``x_t^T R x_t``; the KL fit by ``x_t^T R^{-1} x_t`` (and symmetrically
-    for the output side), so for ``fit == "kl"`` the previous factors are (damped) inverted here.
+    for the output side), so for ``fit == "kl"`` the previous factors are (damped) inverted here, on ``device``
+    (the eigendecompositions of the larger layers are far too slow on the CPU).
     """
     if fit == "frobenius":
-        return prev
+        return prev if device is None else {key: {n: M.to(device) for n, M in prev[key].items()}
+                                            for key in ("i_cov", "o_cov")}
     if fit == "kl":
-        return {key: {n: _damped_inverse(M) for n, M in prev[key].items()} for key in ("i_cov", "o_cov")}
+        return {key: {n: _damped_inverse(M if device is None else M.to(device)) for n, M in prev[key].items()}
+                for key in ("i_cov", "o_cov")}
     raise ValueError(f"Unknown kron fit '{fit}'. Choose from {KRON_FITS}.")
 
 
@@ -444,8 +456,6 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
     for it in range(nkp_iters):
         sq_sums = defaultdict(lambda: {"i": 0.0, "o": 0.0, "n": 0, "tokens": 0})
         new = {"i_cov": {}, "o_cov": {}}
-        # ALS weights of this pass: the previous factors (Frobenius fit) or their damped inverses (KL fit)
-        weights = _als_weights(prev, fit)
         for g, names in enumerate(groups):
             group_bytes = sum(_factor_bytes(linear_layers[n]) for n in names)
             print(f">>> Kronecker curvature: NKP pass {it + 1}/{nkp_iters}, layer group {g + 1}/{len(groups)} "
@@ -468,10 +478,10 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
                                    dtype=torch.float32, device=acc_device)
                     for n in names if n.endswith(tuple(plain_cov_layers))
                 }
-            prev_group = {
-                key: {n: weights[key][n].to(acc_device) for n in names if n in weights[key]}
-                for key in ("i_cov", "o_cov")
-            }
+            # ALS weights of this pass for this group: the previous factors (Frobenius fit) or their damped
+            # inverses (KL fit), computed on the accumulation device
+            prev_group = _als_weights({key: {n: prev[key][n] for n in names if n in prev[key]}
+                                       for key in ("i_cov", "o_cov")}, fit, device=acc_device)
             run_states = defaultdict(dict)
             handles = []
             for n in names:

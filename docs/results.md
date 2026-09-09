@@ -19,7 +19,7 @@ The actual bit counter of every run matched these predictions.
 | model | actual bpw | paper (Table 2) | diag, 2 scales (paper-faithful) | kron, 2 scales | diag, 3 scales | kron, 3 scales |
 |---|---|---|---|---|---|---|
 | Qwen3-0.6B-Base | 0.973 / 0.977 | 27.56 | 29.21 | **25.82** | 34.18 | 29.29 |
-| Qwen3-1.7B-Base | 0.986 | 19.21 | 18.76 | 19.21 (**17.28** with tempered ADMM + curvature refresh, 2026-09-08) | – | – |
+| Qwen3-1.7B-Base | 0.986 | 19.21 | 18.76 | 19.21 (**16.72** with KL-Shampoo factors, tempered ADMM, fresh input factor and curvature refresh, 2026-09-08) | – | – |
 | Qwen3-4B-Base | 0.986 | 14.29 | 14.86 | running (job 5606588) | – | – |
 
 ## Qwen3-0.6B-Base (2026-09-02)
@@ -255,3 +255,73 @@ Observations:
 Summary across sizes (WikiText-2 PPL, best arm per size): 0.6B 26.07 (kron, diag block loss, feature-KD weight 1),
 1.7B 17.28 (kron, tempered ADMM, fresh R, refresh/7). Open: same-code untempered 1.7B control; tempering at 0.6B and
 4B; tempering exponent and refresh period sweeps.
+
+## Estimator × structure × tempering grid for the ADMM curvature (2026-09-08, Qwen3-0.6B, 4-block screen)
+
+Motivation and theory: `curvature_tempering_theory.md`. Arms differ only in how ADMM's dense Kronecker factors are
+estimated and conditioned: estimator {Frobenius/NKP, KL-Shampoo (`kron_fit: kl`, inverse-weighted ALS)} × structure
+{full, spike-plus-flat with 64 spikes (`admm_curvature_spike_rank`)} × tempering {p = 1, p = 0.5
+(`admm_curvature_power`)}. Diag block loss, `max_blocks: 4`, jobs 5615851–5615855 and 5615858–5615860.
+
+| estimator | structure | p | job | block 0 | block 1 | block 2 | **block 3** |
+|---|---|---|---|---|---|---|---|
+| NKP | full | 1 (control) | 5615851 | 18.39 | 14.25 | 14.85 | 15.14 |
+| NKP | full | 0.5 | 5615852 | 16.49 | 14.30 | 14.78 | 15.08 |
+| NKP | spike+flat 64 | 1 | 5615853 | 20.65 | 14.54 | 15.05 | 15.86 |
+| NKP | spike+flat 64 | 0.5 | 5615854 | 17.61 | 14.44 | 14.84 | 15.58 |
+| KL | full | 1 | 5615855 | 17.60 | 14.05 | 14.51 | **14.78** |
+| KL | full | 0.5 | 5615858 (repeat 5615863) | 16.61 | 14.05 | 14.51 | 14.81 (14.88) |
+| KL | spike+flat 64 | 1 | 5615859 (repeat 5615864) | 17.93 | 14.41 | 14.81 | 15.27 (15.00) |
+| KL | spike+flat 64 | 0.5 | 5615860 (repeat 5615865) | 18.98 | 14.21 | 14.66 | 15.00 (15.06) |
+
+Control repeats at block 3 so far: 15.14, 15.28, 15.29, 15.36, 15.49 (noise ≈ 0.2). The three KL arms were run twice
+(second values in parentheses; the spike+flat p = 0.5 repeat resumed from the first run's blocks 0–1): the ordering
+KL/full < KL/spike+flat < NKP holds in both repeats.
+
+Phase 3b (tempered ADMM p = 0.5 **and** a tempered dense block loss, `block_loss: mahalanobis`, `block_loss_power`
+0.5): NKP source 15.03 (5615861), plain source 14.98 (5615862), both within noise of the tempered-ADMM control with
+the diagonal block loss (15.08). Tempering both stages does not compound; it does rescue the plain covariance as a
+block loss (15.85 untempered → 14.98).
+
+Spectrum of the block-output factor (`mlp.down_proj`, shrunk), blocks 0–3: NKP condition number 330 / 218 / 487 /
+683 with effective rank 86 / 154 / 52 / 33; KL condition number 49 / 41 / 44 / 39 with effective rank 692 / 698 /
+673 / 680 and a top-50 trace share of 0.15 instead of 0.35–0.70.
+
+Observations:
+
+- **The KL-Shampoo estimator is the best single change at 0.6B**: −0.36 PPL at block 3 against the control, below
+  every control repeat, and lower at every block boundary. Its factors are already well conditioned, and tempering
+  them adds nothing (14.81 vs 14.78), so at this size the mechanism behind tempering is estimation error of the
+  Frobenius fit (argument 3 of the theory note): the leverage-weighted fit removes the massive-token inflation that
+  the power law was compensating for.
+- **Tempering the NKP factors at 0.6B** is within noise at block 3 (15.08 vs 15.14) but clearly better at block 0
+  (16.5 vs 18.4), consistent with the large 1.7B gain being a conditioning effect that grows with width.
+- **Spike-plus-flat projection hurts** for both estimators (+0.7 / +0.5 for NKP, +0.5 / +0.2 for KL at p = 1 / 0.5).
+  The projected factor is well conditioned, so the loss comes from discarding the bulk eigenvalue structure that ADMM's
+  data term uses; the Pro-KLShampoo argument for flattening (the bulk of a rank-ρ signal-plus-noise gradient model is
+  exactly flat) does not hold for these calibration-time Fisher factors, whose bulk still carries correlation structure.
+  Tempering partially repairs the projection (it re-weights the spikes downward), which is why spike+flat at p = 0.5
+  beats spike+flat at p = 1.
+- Cost: the KL fit adds one eigendecomposition per layer per ALS pass (fp64); the 0.6B calibration took 25 min
+  instead of 10.
+
+### 1.7B follow-up: KL estimator with and without tempering (2026-09-08)
+
+Both on top of the fresh input factor and the refresh every 7 blocks (the periodic refresh uses the configured fit);
+configs `qwen3_1p7b_kron_2scale_kl_refresh.json` (p = 1) and `qwen3_1p7b_kron_2scale_kl_temper_refresh.json` (p = 0.5).
+
+| arm | job | block 7 | block 14 | block 21 | block 27 (pre-KD) | KD loss ep1 → ep8 | **WikiText-2 PPL** | zero-shot mean | wall-clock |
+|---|---|---|---|---|---|---|---|---|---|
+| NKP, tempered + fresh R + refresh (previous best) | 5615752 | 11.44 | 12.46 | 14.49 | 18.02 | 2.489 → 2.457 | 17.28 | 0.446 | 2 h 09 |
+| KL, p = 1, fresh R + refresh | 5615872 | 11.25 | 12.16 | 14.11 | 17.78 | 2.494 → 2.462 | 17.04 | 0.436 | 3 h 00 |
+| KL, p = 0.5, fresh R + refresh | 5615873 | 11.20 | 12.12 | 14.05 | 17.69 | 2.492 → 2.458 | **16.72** | 0.448 | ~3 h 50 |
+
+- The KL estimator lowers the trajectory at every checkpoint relative to the tempered NKP factors (−0.2 to −0.4 PPL
+  from block 7 on) and ends at 17.04; tempering the KL factors adds another −0.32 (16.72), so at 1.7B both
+  mechanisms contribute, whereas at 0.6B tempering was redundant once the estimator was fixed. This matches the
+  theory note: estimation error (argument 3) dominates at 0.6B; the use-side arguments (1)–(2) grow with width.
+- 16.72 is 13 % below the paper's 19.21 and 11 % below the diag baseline (18.76); zero-shot mean 0.448 vs 0.426.
+- Cost: the KL calibration at 1.7B took ~55 min instead of 10 because the damped inverses of the 2048–6144-wide
+  factors were computed on the CPU; fixed on the branch by inverting on the accumulation device (uncommitted at the
+  time of writing, see the pending-state note). The p = 0.5 arm came within minutes of the 4-hour limit for that
+  reason.

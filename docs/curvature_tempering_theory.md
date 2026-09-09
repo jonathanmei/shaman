@@ -64,8 +64,17 @@ but the spectral projection transfers directly: keep the top-$r$ eigenpairs, rep
 (`admm_curvature_spike_rank`). It leaves the well-estimated spikes intact and denoises the bulk, a different
 regulariser from tempering, which compresses spikes and bulk alike.
 
-## The grid
+## The grid and what it showed (results.md, 2026-09-08)
 
 Estimator {Frobenius NKP, KL} × structure {full, spike-plus-flat, $r = 64$} × tempering {$p = 1$, $p = 1/2$} on the
-4-block screen at 0.6B, then the best arms at 1.7B. If KL or spike-plus-flat at $p = 1$ matches tempering, the
-mechanism is estimation (3); if $p = 1/2$ is still needed on top, it is (1)–(2).
+4-block screen at 0.6B, then the best arms at 1.7B. The prediction was: if KL or spike-plus-flat at $p = 1$ matches
+tempering, the mechanism is estimation (3); if $p = 1/2$ is still needed on top, it is (1)–(2).
+
+- **0.6B**: the KL estimator alone gives the full gain (block-3 PPL 14.78 vs 15.14; its factors have condition
+  numbers 39–49 instead of 330–683) and tempering it adds nothing (14.81). Mechanism at this size: estimation (3).
+- **1.7B**: KL alone reaches 17.04 (tempered NKP: 17.46; tempered NKP + fresh input factor + refresh: 17.28), and
+  tempering the KL factors adds a further −0.32 (16.72). Both mechanisms contribute at this width, consistent with
+  (1)–(2) growing with the size of the perturbation and the uncertainty of the curvature.
+- **Spike-plus-flat** hurts for both estimators at 0.6B (+0.2 to +0.7): the bulk of these Fisher factors is not
+  flat, so the Pro-KLShampoo projection discards structure the ADMM data term uses. The projection remains
+  attractive for *cost* at large width (O(nr) instead of O(n²) per factor), but not for accuracy here.

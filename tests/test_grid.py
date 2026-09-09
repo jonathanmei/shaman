@@ -61,7 +61,9 @@ def test_temper_projection_then_power():
 def test_als_weights_kl_uses_damped_inverses():
     R = _spd(5, 11, spread=10.0)
     w = imp._als_weights({"i_cov": {"a": R}, "o_cov": {}}, "kl")
-    assert torch.allclose(w["i_cov"]["a"] @ R, torch.eye(5), atol=1e-4)
+    damped = R + 1e-3 * R.diagonal().mean() * torch.eye(5)  # Tikhonov damping of _damped_inverse
+    assert torch.allclose(w["i_cov"]["a"] @ damped, torch.eye(5), atol=1e-4)
+    assert torch.allclose(w["i_cov"]["a"] @ R, torch.eye(5), atol=1e-2)  # well conditioned: nearly the exact inverse
     assert imp._als_weights({"i_cov": {"a": R}, "o_cov": {}}, "frobenius")["i_cov"]["a"] is R
     with pytest.raises(ValueError):
         imp._als_weights({"i_cov": {}, "o_cov": {}}, "banana")
