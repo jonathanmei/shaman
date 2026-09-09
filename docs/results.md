@@ -20,7 +20,7 @@ The actual bit counter of every run matched these predictions.
 |---|---|---|---|---|---|---|
 | Qwen3-0.6B-Base | 0.973 / 0.977 | 27.56 | 29.21 | **25.82** | 34.18 | 29.29 |
 | Qwen3-1.7B-Base | 0.986 | 19.21 | 18.76 | 19.21 (**16.72** with KL-Shampoo factors, tempered ADMM, fresh input factor and curvature refresh, 2026-09-08) | – | – |
-| Qwen3-4B-Base | 0.986 | 14.29 | 14.86 | running (job 5606588) | – | – |
+| Qwen3-4B-Base | 0.986 | 14.29 | 14.86 | timed out (job 5606588); **14.11** with KL-Shampoo factors, tempered ADMM (p = ½), fresh input factor and curvature refresh (2026-09-09) | – | – |
 
 ## Qwen3-0.6B-Base (2026-09-02)
 
@@ -322,6 +322,27 @@ configs `qwen3_1p7b_kron_2scale_kl_refresh.json` (p = 1) and `qwen3_1p7b_kron_2s
   mechanisms contribute, whereas at 0.6B tempering was redundant once the estimator was fixed. This matches the
   theory note: estimation error (argument 3) dominates at 0.6B; the use-side arguments (1)–(2) grow with width.
 - 16.72 is 13 % below the paper's 19.21 and 11 % below the diag baseline (18.76); zero-shot mean 0.448 vs 0.426.
+### 4B (2026-09-09): KL factors, tempered ADMM (p = ½), fresh input factor, refresh every 9 blocks
+
+`configs/qwen3_4b_kron_2scale_kl_temper_refresh.json`, jobs 5616745 (calibration + all 36 blocks, timed out at the
+4-hour limit during KD) and 5616747 (reloaded the cached pre-KD model, KD + evaluation, 15 min).
+
+| arm | block 0 | block 9 | block 18 | KD loss ep8 | **WikiText-2 PPL** | zero-shot mean |
+|---|---|---|---|---|---|---|
+| diag (2026-09-02, job 5606403) | | | | 2.208 | 14.86 | 0.455 |
+| paper (Table 2) | | | | | 14.29 | |
+| KL, p = ½, fresh R, refresh/9 | 7.98 | 9.02 | 9.85 | 2.186 | **14.11** | 0.463 |
+
+- First 4B result below the paper (−1.3 %) and 5 % below the diag baseline; zero-shot mean 0.463 vs 0.455. The
+  earlier untempered Kron 4B run never finished, so there is no same-size untempered comparison.
+- Cost: KL calibration with GPU Cholesky inverses ~35 min for 36 × 7 layers in 3 groups; ~6 min per block; refreshes
+  at blocks 9 / 18 / 27 took 355 / 271 s (189 / 126 remaining layers). Reconstruction alone is ~3 h 50 at 4B, so a
+  single 4-hour job cannot also run KD; the resubmission resumes from the cached pre-KD model in minutes.
+- Note: the first 4B attempt (job 5616740) hit a CUDA OOM at its first refresh because `collect_stats` moved the
+  model, with ~36 GB of dense factor buffers, to the GPU; the refresh now detaches the factors to the CPU first
+  (commit 4e18bb3). Any change to the block-stage source files invalidates the block checkpoints, which is why the
+  rerun started from block 0.
+
 - **The tempering exponent is U-shaped with its optimum at the square root**: p = 1 → 17.04, p = 0.5 → 16.72,
   p = 0.25 → 17.37 (worse than no tempering at every block from block 7 on). The literal per-factor Shampoo
   exponent (¼) over-tempers here because the Kronecker fit targets the Fisher itself, not its square, so the
