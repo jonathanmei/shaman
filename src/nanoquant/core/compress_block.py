@@ -16,8 +16,9 @@ from ..optimi import AdamW
 from ..utils.cache import ArtifactCache, admm_key
 from ..utils.utils import cleanup_memory, find_layers, set_seed
 from .admm_dbf import factorize_admm_dbf
-from .admm_nq import factorize_admm_nanoquant
+from .admm_nq import EigCache, factorize_admm_nanoquant
 from .curvature import condition_curvature, spectrum_summary
+from .importance import shrink_toward_identity
 from .latent import hard_sign, sign_flips
 
 
@@ -126,7 +127,7 @@ def block_curvature(sublayers: dict, hidden_size: int, quant_config: dict, dev: 
 # ----------------------------------------------------------------------------------------------------
 @torch.no_grad()
 def input_second_moment(block, layer: nn.Module, block_inputs: torch.Tensor, kwargs: dict,
-                        num_samples: int) -> torch.Tensor:
+                        num_samples: int, return_probe: bool = False):
     """Plain second moment ``sum_t x_t x_t^T / T`` of the inputs reaching ``layer`` inside ``block``.
 
     Measured on the block's current weights and on the activations of the quantised prefix
@@ -145,17 +146,23 @@ def input_second_moment(block, layer: nn.Module, block_inputs: torch.Tensor, kwa
         Extra block forward arguments (attention mask, position embeddings, ...).
     num_samples : int
         Number of calibration samples to run.
+    return_probe : bool
+        Also return the layer's input on the first sample, ``(seqlen, in_features)`` fp32, which
+        :func:`fresh_input_factor` uses to validate the reuse of the factor by another layer.
 
     Returns
     -------
-    torch.Tensor
-        ``(in_features, in_features)`` fp32 on the block's device.
+    torch.Tensor or tuple
+        ``(in_features, in_features)`` fp32 on the block's device; with ``return_probe`` the pair ``(R, probe)``.
     """
     acc = torch.zeros(layer.in_features, layer.in_features, dtype=torch.float32, device=block_inputs.device)
     count = [0]
+    probe: list[torch.Tensor] = []
 
     def hook(_m, inp, _out):
         x = inp[0].detach().flatten(0, -2).float()
+        if return_probe and not probe:
+            probe.append(x.clone())
         acc.addmm_(x.mT, x)
         count[0] += x.shape[0]
 
@@ -165,7 +172,141 @@ def input_second_moment(block, layer: nn.Module, block_inputs: torch.Tensor, kwa
             block(block_inputs[j:j + 1], **kwargs)
     finally:
         handle.remove()
-    return acc / max(1, count[0])
+    R = acc / max(1, count[0])
+    return (R, probe[0]) if return_probe else R
+
+
+@torch.no_grad()
+def layer_input_probe(block, layer: nn.Module, sample: torch.Tensor, kwargs: dict) -> torch.Tensor:
+    """The input reaching ``layer`` for one block input ``sample`` ``(1, seqlen, hidden)``, as ``(seqlen, in)`` fp32."""
+    captured: list[torch.Tensor] = []
+    handle = layer.register_forward_hook(
+        lambda _m, inp, _out: captured.append(inp[0].detach().flatten(0, -2).float().clone()))
+    try:
+        block(sample, **kwargs)
+    finally:
+        handle.remove()
+    return captured[0]
+
+
+@torch.no_grad()
+def shared_input_groups(block, layers: dict[str, nn.Module], names, sample: torch.Tensor,
+                        kwargs: dict) -> dict[str, str]:
+    """Group the layers of a block that read the same activation tensor (q/k/v, gate/up).
+
+    One forward pass with hooks records the storage pointer of every layer's input; layers with the same pointer
+    form a group named after its first member in ``names`` order. Model-agnostic.
+
+    Parameters
+    ----------
+    block : nn.Module
+        Decoder block.
+    layers : dict
+        ``name -> module`` (from ``find_layers``).
+    names : iterable of str
+        Layer names in factorisation order.
+    sample : torch.Tensor
+        One block input ``(1, seqlen, hidden)``.
+    kwargs : dict
+        Extra block forward arguments.
+
+    Returns
+    -------
+    dict
+        ``layer name -> group key`` for every name present in ``layers``.
+    """
+    ptrs: dict[str, tuple] = {}
+    handles = []
+
+    def make_hook(name):
+        def hook(_m, inp, _out):
+            ptrs[name] = (inp[0].data_ptr(), tuple(inp[0].shape))
+        return hook
+
+    for n in names:
+        if n in layers:
+            handles.append(layers[n].register_forward_hook(make_hook(n)))
+    try:
+        block(sample, **kwargs)
+    finally:
+        for h in handles:
+            h.remove()
+    first: dict[tuple, str] = {}
+    return {n: first.setdefault(ptrs[n], n) for n in names if n in ptrs}
+
+
+def group_size(groups: dict[str, str], key: str) -> int:
+    """Number of layers in the group ``key`` of :func:`shared_input_groups`."""
+    return sum(1 for g in groups.values() if g == key)
+
+
+@dataclass
+class FreshFactor:
+    """A fresh input second moment cached for the layers of one shared-input group.
+
+    Attributes
+    ----------
+    R, R_shrunk : torch.Tensor
+        Plain and shrunk second moments ``(in, in)``.
+    probe : torch.Tensor
+        The group's input on the first calibration sample, used to validate reuse.
+    """
+    R: torch.Tensor
+    R_shrunk: torch.Tensor
+    probe: torch.Tensor
+
+
+@torch.no_grad()
+def fresh_input_factor(block, layer: nn.Module, name: str, groups: dict[str, str], block_inputs: torch.Tensor,
+                       kwargs: dict, num_samples: int, shrinkage: float, fresh_cache: dict[str, FreshFactor],
+                       eig_cache: EigCache | None) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Fresh input factor of ``layer``, reusing the one measured for an earlier layer of the same group when valid.
+
+    The reuse is validated by one block forward on the first sample: if the layer's input still equals the probe
+    stored with the cached factor (relative difference ``<= 1e-3``), the factor and its shrunk form are returned
+    as-is (so ADMM's eigendecomposition of the shrunk factor can be shared through ``eig_cache``). Otherwise, or
+    for layers whose input nobody else reads, the factor is measured with :func:`input_second_moment`.
+
+    Parameters
+    ----------
+    block, layer, name : nn.Module, nn.Module, str
+        Decoder block, the layer about to be factorised and its name.
+    groups : dict
+        Output of :func:`shared_input_groups`.
+    block_inputs, kwargs, num_samples : torch.Tensor, dict, int
+        As for :func:`input_second_moment`.
+    shrinkage : float
+        ``calib_shrinkage`` applied to the measured factor.
+    fresh_cache : dict
+        ``group key -> FreshFactor``; updated in place, cleared by the caller at the end of the block.
+    eig_cache : EigCache or None
+        Shared factors are registered here; a failed validation clears it.
+
+    Returns
+    -------
+    tuple
+        ``(R, R_shrunk, reused)``.
+    """
+    key = groups.get(name, name)
+    shared = group_size(groups, key) > 1
+    hit = fresh_cache.get(key) if shared else None
+    if hit is not None:
+        probe = layer_input_probe(block, layer, block_inputs[:1], kwargs)
+        if probe.shape == hit.probe.shape and \
+                (probe - hit.probe).norm() <= 1e-3 * hit.probe.norm().clamp_min(torch.finfo(torch.float32).tiny):
+            return hit.R, hit.R_shrunk, True
+        # the shared input changed since the factor was measured (should not happen: only norm and full-precision
+        # linear weights are tuned and neither feeds these inputs); measure again and forget the eigendecompositions
+        del fresh_cache[key]
+        if eig_cache is not None:
+            eig_cache.clear()
+    R, probe = input_second_moment(block, layer, block_inputs, kwargs, num_samples, return_probe=True)
+    R_shrunk = shrink_toward_identity(R, shrinkage)
+    if shared:
+        fresh_cache[key] = FreshFactor(R, R_shrunk, probe)
+        if eig_cache is not None:
+            eig_cache.register(R_shrunk)
+    return R, R_shrunk, False
 
 
 @torch.no_grad()
@@ -351,7 +492,7 @@ def _to_device(results: dict, device) -> dict:
 
 @torch.no_grad()
 def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache | None = None,
-                          input_factor: torch.Tensor | None = None):
+                          input_factor: torch.Tensor | None = None, eig_cache: EigCache | None = None):
     """
     Factorizes and replaces a submodule with a quantized version (NanoQuantLinear).
 
@@ -366,6 +507,9 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
         replaces the calibration-time input curvature: ``i_norm`` becomes its diagonal and, on the dense path,
         ``i_cov`` the matrix itself. With ``block_diagnostics`` the Mahalanobis weight error of the solution is
         printed under both the stale and the fresh factor.
+    eig_cache : EigCache, optional
+        Eigendecompositions of curvature factors shared by several layers of the block (fresh input factor of
+        q/k/v and gate/up), see :func:`fresh_input_factor`.
     """
     set_seed(quant_config['seed'])
     lx_orig = find_layers(layer)[name]
@@ -420,7 +564,14 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
                 eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)),
                 curvature_power=float(quant_config.get('admm_curvature_power', 1.0)),
                 curvature_cond_max=float(quant_config.get('admm_curvature_cond_max', 0.0) or 0.0),
-                curvature_spike_rank=int(quant_config.get('admm_curvature_spike_rank', 0) or 0))
+                curvature_spike_rank=int(quant_config.get('admm_curvature_spike_rank', 0) or 0),
+                eig_cache=eig_cache,
+                early_stop_patience=int(quant_config.get('admm_early_stop_patience', 0) or 0),
+                early_stop_tol=float(quant_config.get('admm_early_stop_tol', 1e-4)),
+                early_stop_min_frac=float(quant_config.get('admm_early_stop_min_frac', 0.5)),
+                sylvester_tol=float(quant_config.get('admm_sylvester_tol', 0.0) or 0.0),
+                sylvester_qr_steps=int(quant_config.get('admm_sylvester_qr_steps', 1)),
+                sylvester_max_pcg=int(quant_config.get('admm_sylvester_max_pcg', 3)))
         else:
             raise ValueError(f"Unknown admm_type: {quant_config['admm_type']}")
         if memo_key is not None:

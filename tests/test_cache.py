@@ -86,6 +86,13 @@ def test_admm_key_is_content_addressed():
     assert k != C.admm_key(W, i_n, o_n, torch.eye(6), torch.eye(8), 4, base)
     assert k != C.admm_key(W, i_n, o_n, None, None, 4, _cfg(admm_mid_scale=True))
     assert k != C.admm_key(W, i_n, o_n, None, None, 4, _cfg(admm_outer_iters=7))
+    # the inexact Sylvester solve and early stopping change the solution, so they are part of the key
+    assert k != C.admm_key(W, i_n, o_n, None, None, 4, _cfg(admm_sylvester_tol=1e-2))
+    assert k != C.admm_key(W, i_n, o_n, None, None, 4, _cfg(admm_sylvester_qr_steps=0))
+    assert k != C.admm_key(W, i_n, o_n, None, None, 4, _cfg(admm_sylvester_max_pcg=1))
+    assert k != C.admm_key(W, i_n, o_n, None, None, 4, _cfg(admm_early_stop_patience=5))
+    assert k != C.admm_key(W, i_n, o_n, None, None, 4, _cfg(admm_early_stop_tol=1e-3))
+    assert k != C.admm_key(W, i_n, o_n, None, None, 4, _cfg(admm_early_stop_min_frac=0.25))
 
 
 # ---------------------------------------------------------------- storage

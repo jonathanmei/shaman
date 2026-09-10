@@ -16,8 +16,9 @@ from ..core.compress_block import (
     factor_drift,
     factorize_and_replace,
     format_drift,
-    input_second_moment,
+    fresh_input_factor,
     mahalanobis_weight_error,
+    shared_input_groups,
     tune_fact,
     tune_nonfact,
 )
@@ -34,13 +35,13 @@ from ..utils.utils import (
     get_layers_to_factorize,
     set_seed,
 )
+from .admm_nq import EigCache
 from .curvature import format_spectrum
 from .importance import (
     PLAIN_COV_KEY,
     collect_stats,
     get_shrunk_stats,
     register_stats,
-    shrink_toward_identity,
 )
 from .latent import (
     format_flip_stats,
@@ -227,6 +228,11 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
         # move data to GPU
         tuning_inputs = tuning_inputs.to(dev)
         target_outputs = target_outputs.to(dev)
+        # layers reading the same activation (q/k/v, gate/up) share one fresh input factor and its eigendecomposition
+        fresh_cache: dict = {}
+        eig_cache = EigCache() if fresh_input else None
+        groups = (shared_input_groups(q_block, sublayers, layers_to_factorize, tuning_inputs[:1], kwargs)
+                  if (fresh_input or diagnostics) else {})
         # compress each linear layer
         memo_hits = 0
         for name in layers_to_factorize:
@@ -242,9 +248,13 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             layer = sublayers[name]
             input_factor = R_fresh = R_fresh_shrunk = None
             if fresh_input or diagnostics:
-                # plain second moment of the inputs that actually reach the layer (quantised prefix, tuned block)
-                R_fresh = input_second_moment(q_block, layer, tuning_inputs, kwargs, num_samples)
-                R_fresh_shrunk = shrink_toward_identity(R_fresh, quant_config['calib_shrinkage'])
+                # plain second moment of the inputs that actually reach the layer (quantised prefix, tuned block),
+                # reused from an earlier layer of the same shared-input group when its input is unchanged
+                R_fresh, R_fresh_shrunk, reused = fresh_input_factor(
+                    q_block, layer, name, groups, tuning_inputs, kwargs, num_samples, quant_config['calib_shrinkage'],
+                    fresh_cache, eig_cache)
+                if reused:
+                    print(f"\t\t[fresh R] {name}: reusing the input factor measured for {groups[name]}")
                 if diagnostics:
                     # the calibration-time factor is shrunk; compare it with the equally shrunk fresh one
                     stale = getattr(layer, 'i_cov', None)
@@ -257,7 +267,8 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
                 w_before = layer.weight.detach().clone()
                 loss_before = evaluate_block_loss(q_block, tuning_inputs, target_outputs, curvature, kwargs, num_samples)
             nano_linear, final_factor_results = factorize_and_replace(q_block, name, curr_rank, quant_config,
-                                                                      cache=cache, input_factor=input_factor)
+                                                                      cache=cache, input_factor=input_factor,
+                                                                      eig_cache=eig_cache)
             memo_hits += int(getattr(final_factor_results, "cache_hit", False))
             if diagnostics:
                 # eq. (9) of the design note: for down_proj the dense block-loss increase of the ADMM solution equals
@@ -285,6 +296,9 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
                 tune_fact(q_block, nano_linear, tuning_inputs, target_outputs, curvature, kwargs, quant_config)
                 cleanup_memory()
             cleanup_memory()
+        fresh_cache.clear()
+        if eig_cache is not None:
+            eig_cache.clear()
         if cache is not None and cache.enabled:
             print(f"\t\t[cache] block {i}: ADMM memo hits {memo_hits}/{len(sublayers)}")
 

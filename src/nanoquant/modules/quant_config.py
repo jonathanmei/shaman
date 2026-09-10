@@ -58,6 +58,17 @@ def NanoQuantConfig(
     admm_curvature_cond_max: float = 0.0,
     # >0: spike-plus-flat projection of ADMM's dense factors (keep this many eigenpairs, flatten the tail; Pro-KLShampoo)
     admm_curvature_spike_rank: int = 0,
+    # stop ADMM once the projected binary factors have been frozen (no sign flips, relative magnitude change below
+    # tol) for this many consecutive iterations after min_frac of the schedule (0 = off; leave off with retain_latent)
+    admm_early_stop_patience: int = 0,
+    admm_early_stop_tol: float = 1e-4,
+    admm_early_stop_min_frac: float = 0.5,
+    # inexact Mahalanobis X-update: stale eigenbasis of the k x k Gram matrix as preconditioner, refreshed by Rayleigh
+    # quotients, QR (orthogonal-iteration) steps and PCG; a full eigendecomposition only when the residual stays above
+    # tol (0 = exact eigendecomposition every iteration)
+    admm_sylvester_tol: float = 0.0,
+    admm_sylvester_qr_steps: int = 1,
+    admm_sylvester_max_pcg: int = 3,
     # >0: every N blocks re-estimate the curvature of the remaining layers on the quantised prefix (kron only)
     curvature_refresh_every: int = 0,
     curvature_refresh_iters: int = 1,
@@ -135,6 +146,12 @@ def NanoQuantConfig(
         "admm_curvature_power": admm_curvature_power,
         "admm_curvature_cond_max": admm_curvature_cond_max,
         "admm_curvature_spike_rank": admm_curvature_spike_rank,
+        "admm_early_stop_patience": admm_early_stop_patience,
+        "admm_early_stop_tol": admm_early_stop_tol,
+        "admm_early_stop_min_frac": admm_early_stop_min_frac,
+        "admm_sylvester_tol": admm_sylvester_tol,
+        "admm_sylvester_qr_steps": admm_sylvester_qr_steps,
+        "admm_sylvester_max_pcg": admm_sylvester_max_pcg,
         "curvature_refresh_every": curvature_refresh_every,
         "curvature_refresh_iters": curvature_refresh_iters,
         "block_diagnostics": block_diagnostics,

@@ -40,7 +40,9 @@ STATS_FIELDS: tuple[str, ...] = ("model_id", "seqlen", "calib_dataset", "num_cal
                                  "curvature", "kron_fit", "kron_nkp_iters")
 ADMM_FIELDS: tuple[str, ...] = ("admm_type", "admm_outer_iters", "admm_inner_iters", "admm_reg",
                                 "admm_penalty_scheduler", "admm_mid_scale", "kron_eigh_dtype", "seed",
-                                "admm_curvature_power", "admm_curvature_cond_max", "admm_curvature_spike_rank")
+                                "admm_curvature_power", "admm_curvature_cond_max", "admm_curvature_spike_rank",
+                                "admm_early_stop_patience", "admm_early_stop_tol", "admm_early_stop_min_frac",
+                                "admm_sylvester_tol", "admm_sylvester_qr_steps", "admm_sylvester_max_pcg")
 # ``max_blocks`` and ``block_diagnostics`` are deliberately absent: a truncated screening run and a run with extra
 # logging share their per-block checkpoints with the plain full chain.
 BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits") + ADMM_FIELDS + (

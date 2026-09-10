@@ -4,7 +4,9 @@
 
 [remote]
 host = "ob"          # ssh alias for the cluster login node (~/.ssh/config)
-base_dir = "~/code"  # remote parent dir; project checks out to base_dir/<repo>
+# Separate checkout for this branch (~/code/fast/shaman) so its submissions never re-checkout ~/code/shaman under
+# jobs still pending there. Its cache/ is a symlink to ~/code/shaman/cache (content-addressed keys, shared ledger).
+base_dir = "~/code/fast"  # remote parent dir; project checks out to base_dir/<repo>
 
 [slurm]
 # Command the job runs, from the project root on the cluster.

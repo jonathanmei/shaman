@@ -163,6 +163,26 @@ class TuneArguments:
     admm_curvature_spike_rank: int = field(
         default=0, metadata={"help": "ADMM: spike-plus-flat projection of the dense factors, keeping this many "
                                      "eigenpairs and flattening the tail (0 = off)"})
+    admm_early_stop_patience: int = field(
+        default=0, metadata={"help": "ADMM: stop once the projected binary factors have been frozen (no sign flips, "
+                                     "relative change below admm_early_stop_tol) for this many consecutive iterations "
+                                     "(0 = off; keep off with retain_latent, whose latents depend on the final rho)"})
+    admm_early_stop_tol: float = field(
+        default=1e-4, metadata={"help": "ADMM early stopping: relative Frobenius change of the projected factors "
+                                        "counted as frozen"})
+    admm_early_stop_min_frac: float = field(
+        default=0.5, metadata={"help": "ADMM early stopping: fraction of admm_outer_iters that must run first"})
+    admm_sylvester_tol: float = field(
+        default=0.0, metadata={"help": "Mahalanobis ADMM: relative residual accepted for the inexact X-update solved "
+                                       "with the stale eigenbasis of the Gram matrix (Rayleigh refresh, QR steps, "
+                                       "PCG; full eigendecomposition only when it fails). 0 = exact eigendecomposition "
+                                       "every iteration. TF32 matmuls floor the achievable residual near 1e-3"})
+    admm_sylvester_qr_steps: int = field(
+        default=1, metadata={"help": "Mahalanobis ADMM: orthogonal-iteration (QR) steps on the stale eigenbasis "
+                                     "before falling back to PCG"})
+    admm_sylvester_max_pcg: int = field(
+        default=3, metadata={"help": "Mahalanobis ADMM: preconditioned conjugate-gradient steps before a full "
+                                     "eigendecomposition is recomputed"})
     curvature_refresh_every: int = field(
         default=0, metadata={"help": ">0: every N blocks re-estimate the curvature of the remaining layers on the "
                                      "quantised prefix (curvature=kron)"})
@@ -309,6 +329,12 @@ def main():
         admm_curvature_power=tune_args.admm_curvature_power,
         admm_curvature_cond_max=tune_args.admm_curvature_cond_max,
         admm_curvature_spike_rank=tune_args.admm_curvature_spike_rank,
+        admm_early_stop_patience=tune_args.admm_early_stop_patience,
+        admm_early_stop_tol=tune_args.admm_early_stop_tol,
+        admm_early_stop_min_frac=tune_args.admm_early_stop_min_frac,
+        admm_sylvester_tol=tune_args.admm_sylvester_tol,
+        admm_sylvester_qr_steps=tune_args.admm_sylvester_qr_steps,
+        admm_sylvester_max_pcg=tune_args.admm_sylvester_max_pcg,
         curvature_refresh_every=tune_args.curvature_refresh_every,
         curvature_refresh_iters=tune_args.curvature_refresh_iters,
         block_diagnostics=tune_args.block_diagnostics,

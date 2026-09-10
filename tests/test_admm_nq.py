@@ -252,3 +252,250 @@ def test_calculate_ranks_pays_for_mid_scale():
     assert two["0.self_attn.q_proj"] == 512
     assert three["0.self_attn.q_proj"] == 480
     assert three == dbf
+
+
+# --------------------------------------------------------------------------------------
+# Inexact Sylvester solve: stale eigenbasis preconditioner with Rayleigh / QR / PCG rungs
+# --------------------------------------------------------------------------------------
+def _sylvester_problem(seed, n=10, k=5, spectrum=None):
+    """Random SPD ``Sigma`` (with its eigendecomposition), SPD Gram matrix ``M`` and right-hand side ``C``."""
+    torch.manual_seed(seed)
+    A = torch.randn(n, n)
+    Sigma = A @ A.mT / n + 0.1 * torch.eye(n)
+    lam, Q = torch.linalg.eigh(Sigma)
+    if spectrum is None:
+        B = torch.randn(k, k)
+        M = B @ B.mT + 0.1 * torch.eye(k)
+    else:
+        Qm, _ = torch.linalg.qr(torch.randn(k, k))
+        M = (Qm * spectrum) @ Qm.mT
+    C = torch.randn(n, k)
+    return Sigma, lam, Q, M, C
+
+
+def _residual(Sigma, lam, M, C, F, rho, reg):
+    sigma = admm_nq._sylvester_stabilizer(lam, M, rho, reg)
+    return (Sigma @ F @ M + sigma * F - C).norm().item()
+
+
+def _rotate(M, angle, i, j):
+    """Rotate the eigenvectors ``i`` and ``j`` of ``M`` by ``angle`` (keeps the spectrum)."""
+    mu, Qm = torch.linalg.eigh(M)
+    G = torch.eye(M.shape[0])
+    c, s = torch.cos(torch.tensor(angle)), torch.sin(torch.tensor(angle))
+    G[i, i], G[j, j], G[i, j], G[j, i] = c, c, -s, s
+    Qr = Qm @ G
+    return (Qr * mu) @ Qr.mT
+
+
+def test_sylvester_tol_zero_is_legacy():
+    Sigma, lam, Q, M, C = _sylvester_problem(20)
+    ref = admm_nq._sylvester_solve_step(Q, lam, M, C, 0.5, 1e-2)
+    state = admm_nq.SylvesterState()
+    got = admm_nq._sylvester_solve_step(Q, lam, M, C, 0.5, 1e-2, Sigma=Sigma, state=state, tol=0.0)
+    assert torch.equal(got, ref)
+    assert state.n_eigh == 1 and state.Q_M is not None and state.mu is not None
+
+
+def test_sylvester_pcg_matches_exact_with_stale_basis():
+    Sigma, lam, Q, M, C = _sylvester_problem(21)
+    rho, reg = 0.5, 1e-2
+    state = admm_nq.SylvesterState()
+    admm_nq._sylvester_solve_step(Q, lam, M, C, rho, reg, Sigma=Sigma, state=state, tol=1e-6)  # fills the state
+    torch.manual_seed(22)
+    P = torch.randn(M.shape[0], M.shape[0])
+    M2 = M + 0.05 * (P @ P.mT) / M.shape[0]
+    exact = admm_nq._sylvester_solve_step(Q, lam, M2, C, rho, reg)
+    got = admm_nq._sylvester_solve_step(Q, lam, M2, C, rho, reg, Sigma=Sigma, state=state, tol=1e-5, qr_steps=1,
+                                        max_pcg=50)
+    assert state.n_eigh == 1, "the stale basis plus corrections should have sufficed"
+    assert torch.allclose(got, exact, atol=1e-3, rtol=1e-3)
+    assert _residual(Sigma, lam, M2, C, got, rho, reg) <= 1e-4 * C.norm().item()
+
+
+def test_sylvester_rayleigh_and_qr_rungs_reduce_residual():
+    spectrum = torch.tensor([100.0, 30.0, 1.0, 1.05, 1.1, 0.95, 1.0])  # two spikes and a cluster
+    Sigma, lam, Q, M, C = _sylvester_problem(23, n=12, k=7, spectrum=spectrum)
+    rho, reg = 0.3, 1e-2
+    mu0, Q0 = torch.linalg.eigh(M)
+    mu0 = mu0.clamp(min=0)
+
+    # (a) pure eigenvalue drift: fresh Rayleigh quotients in the stale basis recover the exact solve
+    M_drift = (Q0 * (mu0 * torch.tensor([1.2, 0.8, 1.1, 0.9, 1.0, 1.05, 0.95]))) @ Q0.mT
+    sigma = admm_nq._sylvester_stabilizer(lam, M_drift, rho, reg)
+    r_stale = _residual(Sigma, lam, M_drift, C, admm_nq._precond_solve(Q, lam, Q0, mu0, sigma, C), rho, reg)
+    _, mu_ray = admm_nq._rayleigh_refresh(M_drift, Q0)
+    r_ray = _residual(Sigma, lam, M_drift, C, admm_nq._precond_solve(Q, lam, Q0, mu_ray, sigma, C), rho, reg)
+    assert r_ray < 1e-3 * r_stale
+
+    # (b) the two spikes rotate into each other: Rayleigh alone cannot fix it, one QR step nearly does
+    M_rot = _rotate(M, 0.3, 6, 5)  # eigh sorts ascending: indices 6, 5 are the 100 and 30 spikes
+    sigma = admm_nq._sylvester_stabilizer(lam, M_rot, rho, reg)
+    Z, mu_ray = admm_nq._rayleigh_refresh(M_rot, Q0)
+    r_ray = _residual(Sigma, lam, M_rot, C, admm_nq._precond_solve(Q, lam, Q0, mu_ray, sigma, C), rho, reg)
+    Q1, _, mu_qr = admm_nq._orthogonal_iteration_step(M_rot, Z, mu_ray)
+    r_qr = _residual(Sigma, lam, M_rot, C, admm_nq._precond_solve(Q, lam, Q1, mu_qr, sigma, C), rho, reg)
+    assert r_qr < 0.5 * r_ray
+    assert torch.allclose(Q1.mT @ Q1, torch.eye(7), atol=1e-5)
+
+
+def test_sylvester_qr_rung_avoids_eigh_when_it_suffices():
+    spectrum = torch.tensor([100.0, 30.0, 1.0, 1.05, 1.1, 0.95, 1.0])
+    Sigma, lam, Q, M, C = _sylvester_problem(24, n=12, k=7, spectrum=spectrum)
+    rho, reg = 0.3, 1e-2
+    state = admm_nq.SylvesterState()
+    admm_nq._sylvester_solve_step(Q, lam, M, C, rho, reg, Sigma=Sigma, state=state, tol=1e-6)
+    M_rot = _rotate(M, 0.3, 6, 5)
+    sigma = admm_nq._sylvester_stabilizer(lam, M_rot, rho, reg)
+    Z, mu_ray = admm_nq._rayleigh_refresh(M_rot, state.Q_M)
+    r_ray = _residual(Sigma, lam, M_rot, C, admm_nq._precond_solve(Q, lam, state.Q_M, mu_ray, sigma, C), rho, reg)
+    Q1, _, mu_qr = admm_nq._orthogonal_iteration_step(M_rot, Z, mu_ray)
+    r_qr = _residual(Sigma, lam, M_rot, C, admm_nq._precond_solve(Q, lam, Q1, mu_qr, sigma, C), rho, reg)
+    assert r_qr < r_ray
+    tol = 0.5 * (r_ray + r_qr) / C.norm().item()
+
+    with_qr = admm_nq.SylvesterState(mu=state.mu, Q_M=state.Q_M, n_eigh=state.n_eigh)
+    admm_nq._sylvester_solve_step(Q, lam, M_rot, C, rho, reg, Sigma=Sigma, state=with_qr, tol=tol, qr_steps=1,
+                                  max_pcg=0)
+    assert with_qr.n_eigh == 1 and with_qr.n_qr == 1
+
+    without = admm_nq.SylvesterState(mu=state.mu, Q_M=state.Q_M, n_eigh=state.n_eigh)
+    admm_nq._sylvester_solve_step(Q, lam, M_rot, C, rho, reg, Sigma=Sigma, state=without, tol=tol, qr_steps=0,
+                                  max_pcg=0)
+    assert without.n_eigh == 2 and without.n_qr == 0
+
+
+def test_sylvester_pcg_refreshes_when_basis_is_far():
+    Sigma, lam, Q, M, C = _sylvester_problem(25)
+    rho, reg = 0.5, 1e-2
+    state = admm_nq.SylvesterState()
+    admm_nq._sylvester_solve_step(Q, lam, M, C, rho, reg, Sigma=Sigma, state=state, tol=1e-6)
+    torch.manual_seed(26)
+    B = torch.randn(M.shape[0], M.shape[0])
+    M_far = 3.0 * B @ B.mT + torch.eye(M.shape[0])
+    exact = admm_nq._sylvester_solve_step(Q, lam, M_far, C, rho, reg)
+    got = admm_nq._sylvester_solve_step(Q, lam, M_far, C, rho, reg, Sigma=Sigma, state=state, tol=1e-6, qr_steps=1,
+                                        max_pcg=2)
+    assert state.n_eigh == 2 and state.n_pcg == 2
+    assert torch.allclose(got, exact, atol=1e-5, rtol=1e-5)
+
+
+def test_mahalanobis_admm_with_inexact_sylvester_runs_and_reports(capsys):
+    torch.manual_seed(27)
+    n_out, n_in = 32, 24
+    W = torch.randn(n_out, n_in)
+    i_norm = torch.rand(n_in) + 0.5
+    o_norm = torch.rand(n_out) + 0.5
+    o_cov = _scaled_cov(_spd(n_out, 0.5), o_norm)
+    i_cov = _scaled_cov(_spd(n_in, 0.5), i_norm)
+    exact = _run(W, i_norm, o_norm, seed=13, i_cov=i_cov, o_cov=o_cov)
+    inexact = _run(W, i_norm, o_norm, seed=13, i_cov=i_cov, o_cov=o_cov, sylvester_tol=1e-2, sylvester_qr_steps=1,
+                   sylvester_max_pcg=3)
+    out = capsys.readouterr().out
+    assert "[ADMM sylvester]" in out and "eigh" in out
+    err_exact = _mahalanobis_error(W, exact["W_final"], i_norm, o_norm, i_cov, o_cov)
+    err_inexact = _mahalanobis_error(W, inexact["W_final"], i_norm, o_norm, i_cov, o_cov)
+    assert err_inexact < 1.1 * err_exact
+
+
+# --------------------------------------------------------------------------------------
+# Early stopping on a frozen Z
+# --------------------------------------------------------------------------------------
+def test_early_stop_off_by_default_and_reproduces_legacy(capsys):
+    torch.manual_seed(28)
+    W = torch.randn(24, 16)
+    i_norm = torch.rand(16) + 0.5
+    o_norm = torch.rand(24) + 0.5
+    ref = _run(W, i_norm, o_norm, seed=7)
+    got = _run(W, i_norm, o_norm, seed=7, early_stop_patience=0)
+    assert all(torch.equal(ref[k], got[k]) for k in ("W_final", "A", "B"))
+    assert "early stop" not in capsys.readouterr().out
+
+
+def test_early_stop_triggers_and_keeps_the_reconstruction(capsys):
+    torch.manual_seed(29)
+    W = torch.randn(24, 16)
+    i_norm = torch.rand(16) + 0.5
+    o_norm = torch.rand(24) + 0.5
+    torch.manual_seed(30)
+    full = admm_nq.factorize_admm_nanoquant(W, i_norm, o_norm, mid_rank=RANK, outer_iters=200, rho_scheduler="linear")
+    torch.manual_seed(30)
+    early = admm_nq.factorize_admm_nanoquant(W, i_norm, o_norm, mid_rank=RANK, outer_iters=200, rho_scheduler="linear",
+                                             early_stop_patience=5, early_stop_tol=1e-2, early_stop_min_frac=0.25)
+    out = capsys.readouterr().out
+    assert "[ADMM] early stop at" in out
+    stopped_at = int(out.split("[ADMM] early stop at ")[1].split("/")[0])
+    assert 50 <= stopped_at < 200  # not before min_frac, not the full schedule
+    # a frozen Z is a heuristic (a late sign flip is still possible), so compare the deployed reconstructions
+    err_full = (full["W_final"] - W).norm() / W.norm()
+    err_early = (early["W_final"] - W).norm() / W.norm()
+    assert err_early <= 1.02 * err_full
+    # the binary patterns agree almost everywhere
+    agree = (full["A"].sign() == early["A"].sign()).float().mean() * (full["B"].sign() == early["B"].sign()).float().mean()
+    assert agree > 0.98
+
+
+def test_new_admm_config_defaults_are_legacy():
+    cfg = NanoQuantConfig()
+    assert cfg["admm_early_stop_patience"] == 0
+    assert cfg["admm_early_stop_tol"] == 1e-4
+    assert cfg["admm_early_stop_min_frac"] == 0.5
+    assert cfg["admm_sylvester_tol"] == 0.0
+    assert cfg["admm_sylvester_qr_steps"] == 1
+    assert cfg["admm_sylvester_max_pcg"] == 3
+
+
+# --------------------------------------------------------------------------------------
+# Eigendecomposition cache for shared curvature factors
+# --------------------------------------------------------------------------------------
+def _count_eigh(monkeypatch):
+    calls = {"n": 0}
+    real = torch.linalg.eigh
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(torch.linalg, "eigh", counting)
+    return calls
+
+
+def test_normalized_curvature_eig_cache_hits_same_matrix(monkeypatch):
+    calls = _count_eigh(monkeypatch)
+    norm = torch.rand(6) + 0.5
+    cov = _scaled_cov(_spd(6, 0.4), norm)
+    cache = admm_nq.EigCache()
+    admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, eig_cache=cache)  # unregistered: not stored
+    assert calls["n"] == 1 and len(cache) == 0
+    cache.register(cov)
+    first = admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, eig_cache=cache)
+    second = admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, eig_cache=cache)
+    assert calls["n"] == 2 and len(cache) == 1
+    assert all(torch.equal(a, b) for a, b in zip(first, second))
+    admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, power=0.5, eig_cache=cache)  # other conditioning
+    assert calls["n"] == 3 and len(cache) == 2
+    admm_nq._normalized_curvature(cov.clone(), norm, torch.float64, 1e-12, eig_cache=cache)  # other tensor
+    assert calls["n"] == 4 and len(cache) == 2
+    admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12)  # no cache: always computes
+    assert calls["n"] == 5
+    cache.clear()
+    assert len(cache) == 0
+
+
+def test_factorize_with_eig_cache_shares_the_input_factor(monkeypatch):
+    calls = _count_eigh(monkeypatch)
+    torch.manual_seed(31)
+    n_in = 12
+    i_norm = torch.rand(n_in) + 0.5
+    i_cov = _scaled_cov(_spd(n_in, 0.3), i_norm)
+    cache = admm_nq.EigCache()
+    cache.register(i_cov)
+    # q-like layer (out > in) and k-like layer (out < in -> transposed path) sharing the input factor
+    for n_out, transpose in ((16, False), (8, True)):
+        W = torch.randn(n_out, n_in)
+        o_norm = torch.rand(n_out) + 0.5
+        o_cov = _scaled_cov(_spd(n_out, 0.3), o_norm)
+        _run(W, i_norm, o_norm, seed=3, is_transpose=transpose, i_cov=i_cov, o_cov=o_cov, eig_cache=cache)
+    # 2 output factors + 1 shared input factor + the per-iteration k x k eigh of both runs (30 iters x 2 updates)
+    assert calls["n"] == 3 + 2 * 30 * 2
+    assert len(cache) == 1
