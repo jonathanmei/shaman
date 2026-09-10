@@ -218,9 +218,9 @@ def _sylvester_solve_step(Q: torch.Tensor, lam: torch.Tensor, M: torch.Tensor, C
     With ``tol > 0`` and a ``state`` the ``k x k`` eigendecomposition is not recomputed every call. The stale basis
     (with fresh Rayleigh quotients) is used as a preconditioner and the current operator supplies the correction, in
     rungs of increasing cost until the relative residual ``||C - (Sigma F M + sigma F)|| <= tol ||C||``:
-    stale basis + Rayleigh refresh; ``qr_steps`` orthogonal-iteration steps; ``max_pcg`` preconditioned
-    conjugate-gradient steps; finally a full eigendecomposition (the exact solve). All matmuls run in fp32/TF32,
-    which floors the achievable relative residual near 1e-3.
+    stale basis with a Rayleigh refresh and ``qr_steps`` orthogonal-iteration steps (``0`` = Rayleigh only);
+    ``max_pcg`` preconditioned conjugate-gradient steps; finally a full eigendecomposition (the exact solve). All
+    matmuls run in fp32/TF32, which floors the achievable relative residual near 1e-3.
 
     Parameters
     ----------
@@ -279,21 +279,18 @@ def _sylvester_solve_step(Q: torch.Tensor, lam: torch.Tensor, M: torch.Tensor, C
         state.mu, state.Q_M = mu, Q_M
         return F.to(orig_dtype)
 
-    # rung 1: stale basis with fresh Rayleigh quotients
+    # rung 1: stale basis, fresh Rayleigh quotients, then `qr_steps` orthogonal-iteration steps before the first
+    # solve (the QR reuses Z = M Q_M and costs about as much as one matmul unit, whereas a failed solve costs three;
+    # on the 0.6B screen the Rayleigh-only solve passed on almost no iteration, so it is not attempted separately)
     Q_M = state.Q_M
     Z, mu = _rayleigh_refresh(M, Q_M)
+    for _ in range(max(0, int(qr_steps))):
+        Q_M, Z, mu = _orthogonal_iteration_step(M, Z, mu)
+        state.n_qr += 1
     F = _precond_solve(Q, lam, Q_M, mu, sigma, C)
     r = C - operator(F)
     if r.norm() <= threshold:
         return accept(F, Q_M, mu)
-    # rung 2: orthogonal-iteration steps on the basis
-    for _ in range(max(0, int(qr_steps))):
-        Q_M, Z, mu = _orthogonal_iteration_step(M, Z, mu)
-        state.n_qr += 1
-        F = _precond_solve(Q, lam, Q_M, mu, sigma, C)
-        r = C - operator(F)
-        if r.norm() <= threshold:
-            return accept(F, Q_M, mu)
     # rung 3: preconditioned conjugate gradient (operator and preconditioner are SPD in the Frobenius inner product)
     if max_pcg > 0:
         z = _precond_solve(Q, lam, Q_M, mu, sigma, r)
@@ -536,7 +533,8 @@ def factorize_admm_nanoquant(
     # early stopping: the exported factors are A_z / B_z, so once their signs and rank-one magnitudes stop moving
     # the remaining iterations only move the latent
     A_z_prev = B_z_prev = None
-    frozen_streak = 0
+    frozen_streak = max_streak = 0
+    last_flips, last_change = -1, float("nan")
     min_iters = int(early_stop_min_frac * outer_iters)
 
     for itt in range(outer_iters):
@@ -588,6 +586,8 @@ def factorize_admm_nanoquant(
                     frozen_streak += 1
                 else:
                     frozen_streak = 0
+                max_streak = max(max_streak, frozen_streak)
+                last_flips, last_change = flips, change
             A_z_prev, B_z_prev = A_z, B_z  # rank1_approx returns fresh tensors, so references suffice
             if frozen_streak >= early_stop_patience:
                 print(f"\t\t[ADMM] early stop at {itt + 1}/{outer_iters} (Z frozen for {frozen_streak} iterations)")
@@ -623,6 +623,10 @@ def factorize_admm_nanoquant(
             A_z_old.copy_(A_z)
             B_z_old.copy_(B_z)
 
+    if early_stop_patience > 0 and frozen_streak < early_stop_patience:
+        # ran the full schedule: report how close the frozen-Z criterion came, to calibrate the knobs
+        print(f"\t\t[ADMM] no early stop: longest frozen streak {max_streak}/{early_stop_patience}, "
+              f"last iteration flips {last_flips}, relative change {last_change:.2e} (tol {early_stop_tol:g})")
     if use_maha and sylvester_tol > 0:
         print(f"\t\t[ADMM sylvester] A-update: {state_A.summary()} | B-update: {state_B.summary()}")
 
