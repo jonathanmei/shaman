@@ -90,6 +90,14 @@ class NanoQuantConfigDataclass:
     admm_curvature_power: float = 1.0
     admm_curvature_cond_max: float = 0.0
     admm_curvature_spike_rank: int = 0
+    # early stopping of ADMM on frozen projected factors (0 = off)
+    admm_early_stop_patience: int = 0
+    admm_early_stop_tol: float = 1e-4
+    admm_early_stop_min_frac: float = 0.5
+    # inexact Mahalanobis X-update (0 = exact per-iteration eigendecomposition)
+    admm_sylvester_tol: float = 0.0
+    admm_sylvester_qr_steps: int = 1
+    admm_sylvester_max_pcg: int = 3
     curvature_refresh_every: int = 0
     curvature_refresh_iters: int = 1
     block_diagnostics: bool = False

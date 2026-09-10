@@ -445,6 +445,16 @@ def test_new_admm_config_defaults_are_legacy():
     assert cfg["admm_sylvester_max_pcg"] == 3
 
 
+def test_config_dataclass_accepts_every_config_key():
+    """main.py builds NanoQuantConfigDataclass(**NanoQuantConfig(...)): every key must be a dataclass field."""
+    from nanoquant.modules.hub import NanoQuantConfigDataclass
+
+    cfg = NanoQuantConfig(model_id="t")
+    dc = NanoQuantConfigDataclass(**cfg)
+    assert dc.to_dict()["admm_sylvester_tol"] == 0.0
+    assert set(cfg) <= set(NanoQuantConfigDataclass.__dataclass_fields__)
+
+
 # --------------------------------------------------------------------------------------
 # Eigendecomposition cache for shared curvature factors
 # --------------------------------------------------------------------------------------
