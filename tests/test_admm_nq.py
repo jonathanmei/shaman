@@ -252,3 +252,68 @@ def test_calculate_ranks_pays_for_mid_scale():
     assert two["0.self_attn.q_proj"] == 512
     assert three["0.self_attn.q_proj"] == 480
     assert three == dbf
+
+
+def test_config_dataclass_accepts_every_config_key():
+    """main.py builds NanoQuantConfigDataclass(**NanoQuantConfig(...)): every key must be a dataclass field."""
+    from nanoquant.modules.hub import NanoQuantConfigDataclass
+
+    cfg = NanoQuantConfig(model_id="t")
+    NanoQuantConfigDataclass(**cfg)
+    assert set(cfg) <= set(NanoQuantConfigDataclass.__dataclass_fields__)
+
+
+# --------------------------------------------------------------------------------------
+# Eigendecomposition cache for shared curvature factors
+# --------------------------------------------------------------------------------------
+def _count_eigh(monkeypatch):
+    calls = {"n": 0}
+    real = torch.linalg.eigh
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(torch.linalg, "eigh", counting)
+    return calls
+
+
+def test_normalized_curvature_eig_cache_hits_same_matrix(monkeypatch):
+    calls = _count_eigh(monkeypatch)
+    norm = torch.rand(6) + 0.5
+    cov = _scaled_cov(_spd(6, 0.4), norm)
+    cache = admm_nq.EigCache()
+    admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, eig_cache=cache)  # unregistered: not stored
+    assert calls["n"] == 1 and len(cache) == 0
+    cache.register(cov)
+    first = admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, eig_cache=cache)
+    second = admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, eig_cache=cache)
+    assert calls["n"] == 2 and len(cache) == 1
+    assert all(torch.equal(a, b) for a, b in zip(first, second))
+    admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, power=0.5, eig_cache=cache)  # other conditioning
+    assert calls["n"] == 3 and len(cache) == 2
+    admm_nq._normalized_curvature(cov.clone(), norm, torch.float64, 1e-12, eig_cache=cache)  # other tensor
+    assert calls["n"] == 4 and len(cache) == 2
+    admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12)  # no cache: always computes
+    assert calls["n"] == 5
+    cache.clear()
+    assert len(cache) == 0
+
+
+def test_factorize_with_eig_cache_shares_the_input_factor(monkeypatch):
+    calls = _count_eigh(monkeypatch)
+    torch.manual_seed(31)
+    n_in = 12
+    i_norm = torch.rand(n_in) + 0.5
+    i_cov = _scaled_cov(_spd(n_in, 0.3), i_norm)
+    cache = admm_nq.EigCache()
+    cache.register(i_cov)
+    # q-like layer (out > in) and k-like layer (out < in -> transposed path) sharing the input factor
+    for n_out, transpose in ((16, False), (8, True)):
+        W = torch.randn(n_out, n_in)
+        o_norm = torch.rand(n_out) + 0.5
+        o_cov = _scaled_cov(_spd(n_out, 0.3), o_norm)
+        _run(W, i_norm, o_norm, seed=3, is_transpose=transpose, i_cov=i_cov, o_cov=o_cov, eig_cache=cache)
+    # 2 output factors + 1 shared input factor + the per-iteration k x k eigh of both runs (30 iters x 2 updates)
+    assert calls["n"] == 3 + 2 * 30 * 2
+    assert len(cache) == 1
