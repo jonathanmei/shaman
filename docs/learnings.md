@@ -59,6 +59,7 @@ Single-run spread at 0.6B is about ±0.5 PPL. Everything below landed inside it 
 | KD: feature distillation, trainable norm weights, best-epoch selection (4B) | all within ±0.03 of 14.106 | KD-stage screen |
 | factor tuning: latent row normalisation, lower/higher binary lr | 14.89–15.07 vs 14.78–14.88 control | factor-tuning screen |
 | dense (Mahalanobis) block loss, spike-plus-flat factors, 3 scales, latent KD | earlier branches, all null or negative | results.md |
+| spike-plus-flat projection of the factor *or of its inverse* (top-64 / bottom-64 / both exact, AM / HM / GM middle), shrunk and unshrunk | every projection worse at every block boundary: block 3 +0.10 … +0.34 vs control 14.15 (inverse and unshrunk two-sided outside noise); `calib_shrinkage` 0 vs 0.2 identical (14.14 vs 14.15) | results.md, 2026-09-14 projection screen |
 
 The KD stage on a fixed pre-KD model is deterministic to ~0.02, so it is the one place cheap screening is trustworthy.
 The seed-1 twins (`configs/*_best_seed1.json`) exist to turn the two single-run bests into two-seed numbers; the 4B

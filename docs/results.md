@@ -574,3 +574,61 @@ PCG rungs) saved ~10 % of ADMM time at 1.7B (14.3 vs 15.9 s per layer; PPL 16.66
 (26.1 vs 26.4 s): at k ≈ 2000, n = 9728 its extra `n²k` matmuls and residual syncs cost what the fp32 `eigh` costs.
 Early stopping on a frozen Z is inapplicable: at iteration 400 every layer still flips 30–20 000 signs per iteration
 under the linear ρ schedule. ADMM is ~40 % of 4B reconstruction; the tuning stages are the larger lever.
+
+## Spike-plus-flat projection of the factor vs of its inverse (2026-09-14, Qwen3-0.6B, 4-block screen, branch `spectral-projection-screen` @ 34bde42)
+
+Question (`curvature_tempering_theory.md`, "Modelling the inverse instead"): a low-rank-plus-identity model of the
+*inverse* factor is the same matrix family as Pro-KLShampoo's model of the factor; it differs in which end of the
+spectrum is kept exactly (bottom = the cheap directions) and in the shared value the fit implies (harmonic instead of
+arithmetic mean). The two-sided projection (`admm_curvature_spike_rank` top eigenvalues and
+`admm_curvature_dip_rank` bottom eigenvalues exact, `admm_curvature_flat_mean` for the middle) contains both as
+corners. Base config `qwen3_0p6b_kl_ms_screen.json` (current recipe: KL factors, p = ½, fresh shared input factor,
+refresh/7, measured ranks × ramp 0.6, parity), 64 exact eigenvalues per kept side, at the recipe's
+`calib_shrinkage` 0.2 and at 0 (on shrunk factors the bottom of the spectrum is a plateau, so the inverse
+projection is only meaningful unshrunk). Prediction before the runs: inverse ≤ forward < two-sided ≈ control.
+
+| arm | config | job | spike / dip / mean | shrink | block 0 | block 1 | block 2 | **block 3** |
+|---|---|---|---|---|---|---|---|---|
+| control | `qwen3_0p6b_proj_ctrl_s02` | 5666720 | – | 0.2 | 13.97 | 13.55 | 13.88 | **14.15** |
+| forward (Pro-KLShampoo) | `..._fwd_s02` | 5666721 | 64 / 0 / AM | 0.2 | 14.43 | 13.66 | 14.01 | 14.29 |
+| inverse | `..._inv_s02` | 5666722 | 0 / 64 / HM | 0.2 | 14.77 | 13.67 | 14.06 | 14.38 |
+| two-sided | `..._two_s02` | 5666723 | 64 / 64 / GM | 0.2 | 14.23 | 13.60 | 13.93 | 14.24 |
+| control | `..._ctrl_s0` | 5666724 | – | 0 | 14.30 | 13.44 | 13.78 | **14.14** |
+| inverse | `..._inv_s0` | 5666725 | 0 / 64 / HM | 0 | 15.81 | 13.64 | 14.02 | 14.39 |
+| two-sided | `..._two_s0` | 5666726 | 64 / 64 / GM | 0 | 14.52 | 13.72 | 14.13 | 14.48 |
+
+All seven completed in 25–27 min. Block-3 single-run noise on this screen is ≈ 0.2 (control repeats in the
+2026-09-08 grid).
+
+Spectrum diagnostics (`block_diagnostics` now prints, per layer and factor, the dispersion of the eigenvalues a
+projection replaces: `log(AM/GM)` is the KL gap of the forward fit, `log(GM/HM)` that of the inverse fit; with no
+projection the whole spectrum is summarised). Block 3, unit-diagonal factors:
+
+- whole spectrum, shrunk 0.2: `log(AM/GM)` 0.13–0.52, `log(GM/HM)` 0.10–0.38; unshrunk: 0.22–1.31 and 0.19–1.16.
+  Shrinkage removes two thirds of the dispersion, almost all of it at the bottom.
+- middle after removing the top 64 (forward arm, shrunk): 0.08–0.20 / 0.08–0.32 — the remaining dispersion sits at
+  the *bottom* of what is left (the inverse-fit gap now exceeds the forward gap), i.e. the middle is not flat.
+- middle after removing the bottom 64 (inverse arm, unshrunk): 0.19–1.21 / 0.15–0.81 — the spikes are still in the
+  set the harmonic mean replaces, so the inverse projection flattens the dominant directions to a value far below
+  them.
+
+Observations:
+
+- **Every projection is worse than its control at every block boundary.** Block-3 penalties: forward +0.14, inverse
+  +0.23, two-sided +0.10 (shrunk); inverse +0.25, two-sided +0.34 (unshrunk). The two shrunk arms forward and
+  two-sided are inside the noise at block 3 but not at block 0 (+0.3 to +0.5), where every arm is consistently worse.
+- **The inverse representation is the worst corner**, as predicted: keeping the cheap directions exactly and
+  flattening everything else to the harmonic mean underestimates the curvature of the dominant directions, and the
+  fit dumps error there (block 0 unshrunk: 15.81 vs 14.30). Underestimating curvature is the unbounded failure;
+  overestimating it (the forward arm's arithmetic mean) is the bounded one.
+- **Two-sided does not recover the control.** The diagnostics say why: with 64 eigenvalues removed from each end the
+  middle still carries `log(AM/GM)` up to 0.2 (shrunk) and 1.2 (unshrunk) of structure. The bulk of these Fisher
+  factors is a smooth slope, not a spike-and-flat spectrum; the KL-Shampoo estimator already makes the spectrum
+  well conditioned (2026-09-08 grid), and the remaining slope is what the Mahalanobis data term uses.
+- **Shrinkage 0 vs 0.2 is a null result** in the current recipe (14.14 vs 14.15 at block 3; 0.2 is better at
+  block 0, 13.97 vs 14.30). The KL estimator and tempering already do what shrinkage was compensating for.
+
+Verdict: closed for accuracy. A structured, eigh-free Sylvester step would only pay if a projection were acceptable;
+the cheapest acceptable one (two-sided on shrunk factors, +0.10) is within noise but on the wrong side at every
+block, and the ADMM compute saving would be at most the ~40 % ADMM share of block reconstruction. The knobs stay in
+the code (defaults off; part of the cache keys) and the projection-gap diagnostic is useful on its own.
