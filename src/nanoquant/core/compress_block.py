@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import math
 import time
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -17,9 +16,6 @@ from ..utils.cache import ArtifactCache, admm_key
 from ..utils.utils import cleanup_memory, find_layers, set_seed
 from .admm_dbf import factorize_admm_dbf
 from .admm_nq import factorize_admm_nanoquant
-from .curvature import condition_curvature, spectrum_summary
-from .latent import hard_sign, normalize_latents, sign_flips
-from .tail import TailLogitObjective
 
 
 @torch.jit.script
@@ -27,50 +23,16 @@ def fused_weighted_mse(pred, tgt, importance):
     return ((pred.float() - tgt.float()).square() * importance).sum()
 
 
-@torch.jit.script
-def fused_weighted_mahalanobis(pred, tgt, curvature):
-    """Dense output-feature quadratic loss for block reconstruction errors."""
-    error = (pred.float() - tgt.float()).reshape(-1, pred.size(-1))
-    curvature = curvature.float()
-    return ((error @ curvature) * error).sum()
-
-
 # ----------------------------------------------------------------------------------------------------
-# Block-output curvature: which weighting the block losses use, and how the dense matrix is conditioned
+# Block-output importance: the per-feature weights of the block reconstruction loss
 # ----------------------------------------------------------------------------------------------------
-@dataclass
-class BlockCurvature:
-    """Output-side curvature of one decoder block as used by the block reconstruction losses.
-
-    Attributes
-    ----------
-    importance : torch.Tensor
-        Per-feature weights of the diagonal loss ``sum_t sum_j E_tj^2 importance_j`` (shape ``(hidden,)``).
-    dense : torch.Tensor or None
-        Conditioned dense matrix of the Mahalanobis loss ``sum_t E_t dense E_t^T`` (``(hidden, hidden)``),
-        ``None`` when no dense curvature statistics exist.
-    optimize_dense : bool
-        Whether the tuning stages minimise the dense loss (``block_loss="mahalanobis"``) or the diagonal one.
-    summary : dict
-        Spectrum summary of ``dense`` (see :func:`spectrum_summary``); empty when ``dense`` is ``None``.
-    """
-    importance: torch.Tensor
-    dense: torch.Tensor | None
-    optimize_dense: bool
-    summary: dict
-
-
 @torch.no_grad()
-def block_curvature(sublayers: dict, hidden_size: int, quant_config: dict, dev: str) -> BlockCurvature:
-    """Select and condition the output-side curvature of a decoder block.
+def block_importance(sublayers: dict, hidden_size: int, dev: str) -> torch.Tensor:
+    """Per-feature weights of the block reconstruction loss ``sum_t sum_j E_tj^2 importance_j``.
 
-    The block's output is written to the residual stream by ``mlp.down_proj`` (``fc2`` for OPT), so that
-    layer's output-side statistics (``o_norm`` and, with Kronecker curvature, the dense ``o_cov``) are the
-    natural weights of the block reconstruction error. With ``block_loss_source="nkp"`` the diagonal loss uses
-    ``o_norm`` (the legacy behaviour) and the dense loss the Kronecker output factor ``o_cov``; with ``"plain"``
-    both come from the unweighted output-gradient covariance ``o_cov_plain`` (its diagonal for the diagonal loss).
-    The dense matrix is conditioned by the ``block_loss_*`` knobs and is optimised only when
-    ``block_loss="mahalanobis"`` (otherwise it is logged for diagnostics).
+    The block's output is written to the residual stream by ``mlp.down_proj`` (``fc2`` for OPT), so that layer's
+    output-side second moments ``o_norm`` are the natural weights of the block reconstruction error (the paper's
+    weighted MSE). Falls back to uniform weights when no statistics are attached.
 
     Parameters
     ----------
@@ -78,47 +40,18 @@ def block_curvature(sublayers: dict, hidden_size: int, quant_config: dict, dev: 
         ``name -> nn.Linear`` of the block (``find_layers``), before factorisation.
     hidden_size : int
         Residual-stream width (fallback for uniform importance).
-    quant_config : dict
-        Quantisation configuration (``block_loss``, ``block_loss_cond_max``, ``block_loss_power``,
-        ``block_loss_mix``).
     dev : str
-        Device of the returned tensors.
+        Device of the returned tensor.
 
     Returns
     -------
-    BlockCurvature
+    torch.Tensor
+        ``(hidden,)`` fp32.
     """
-    block_loss = quant_config.get("block_loss", "diag")
-    if block_loss not in ("diag", "mahalanobis"):
-        raise ValueError(f"Unknown block_loss: {block_loss}")
-    source = quant_config.get("block_loss_source", "nkp")
-    if source not in ("nkp", "plain"):
-        raise ValueError(f"Unknown block_loss_source: {source}")
     layer = sublayers.get('mlp.down_proj', sublayers.get('fc2', None))
     if layer is None or not hasattr(layer, 'o_norm'):
-        importance = torch.ones(hidden_size, device=dev)
-        o_cov = None
-    elif source == "plain":
-        o_cov = getattr(layer, 'o_cov_plain', None)
-        if o_cov is None:
-            raise ValueError("block_loss_source='plain' requires the plain output-gradient covariance "
-                             "(curvature='kron' with block-output layers in importance.PLAIN_COV_LAYERS)")
-        o_cov = o_cov.to(dev)
-        importance = o_cov.diagonal().clone()
-    else:
-        importance = layer.o_norm.to(dev)
-        o_cov = getattr(layer, 'o_cov', None)
-    if block_loss == "mahalanobis" and o_cov is None:
-        raise ValueError("block_loss='mahalanobis' requires dense Kron curvature statistics")
-    dense = None
-    summary: dict = {}
-    if o_cov is not None:
-        dense = condition_curvature(o_cov.to(dev), cond_max=float(quant_config.get("block_loss_cond_max", 0.0) or 0.0),
-                                    power=float(quant_config.get("block_loss_power", 1.0)),
-                                    mix=float(quant_config.get("block_loss_mix", 1.0)))
-        summary = spectrum_summary(dense)
-    return BlockCurvature(importance=importance, dense=dense, optimize_dense=block_loss == "mahalanobis",
-                          summary=summary)
+        return torch.ones(hidden_size, device=dev)
+    return layer.o_norm.to(dev)
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -226,19 +159,15 @@ def mahalanobis_weight_error(W: torch.Tensor, W_hat: torch.Tensor, L: torch.Tens
 
 
 @torch.no_grad()
-def evaluate_block_loss(block, block_inputs, block_target_outputs, curvature: BlockCurvature, kwargs,
-                        num_samples: int) -> tuple[float, float | None]:
-    """Per-element diagonal and dense block losses of the block's current parameters (no optimisation)."""
+def evaluate_block_loss(block, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs,
+                        num_samples: int) -> float:
+    """Per-element weighted block loss of the block's current parameters (no optimisation)."""
     numel = block_target_outputs.numel()
-    diag = torch.zeros((), device=block_target_outputs.device)
-    dense = torch.zeros((), device=block_target_outputs.device)
+    total = torch.zeros((), device=block_target_outputs.device)
     for j in range(num_samples):
         y = block(block_inputs[j:j + 1], **kwargs)[0]
-        tgt = block_target_outputs[j:j + 1]
-        diag += fused_weighted_mse(y, tgt, curvature.importance)
-        if curvature.dense is not None:
-            dense += fused_weighted_mahalanobis(y, tgt, curvature.dense)
-    return (diag / numel).item(), (dense / numel).item() if curvature.dense is not None else None
+        total += fused_weighted_mse(y, block_target_outputs[j:j + 1], importance)
+    return (total / numel).item()
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -273,80 +202,38 @@ def get_param_group_config(target_module, binary_lr=1e-5, scale_lr=1e-5, bias_lr
     return configs
 
 
-def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, curvature: BlockCurvature, kwargs,
-               batch_size: int, epochs: int, num_samples: int, tail: TailLogitObjective | None = None) -> None:
+def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs,
+               batch_size: int, epochs: int, num_samples: int) -> None:
     """Shared epoch loop of :func:`tune_nonfact` and :func:`tune_fact`.
 
-    Minimises the selected block loss (diagonal or dense, see :class:`BlockCurvature`) with gradient
-    accumulation over ``batch_size`` samples and logs **both** losses every epoch, so that the
-    objective actually optimised and the other one can be compared across runs.
-
-    With a ``tail`` objective (:class:`~nanoquant.core.tail.TailLogitObjective`, last blocks only) the loss is
-    the logit-level KL through the FP suffix instead; ``tail.mix < 1`` mixes it with the block loss, each term
-    divided by its value at the first step so that ``mix`` is a plain weight: ``mix * KL/KL_0 + (1 - mix) *
-    blk/blk_0``. The per-epoch log then shows the mean KL (teacher cross-entropy) and the block losses.
+    Minimises the weighted block reconstruction loss with gradient accumulation over ``batch_size`` samples and
+    logs the per-element loss every epoch.
     """
     device = block_target_outputs.device
     numel = block_target_outputs.numel()
-    importance, dense = curvature.importance, curvature.dense
     t0 = time.time()
-    ref_kl = ref_blk = None
     for epoch in range(epochs):
         data_idx = torch.randperm(num_samples, device="cpu", dtype=torch.long)
-        epoch_diag = torch.zeros(1, device=device)
-        epoch_dense = torch.zeros(1, device=device)
-        epoch_kl = torch.zeros(1, device=device)
+        epoch_loss = torch.zeros(1, device=device)
         for i in range(num_samples):
             idx = data_idx[i].item()
             y = block(block_inputs[idx:idx + 1], **kwargs)[0]
-            tgt = block_target_outputs[idx:idx + 1]
-            if curvature.optimize_dense:
-                blk_loss = fused_weighted_mahalanobis(y, tgt, dense)
-                with torch.no_grad():
-                    other = fused_weighted_mse(y.detach(), tgt, importance)
-                epoch_dense += blk_loss.detach()
-                epoch_diag += other
-            else:
-                blk_loss = fused_weighted_mse(y, tgt, importance)
-                if dense is not None:
-                    with torch.no_grad():
-                        epoch_dense += fused_weighted_mahalanobis(y.detach(), tgt, dense)
-                epoch_diag += blk_loss.detach()
-            if tail is None:
-                loss = blk_loss
-            else:
-                kl = tail.kl(y, idx)
-                epoch_kl += kl.detach()
-                if tail.mix >= 1.0:
-                    loss = kl
-                else:
-                    if ref_kl is None:
-                        ref_kl = kl.detach().clamp_min(1e-12)
-                        ref_blk = blk_loss.detach().clamp_min(1e-30)
-                    loss = tail.mix * kl / ref_kl + (1.0 - tail.mix) * blk_loss / ref_blk
+            loss = fused_weighted_mse(y, block_target_outputs[idx:idx + 1], importance)
+            epoch_loss += loss.detach()
             (loss / batch_size).backward()
             if (i + 1) % batch_size == 0 or (i + 1) == num_samples:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
         cleanup_memory()
-        if tail is not None:
-            msg = (f"\t\t(Epoch {epoch+1:02d}/{epochs:02d}) KL {(epoch_kl / num_samples).item():.4f}"
-                   + (f" (mix {tail.mix:g})" if tail.mix < 1.0 else ""))
-        else:
-            main = epoch_dense if curvature.optimize_dense else epoch_diag
-            msg = f"\t\t(Epoch {epoch+1:02d}/{epochs:02d}) Block Loss: {(main / numel).item():.4e}"
-        msg += f" | diag {(epoch_diag / numel).item():.4e}"
-        if dense is not None:
-            msg += f" | dense {(epoch_dense / numel).item():.4e}"
+        msg = f"\t\t(Epoch {epoch+1:02d}/{epochs:02d}) Block Loss: {(epoch_loss / numel).item():.4e}"
         if epoch == epochs - 1:
             msg += f" | {time.time() - t0:.0f}s"
         print(msg)
 
 
 @torch.enable_grad()
-def tune_nonfact(block, block_inputs, block_target_outputs, curvature: BlockCurvature, kwargs, quant_config,
-                 tail: TailLogitObjective | None = None):
+def tune_nonfact(block, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs, quant_config):
     """Tune the still full-precision linear layers of ``block`` to absorb the quantisation error so far."""
     set_seed(quant_config['seed'])
     batch_size = quant_config['nonfact_batch_size']
@@ -362,8 +249,8 @@ def tune_nonfact(block, block_inputs, block_target_outputs, curvature: BlockCurv
     assert len(params) > 0, "No linear layers found in the block"
     optimizer = AdamW(params, lr=lr, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-4 * lr)
-    _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, curvature, kwargs, batch_size, epochs,
-               num_samples, tail=tail)
+    _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, importance, kwargs, batch_size, epochs,
+               num_samples)
     for p in params:
         p.requires_grad = False
     block.zero_grad(set_to_none=True)
@@ -443,9 +330,7 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
                 i_cov=None if i_cov is None else i_cov.to(device),
                 o_cov=None if o_cov is None else o_cov.to(device),
                 eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)),
-                curvature_power=float(quant_config.get('admm_curvature_power', 1.0)),
-                curvature_cond_max=float(quant_config.get('admm_curvature_cond_max', 0.0) or 0.0),
-                curvature_spike_rank=int(quant_config.get('admm_curvature_spike_rank', 0) or 0))
+                curvature_power=float(quant_config.get('admm_curvature_power', 1.0)))
         else:
             raise ValueError(f"Unknown admm_type: {quant_config['admm_type']}")
         if memo_key is not None:
@@ -465,7 +350,7 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
             msg += f" | fresh-R {fresh / max(ref_f, 1e-30):.4e}"
         print(msg)
     # The dense factors are no longer needed for this layer: free the memory.
-    for buf_name in ('i_cov', 'o_cov', 'o_cov_plain'):
+    for buf_name in ('i_cov', 'o_cov'):
         if hasattr(lx_orig, buf_name):
             delattr(lx_orig, buf_name)
     del i_cov, o_cov, i_cov_stale
@@ -477,8 +362,7 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
     # Replace module class and convert
     do_tuning = quant_config['tune_fact']
     new_module.__class__ = NanoQuantLinear
-    new_module.__quant_convert__(do_train=do_tuning, rank=rank, factor_results=final_factor_results,
-                                 keep_latent=bool(quant_config.get('retain_latent', False)))
+    new_module.__quant_convert__(do_train=do_tuning, rank=rank, factor_results=final_factor_results)
 
     # --- 2. Finalization ---
     if not do_tuning and new_module.bias is not None and hasattr(lx_orig, 'bias') and lx_orig.bias is not None:
@@ -500,16 +384,17 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
     return new_module, final_factor_results
 
 
+def _hard_sign(x: torch.Tensor) -> torch.Tensor:
+    """Deployed sign convention of the binary factors: ``+1`` for ``x >= 0`` and ``-1`` otherwise."""
+    return torch.where(x < 0, -torch.ones_like(x), torch.ones_like(x))
+
+
 @torch.enable_grad()
-def tune_fact(block, target_linear, block_inputs, block_target_outputs, curvature: BlockCurvature, kwargs,
-              quant_config, tail: TailLogitObjective | None = None):
+def tune_fact(block, target_linear, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs,
+              quant_config):
     """Tune the latent binary factors and scales of ``target_linear`` (STE forward), then harden it.
 
-    With ``fact_latent_normalize`` the ADMM latents (tiny: median ``|latent|`` of order 1e-3) are first rescaled
-    row-wise to unit mean magnitude, which leaves the STE forward unchanged and makes ``fact_binary_lr`` a
-    flip budget rather than a flip-everything switch. The number of sign flips relative to the ADMM
-    initialisation is logged; with ``retain_latent`` the frozen latents are kept on the layer for a later
-    latent-aware KD stage.
+    The number of sign flips relative to the ADMM initialisation is logged as a diagnostic.
     """
     set_seed(quant_config['seed'])
     batch_size = quant_config['fact_batch_size']
@@ -519,21 +404,20 @@ def tune_fact(block, target_linear, block_inputs, block_target_outputs, curvatur
     binary_lr = quant_config['fact_binary_lr']
     scale_lr = quant_config['fact_scale_lr']
     bias_lr = quant_config['fact_bias_lr']
-    if quant_config.get('fact_latent_normalize', False):
-        normalize_latents(target_linear)
     param_config = get_param_group_config(block, binary_lr=binary_lr, scale_lr=scale_lr, bias_lr=bias_lr)
     optimizer = AdamW(param_config, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-4 * scale_lr)
     with torch.no_grad():
-        init_signs = {n: hard_sign(p.detach()) for n, p in target_linear.named_parameters() if "latent" in n}
-    _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, curvature, kwargs, batch_size, epochs,
-               num_samples, tail=tail)
+        init_signs = {n: _hard_sign(p.detach()) for n, p in target_linear.named_parameters() if "latent" in n}
+    _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, importance, kwargs, batch_size, epochs,
+               num_samples)
     with torch.no_grad():
-        flips = sum(sign_flips(getattr(target_linear, n), s) for n, s in init_signs.items())
+        flips = sum(int((_hard_sign(getattr(target_linear, n).detach()) != s).sum().item())
+                    for n, s in init_signs.items())
         total = sum(s.numel() for s in init_signs.values())
     if total:
         print(f"\t\tsign flips during factor tuning: {flips}/{total} ({flips / total:.3e})")
     del init_signs
     # harden latent binary weights
-    target_linear.finalize(keep_latent=bool(quant_config.get('retain_latent', False)))
+    target_linear.finalize()
     del param_config, optimizer

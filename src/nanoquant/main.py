@@ -55,26 +55,23 @@ class QuantArguments:
     bits: float = field(default=1.0, metadata={"help": "Target quantization bits"})
     rank_budget: str = field(
         default="uniform",
-        metadata={"help": "Rank allocation: 'uniform' (legacy per-layer rule), 'parity' (non-uniform at the uniform "
-                          "rule's total bits) or 'full' (non-uniform at exactly `bits` per weight)",
+        metadata={"help": "Rank allocation: 'uniform' (the paper's per-layer rule) or, with a measured sensitivity, "
+                          "'parity' (same total bits as uniform) / 'full' (exactly `bits` per weight)",
                   "choices": ["uniform", "parity", "full"]})
-    rank_depth_ramp: float = field(
-        default=0.0, metadata={"help": "Log-ratio of the last block's bit budget to the first block's (0 = flat)"})
-    rank_type_weights: str = field(
-        default="", metadata={"help": "Per-layer-type bit-budget multipliers, e.g. 'v_proj:1.2,down_proj:1.15'"})
-    rank_max_ratio: float = field(
-        default=1.0, metadata={"help": "Rank ceiling as a multiple of min(in, out); 1.0 = legacy cap"})
     rank_sensitivity: str = field(
         default="none",
-        metadata={"help": "Measured per-layer sensitivity driving the non-uniform allocation: 'none' (ramp / type "
-                          "multipliers only), 'admm' (short ADMM solves at candidate ranks, curvature-weighted error) "
-                          "or 'svd' (tail energy of the whitened spectrum); requires rank_budget parity/full",
+        metadata={"help": "Measured per-layer sensitivity driving the non-uniform allocation: 'admm' (short ADMM "
+                          "solves at candidate ranks, curvature-weighted error) or 'svd' (tail energy of the whitened "
+                          "spectrum); 'none' = uniform rule only",
                   "choices": ["none", "admm", "svd"]})
     rank_probe_ranks: str = field(
         default="0.5,1.0,1.5",
         metadata={"help": "Multiples of the uniform rank at which each layer is probed (rank_sensitivity != none)"})
     rank_probe_iters: int = field(
         default=50, metadata={"help": "ADMM outer iterations per probe solve (rank_sensitivity='admm')"})
+    rank_depth_ramp: float = field(
+        default=0.0, metadata={"help": "Depth prior on the measured curves: log-ratio of the last block's multiplier "
+                                       "to the first block's (0 = flat)"})
     seed: int = field(default=0, metadata={"help": "Random seed"})
     num_calib_samples: int = field(default=128, metadata={"help": "Number of calibration samples"})
     calib_dataset: str = field(default="wikitext2", metadata={"help": "Calibration dataset"})
@@ -85,26 +82,6 @@ class QuantArguments:
             "help": "Calibration strategy",
             "choices": ["online", "two_phase", "dbf", "none"],
         },
-    )
-    block_loss: str = field(
-        default="diag",
-        metadata={"help": "Block reconstruction loss: 'diag' or dense 'mahalanobis' (requires curvature=kron)",
-                  "choices": ["diag", "mahalanobis"]},
-    )
-    block_loss_cond_max: float = field(
-        default=0.0,
-        metadata={"help": "Dense block loss: cap the curvature's condition number at this value by flooring its "
-                          "eigenvalues, trace preserved (0 = off)"})
-    block_loss_power: float = field(
-        default=1.0, metadata={"help": "Dense block loss: raise the curvature's eigenvalues to this power (1 = off)"})
-    block_loss_mix: float = field(
-        default=1.0,
-        metadata={"help": "Dense block loss: use (1-mix)*diag(L) + mix*L (1 = fully dense, 0 = diagonal)"})
-    block_loss_source: str = field(
-        default="nkp",
-        metadata={"help": "Curvature of the block loss: 'nkp' (output factor of the Kronecker fit of mlp.down_proj) "
-                          "or 'plain' (unweighted, clipped block-output gradient covariance; requires curvature=kron)",
-                  "choices": ["nkp", "plain"]},
     )
     curvature: str = field(
         default="diag",
@@ -180,11 +157,6 @@ class TuneArguments:
     )
     admm_curvature_power: float = field(
         default=1.0, metadata={"help": "ADMM: raise the eigenvalues of the dense curvature factors to this power (1 = off)"})
-    admm_curvature_cond_max: float = field(
-        default=0.0, metadata={"help": "ADMM: cap the condition number of the dense curvature factors (0 = off)"})
-    admm_curvature_spike_rank: int = field(
-        default=0, metadata={"help": "ADMM: spike-plus-flat projection of the dense factors, keeping this many "
-                                     "eigenpairs and flattening the tail (0 = off)"})
     curvature_refresh_every: int = field(
         default=0, metadata={"help": ">0: every N blocks re-estimate the curvature of the remaining layers on the "
                                      "quantised prefix (curvature=kron)"})
@@ -193,47 +165,16 @@ class TuneArguments:
         default=False,
         metadata={"help": "Log input-factor drift, Mahalanobis weight errors (stale vs fresh factor) and the "
                           "block-loss change of every ADMM solution (two extra block forward passes per layer)"})
-    tail_logit_blocks: int = field(
-        default=0, metadata={"help": ">0: reconstruct the last N blocks against the FP suffix's logits (forward KL) "
-                                     "instead of the block loss"})
-    tail_logit_mix: float = field(
-        default=1.0, metadata={"help": "Weight of the logit KL in the tail-block loss (1 = pure KL; <1 mixes in the "
-                                       "block loss, both normalised by their first-step values)"})
     tune_fact: bool = field(default=True, metadata={"help": "Tune factorized layers"})
     fact_binary_lr: float = field(default=1e-5, metadata={"help": "LR for factorized binary parameters"})
     fact_scale_lr: float = field(default=1e-5, metadata={"help": "LR for factorized scale parameters"})
     fact_bias_lr: float = field(default=1e-5, metadata={"help": "LR for factorized bias parameters"})
     fact_batch_size: int = field(default=1, metadata={"help": "Batch size for factorized tuning"})
     fact_epochs: int = field(default=8, metadata={"help": "Epochs for factorized tuning"})
-    fact_latent_normalize: bool = field(
-        default=False,
-        metadata={"help": "Rescale each latent row of the freshly factorised layer to unit mean magnitude before "
-                          "factor tuning (sign-preserving; one lr = one flip budget per row)"})
-    retain_latent: bool = field(
-        default=False,
-        metadata={"help": "Keep the (frozen) latent factors after block tuning; required by model_kd_mode=scales_latent"})
-    tune_model: bool = field(default=True, metadata={"help": "Perform model-level KD tuning"})
+    tune_model: bool = field(default=True, metadata={"help": "Perform model-level KD tuning (scales only)"})
     model_kd_lr: float = field(default=1e-5, metadata={"help": "LR for model knowledge distillation"})
-    model_kd_latent_lr: float = field(default=1e-6, metadata={"help": "LR for latent binary parameters during KD"})
-    model_kd_mode: str = field(
-        default="scales",
-        metadata={"help": "KD parameters: scales or scales_latent", "choices": ["scales", "scales_latent"]},
-    )
-    model_kd_latent_normalize: bool = field(
-        default=False,
-        metadata={"help": "scales_latent: rescale each latent row to unit mean magnitude before KD (sign-preserving)"})
     model_kd_eval_every_epoch: bool = field(default=False,
                                             metadata={"help": "Evaluate held-out perplexity after every KD epoch"})
-    model_kd_feature_weight: float = field(
-        default=0.0, metadata={"help": "Weight of the residual-stream feature distillation term in KD (0 = off; "
-                                       "requires model_kd_teacher=online)"})
-    model_kd_norm_weights: bool = field(
-        default=False, metadata={"help": "Also train the weights of every normalisation layer (RMSNorm/LayerNorm) "
-                                         "during KD"})
-    model_kd_norm_lr: float = field(default=1e-5, metadata={"help": "LR of the normalisation weights during KD"})
-    model_kd_select_best: bool = field(
-        default=False, metadata={"help": "Evaluate WikiText-2 validation perplexity after every KD epoch and keep "
-                                         "the best epoch's parameters"})
     pre_kd_checkpoint: str = field(
         default="", metadata={"help": "Explicit pre-KD checkpoint to load instead of the keyed cache artifact"})
     model_kd_batch_size: int = field(default=1, metadata={"help": "Batch size for model KD"})
@@ -313,22 +254,15 @@ def main():
         model_id=model_args.model_id,
         bits=quant_args.bits,
         rank_budget=quant_args.rank_budget,
-        rank_depth_ramp=quant_args.rank_depth_ramp,
-        rank_type_weights=quant_args.rank_type_weights,
-        rank_max_ratio=quant_args.rank_max_ratio,
         rank_sensitivity=quant_args.rank_sensitivity,
         rank_probe_ranks=quant_args.rank_probe_ranks,
         rank_probe_iters=quant_args.rank_probe_iters,
+        rank_depth_ramp=quant_args.rank_depth_ramp,
         seed=quant_args.seed,
         num_calib_samples=quant_args.num_calib_samples,
         calib_dataset=quant_args.calib_dataset,
         calib_shrinkage=quant_args.calib_shrinkage,
         calib_strategy=quant_args.calib_strategy,
-        block_loss=quant_args.block_loss,
-        block_loss_cond_max=quant_args.block_loss_cond_max,
-        block_loss_power=quant_args.block_loss_power,
-        block_loss_mix=quant_args.block_loss_mix,
-        block_loss_source=quant_args.block_loss_source,
         curvature=quant_args.curvature,
         kron_fit=quant_args.kron_fit,
         kron_nkp_iters=quant_args.kron_nkp_iters,
@@ -353,31 +287,18 @@ def main():
         admm_mid_scale=tune_args.admm_mid_scale,
         admm_input_factor=tune_args.admm_input_factor,
         admm_curvature_power=tune_args.admm_curvature_power,
-        admm_curvature_cond_max=tune_args.admm_curvature_cond_max,
-        admm_curvature_spike_rank=tune_args.admm_curvature_spike_rank,
         curvature_refresh_every=tune_args.curvature_refresh_every,
         curvature_refresh_iters=tune_args.curvature_refresh_iters,
         block_diagnostics=tune_args.block_diagnostics,
-        tail_logit_blocks=tune_args.tail_logit_blocks,
-        tail_logit_mix=tune_args.tail_logit_mix,
         tune_fact=tune_args.tune_fact,
         fact_binary_lr=tune_args.fact_binary_lr,
         fact_scale_lr=tune_args.fact_scale_lr,
         fact_bias_lr=tune_args.fact_bias_lr,
         fact_batch_size=tune_args.fact_batch_size,
         fact_epochs=tune_args.fact_epochs,
-        fact_latent_normalize=tune_args.fact_latent_normalize,
-        retain_latent=tune_args.retain_latent,
         tune_model=tune_args.tune_model,
         model_kd_lr=tune_args.model_kd_lr,
-        model_kd_latent_lr=tune_args.model_kd_latent_lr,
-        model_kd_mode=tune_args.model_kd_mode,
-        model_kd_latent_normalize=tune_args.model_kd_latent_normalize,
         model_kd_eval_every_epoch=tune_args.model_kd_eval_every_epoch,
-        model_kd_feature_weight=tune_args.model_kd_feature_weight,
-        model_kd_norm_weights=tune_args.model_kd_norm_weights,
-        model_kd_norm_lr=tune_args.model_kd_norm_lr,
-        model_kd_select_best=tune_args.model_kd_select_best,
         pre_kd_checkpoint=tune_args.pre_kd_checkpoint,
         model_kd_batch_size=tune_args.model_kd_batch_size,
         model_kd_epochs=tune_args.model_kd_epochs,

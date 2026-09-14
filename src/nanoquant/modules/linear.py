@@ -19,7 +19,6 @@ class NanoQuantLinear(nn.Module):
         *,
         rank: int = 1024,
         factor_results: argparse.Namespace = None,
-        keep_latent: bool = False,
         **kwargs,
     ):
         """Convert this ``nn.Linear`` in place into a factorised NanoQuant layer.
@@ -32,9 +31,6 @@ class NanoQuantLinear(nn.Module):
             Factorisation rank.
         factor_results : argparse.Namespace
             Output of the ADMM factoriser (``A``, ``B``, ``A_latent``, ``B_latent``, scales).
-        keep_latent : bool
-            With ``do_train=False``, additionally store the frozen latent factors so that a later
-            latent-aware stage (model-level KD with ``model_kd_mode="scales_latent"``) can resume them.
         """
         self.do_train = do_train
         self.rank = rank
@@ -42,7 +38,7 @@ class NanoQuantLinear(nn.Module):
         self.dtype = torch.bfloat16
 
         assert factor_results is not None, "factor_results must be provided"
-        self._setup_path(factor_results, keep_latent=keep_latent)
+        self._setup_path(factor_results)
 
         if not self.do_train:
             for param in self.parameters():
@@ -56,7 +52,7 @@ class NanoQuantLinear(nn.Module):
             del self.weight
         self.register_parameter("weight", None)
 
-    def _setup_path(self, factors, keep_latent: bool = False):
+    def _setup_path(self, factors):
         if factors is not None:
             vals = {
                 "scale_pre": factors.scale_pre.float(),
@@ -65,10 +61,10 @@ class NanoQuantLinear(nn.Module):
             if hasattr(factors, "scale_mid") and factors.scale_mid is not None:
                 vals["scale_mid"] = factors.scale_mid.float()
 
-            if self.do_train or keep_latent:
+            if self.do_train:
                 vals["V_latent"] = factors.B_latent.float()
                 vals["U_latent"] = factors.A_latent.mT.float()
-            if not self.do_train:
+            else:
                 vals["V"] = self.binary_ste(factors.B.float())
                 vals["U"] = self.binary_ste(factors.A.float().mT)
         else:
@@ -98,7 +94,7 @@ class NanoQuantLinear(nn.Module):
 
             setattr(self, name, param)
 
-    def init_for_inference(self, rank, has_scale_mid=False, has_latent=False):
+    def init_for_inference(self, rank, has_scale_mid=False):
         self.rank = rank
         self.do_train = False
         self._binarized = True
@@ -109,10 +105,6 @@ class NanoQuantLinear(nn.Module):
         self.register_parameter("weight", None)
 
         self._setup_path(factors=None)
-
-        if has_latent:
-            self.V_latent = nn.Parameter(torch.empty_like(self.V), requires_grad=False)
-            self.U_latent = nn.Parameter(torch.empty_like(self.U), requires_grad=False)
 
         if not has_scale_mid and hasattr(self, "scale_mid"):
             delattr(self, "scale_mid")
@@ -280,15 +272,8 @@ class NanoQuantLinear(nn.Module):
             return x
         return self.binary_ste(x)
 
-    def finalize(self, keep_latent: bool = False):
-        """Harden the latent factors into ±1 ``U``/``V`` and leave training mode.
-
-        Parameters
-        ----------
-        keep_latent : bool
-            Keep ``U_latent``/``V_latent`` as frozen parameters (for a later latent-aware KD stage)
-            instead of deleting them. The forward pass uses the hardened ``U``/``V`` either way.
-        """
+    def finalize(self):
+        """Harden the latent factors into ±1 ``U``/``V``, delete the latents and leave training mode."""
         if not self.do_train:
             return
         with torch.no_grad():
@@ -305,18 +290,9 @@ class NanoQuantLinear(nn.Module):
             for param in self.parameters():
                 param.requires_grad_(False)
 
-            if not keep_latent:
-                self.drop_latent()
-
-    def drop_latent(self):
-        """Delete the latent factors ``U_latent``/``V_latent`` if present (hardened ``U``/``V`` remain)."""
-        for attr_name in ("U_latent", "V_latent"):
-            if hasattr(self, attr_name):
-                delattr(self, attr_name)
-
-    @property
-    def has_latent(self) -> bool:
-        return hasattr(self, "U_latent") and hasattr(self, "V_latent")
+            for attr_name in latent_attrs:
+                if hasattr(self, attr_name):
+                    delattr(self, attr_name)
 
     # -------------------------
     # packing / state_dict

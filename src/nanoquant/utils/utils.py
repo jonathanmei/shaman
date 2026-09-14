@@ -113,29 +113,6 @@ def get_decoder_layers(model):
     raise AttributeError(f"Could not find decoder layers for model architecture '{model_type}'.")
 
 
-def get_final_norm_and_head(model) -> tuple[nn.Module, nn.Module]:
-    """Final normalisation layer and LM head of a causal LM (the suffix after the last decoder block).
-
-    Parameters
-    ----------
-    model : nn.Module
-        Hugging Face causal LM.
-
-    Returns
-    -------
-    tuple of nn.Module
-        ``(final_norm, lm_head)``.
-    """
-    model_type = model.config.model_type
-    if model_type in ["llama", "mistral", "mixtral", "mobilellm", "qwen3"] or model_type.startswith("gemma"):
-        return model.model.norm, model.lm_head
-    if model_type == "opt":
-        return model.model.decoder.final_layer_norm, model.lm_head
-    if model_type == "gpt2":
-        return model.transformer.ln_f, model.lm_head
-    raise ValueError(f"Could not find the final norm / LM head for model architecture '{model_type}'.")
-
-
 def get_decoder_layer_cls_name(model: nn.Module) -> list[str]:
     """Helper to get the class name of the decoder blocks (to prevent accelerate from splitting blocks)."""
     try:
@@ -166,8 +143,8 @@ def has_mid_scale(quant_config) -> bool:
 SCALE_BITS = 16
 RANK_STEP = 32
 RANK_BUDGETS = ("uniform", "parity", "full")
-# how the per-layer bit budget is set under a non-uniform budget: hand-set multipliers only ("none"), or a
-# sensitivity curve measured at calibration time by short ADMM solves ("admm") or a whitened-SVD proxy ("svd")
+# how the per-layer bit budget is set under a non-uniform budget: a sensitivity curve measured at calibration time
+# by short ADMM solves ("admm") or a whitened-SVD proxy ("svd"); "none" = the uniform rule only
 RANK_SENSITIVITIES = ("none", "admm", "svd")
 # power-law exponent of the fitted sensitivity curve J(r) = exp(a) r^-beta: clamp range and single-probe default
 BETA_RANGE = (0.05, 8.0)
@@ -237,10 +214,9 @@ def uniform_rank(in_features: int, out_features: int, bits: float, num_scales: i
     return _floor_rank(_continuous_rank(in_features, out_features, bits, num_scales), in_features, out_features)
 
 
-def _rank_ceiling(in_features: int, out_features: int, max_ratio: float) -> int:
-    """Rank ceiling ``max_ratio * min(in, out)`` floored to a multiple of 32 (never below the legacy cap)."""
-    m = min(in_features, out_features)
-    return max(m, (int(max_ratio * m) // RANK_STEP) * RANK_STEP)
+def rank_ceiling(in_features: int, out_features: int) -> int:
+    """Largest rank a layer may receive: ``min(in, out)`` (beyond it the sign product's real rank saturates)."""
+    return min(in_features, out_features)
 
 
 def parse_probe_ranks(spec: str) -> list[float]:
@@ -314,44 +290,12 @@ def predicted_loss(curve: tuple[float, float], rank: int) -> float:
     return float(np.exp(a - beta * np.log(rank)))
 
 
-def parse_type_weights(spec: str) -> dict[str, float]:
-    """Parse ``"v_proj:1.2,down_proj:1.15"`` into ``{"v_proj": 1.2, "down_proj": 1.15}``.
+def depth_multipliers(shapes: dict[str, tuple[int, int]], n_blocks: int, depth_ramp: float) -> dict[str, float]:
+    """Depth prior ``m_l = exp(ramp (b_l / (B - 1) - 1/2))`` per layer (block index ``b_l`` of ``B`` blocks).
 
-    Keys are the last component of a layer name (``q_proj``, ``down_proj``, ...) or the full sub-layer name
-    (``self_attn.q_proj``); values are positive bit-budget multipliers.
-
-    Raises
-    ------
-    ValueError
-        On a malformed entry or a non-positive weight.
-    """
-    weights: dict[str, float] = {}
-    for item in (spec or "").split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if ":" not in item:
-            raise ValueError(f"rank_type_weights entry '{item}' must be 'name:weight'")
-        name, value = item.rsplit(":", 1)
-        try:
-            w = float(value)
-        except ValueError as e:
-            raise ValueError(f"rank_type_weights entry '{item}': weight is not a number") from e
-        if w <= 0:
-            raise ValueError(f"rank_type_weights entry '{item}': weight must be > 0")
-        weights[name.strip()] = w
-    return weights
-
-
-def _type_weight(name: str, weights: dict[str, float]) -> float:
-    if name in weights:
-        return weights[name]
-    return weights.get(name.rsplit(".", 1)[-1], 1.0)
-
-
-def budget_multipliers(shapes: dict[str, tuple[int, int]], n_blocks: int, depth_ramp: float,
-                       type_weights: dict[str, float]) -> dict[str, float]:
-    """Per-layer bit-budget multipliers ``m_l = exp(ramp (b_l/(B-1) - 1/2)) * w_type(l)``, unnormalised.
+    The ramp supplies the end-to-end depth weighting that the local Gauss-Newton sensitivity misses: late-block
+    errors land on the logits through fewer layers of repair. ``ramp`` is the log-ratio of the last block's
+    multiplier to the first block's (0 = flat).
 
     Parameters
     ----------
@@ -360,105 +304,13 @@ def budget_multipliers(shapes: dict[str, tuple[int, int]], n_blocks: int, depth_
     n_blocks : int
         Number of decoder blocks.
     depth_ramp : float
-        Log-ratio of the last block's multiplier to the first block's (0 = flat).
-    type_weights : dict
-        Per-layer-type multipliers (see :func:`parse_type_weights`).
-
-    Raises
-    ------
-    ValueError
-        If a type weight refers to a layer type absent from ``shapes``.
+        Log-ratio of the last block's multiplier to the first block's.
     """
-    known = {k.split(".", 1)[1] for k in shapes} | {k.split(".", 1)[1].rsplit(".", 1)[-1] for k in shapes}
-    unknown = [t for t in type_weights if t not in known]
-    if unknown:
-        raise ValueError(f"rank_type_weights refer to layer types not in the model: {unknown}")
     mult: dict[str, float] = {}
     for key in shapes:
-        blk, name = key.split(".", 1)
-        depth = np.exp(depth_ramp * (int(blk) / (n_blocks - 1) - 0.5)) if n_blocks > 1 else 1.0
-        mult[key] = float(depth) * _type_weight(name, type_weights)
+        blk = int(key.split(".", 1)[0])
+        mult[key] = float(np.exp(depth_ramp * (blk / (n_blocks - 1) - 0.5))) if n_blocks > 1 else 1.0
     return mult
-
-
-def allocate_ranks(shapes: dict[str, tuple[int, int]], n_blocks: int, bits: float, num_scales: int,
-                   depth_ramp: float, type_weights: dict[str, float], budget: str,
-                   legacy: dict[str, int], max_ratio: float = 1.0) -> dict[str, int]:
-    """Budget-matched non-uniform rank allocation.
-
-    Every layer ``l`` gets a bit-budget multiplier ``m_l = exp(ramp (b_l/(B-1) - 1/2)) * w_type(l)`` (block index
-    ``b_l`` of ``B`` blocks), normalised so that the continuous budgets sum to ``bits`` times the number of
-    factorised weights. Ranks start at the floored continuous targets and are then moved in steps of 32 toward
-    the bit target: ``budget="parity"`` targets the bits the legacy uniform rule actually spends (so arms are
-    comparable at identical actual bpw), ``budget="full"`` targets ``bits`` per weight exactly (spending the
-    remainder that the 32-multiple rounding leaves idle). Steps are taken on the layer whose rank is furthest
-    from its continuous target in relative terms, never below 32 nor above ``max_ratio * min(in, out)``.
-
-    Ranks above ``min(in, out)`` are meaningful for binary factors: the real rank of the sign product saturates
-    there, but the set of representable matrices keeps growing with the rank (each entry of the product is a sum
-    of ``rank`` terms of ±1), and the ADMM solves stay well posed through their ridge/proximal terms. The ratio
-    bounds the ``rank^3`` cost of the Mahalanobis ADMM's eigendecompositions.
-
-    Parameters
-    ----------
-    shapes : dict
-        ``"<block>.<name>" -> (in_features, out_features)`` in schedule order.
-    n_blocks : int
-        Number of decoder blocks.
-    bits : float
-        Target bits per weight.
-    num_scales : int
-        2 or 3.
-    depth_ramp : float
-        Log-ratio of the last block's multiplier to the first block's (0 = flat).
-    type_weights : dict
-        Per-layer-type multipliers (see :func:`parse_type_weights`).
-    budget : str
-        ``"parity"`` or ``"full"``.
-    legacy : dict
-        Ranks of the uniform rule (defines the parity target).
-    max_ratio : float
-        Rank ceiling as a multiple of ``min(in, out)`` (``1.0`` = the legacy cap), floored to a multiple of 32.
-
-    Returns
-    -------
-    dict
-        ``"<block>.<name>" -> rank``.
-    """
-    if budget not in ("parity", "full"):
-        raise ValueError(f"Unknown rank_budget for allocate_ranks: {budget}")
-    if max_ratio < 1.0:
-        raise ValueError("rank_max_ratio must be >= 1")
-    # bit-budget multipliers, normalised to leave the total budget unchanged
-    mult = budget_multipliers(shapes, n_blocks, depth_ramp, type_weights)
-    weights_total = sum(a * b for a, b in shapes.values())
-    norm = weights_total / sum(mult[k] * a * b for k, (a, b) in shapes.items())
-    target = {k: max(_continuous_rank(a, b, bits * mult[k] * norm, num_scales), 1.0) for k, (a, b) in shapes.items()}
-    lo = RANK_STEP
-    hi = {k: _rank_ceiling(a, b, max_ratio) for k, (a, b) in shapes.items()}
-    ranks = {k: min(_floor_rank(target[k], a, b, max_rank=hi[k]), hi[k]) for k, (a, b) in shapes.items()}
-    step_bits = {k: _step_bits(a, b, num_scales) for k, (a, b) in shapes.items()}
-    total_target = _total_bit_target(shapes, bits, num_scales, budget, legacy)
-    total = sum(layer_bits(a, b, ranks[k], num_scales) for k, (a, b) in shapes.items())
-
-    def rel_excess(k):
-        return (ranks[k] - target[k]) / target[k]
-
-    while total > total_target:
-        cands = [k for k in shapes if ranks[k] - RANK_STEP >= lo]
-        if not cands:
-            break
-        k = max(cands, key=rel_excess)
-        ranks[k] -= RANK_STEP
-        total -= step_bits[k]
-    while True:
-        cands = [k for k in shapes if ranks[k] + RANK_STEP <= hi[k] and total + step_bits[k] <= total_target]
-        if not cands:
-            break
-        k = min(cands, key=rel_excess)
-        ranks[k] += RANK_STEP
-        total += step_bits[k]
-    return ranks
 
 
 def _step_bits(in_features: int, out_features: int, num_scales: int) -> int:
@@ -475,15 +327,15 @@ def _total_bit_target(shapes: dict[str, tuple[int, int]], bits: float, num_scale
 
 
 def allocate_ranks_measured(shapes: dict[str, tuple[int, int]], curves: dict[str, tuple[float, float]], bits: float,
-                            num_scales: int, budget: str, legacy: dict[str, int], max_ratio: float = 1.0,
+                            num_scales: int, budget: str, legacy: dict[str, int],
                             mult: dict[str, float] | None = None) -> dict[str, int]:
     """Rank allocation by marginal predicted loss per bit from measured per-layer sensitivity curves.
 
     Every layer starts at rank 32; one 32-step at a time is given to the layer with the largest predicted loss
     decrease per added bit, ``(J_l(r) - J_l(r + 32)) / step_bits_l``, until no step fits under the bit target
     (``budget="parity"``: the bits the uniform rule spends; ``"full"``: exactly ``bits`` per weight) or the
-    ceiling ``max_ratio * min(in, out)``. For decreasing convex curves this greedy fill is the optimum of the
-    discretised separable knapsack. Layers without a curve keep their uniform rank (their bits stay reserved).
+    ceiling ``min(in, out)``. For decreasing convex curves this greedy fill is the optimum of the discretised
+    separable knapsack. Layers without a curve keep their uniform rank (their bits stay reserved).
 
     Parameters
     ----------
@@ -499,10 +351,8 @@ def allocate_ranks_measured(shapes: dict[str, tuple[int, int]], curves: dict[str
         ``"parity"`` or ``"full"``.
     legacy : dict
         Ranks of the uniform rule (parity target and fallback).
-    max_ratio : float
-        Rank ceiling as a multiple of ``min(in, out)``.
     mult : dict, optional
-        Multiplicative prior on each layer's curve (e.g. the depth-ramp / type-weight multipliers).
+        Multiplicative prior on each layer's curve (see :func:`depth_multipliers`).
 
     Returns
     -------
@@ -511,10 +361,8 @@ def allocate_ranks_measured(shapes: dict[str, tuple[int, int]], curves: dict[str
     """
     if budget not in ("parity", "full"):
         raise ValueError(f"Unknown rank_budget for allocate_ranks_measured: {budget}")
-    if max_ratio < 1.0:
-        raise ValueError("rank_max_ratio must be >= 1")
     lo = RANK_STEP
-    hi = {k: _rank_ceiling(a, b, max_ratio) for k, (a, b) in shapes.items()}
+    hi = {k: rank_ceiling(a, b) for k, (a, b) in shapes.items()}
     step_bits = {k: _step_bits(a, b, num_scales) for k, (a, b) in shapes.items()}
     total_target = _total_bit_target(shapes, bits, num_scales, budget, legacy)
     level = {k: (curves[k][0] + (float(np.log(mult[k])) if mult else 0.0), curves[k][1])
@@ -564,13 +412,12 @@ def _format_measured_summary(shapes: dict[str, tuple[int, int]], ranks: dict[str
 def calculate_ranks(model, layers_to_analyze, quant_config, sensitivity: dict | None = None):
     """Per-layer factorisation ranks for the bit target ``quant_config["bits"]``.
 
-    With the defaults (``rank_budget="uniform"``, no depth ramp, no type weights) this is the legacy rule: each
-    layer's rank is the bit-exact continuous rank floored to a multiple of 32 (at least 32). ``rank_budget`` of
-    ``"parity"`` or ``"full"`` enables the non-uniform allocation of :func:`allocate_ranks` driven by
-    ``rank_depth_ramp`` and ``rank_type_weights``. With ``rank_sensitivity`` other than ``"none"`` the allocation
-    follows the measured curves of :func:`nanoquant.core.rank_probe.measure_sensitivity`
-    (:func:`allocate_ranks_measured`, the ramp / type multipliers acting as a prior); until those curves exist
-    (``sensitivity`` is ``None``, e.g. the accounting printed before calibration) the uniform rule is returned.
+    ``rank_budget="uniform"`` (default) is the paper's rule: each layer's rank is the bit-exact continuous rank
+    floored to a multiple of 32 (at least 32). ``"parity"`` / ``"full"`` allocate the same total bits (or exactly
+    ``bits`` per weight) by marginal predicted loss per bit from the sensitivity curves measured at calibration
+    time (:func:`nanoquant.core.rank_probe.measure_sensitivity`, :func:`allocate_ranks_measured`), with
+    ``rank_depth_ramp`` as an optional depth prior. Until those curves exist (``sensitivity`` is ``None``, e.g. the
+    accounting printed before calibration) the uniform rule is returned.
 
     Parameters
     ----------
@@ -597,19 +444,14 @@ def calculate_ranks(model, layers_to_analyze, quant_config, sensitivity: dict | 
     if measured not in RANK_SENSITIVITIES:
         raise ValueError(f"Unknown rank_sensitivity: {measured}")
     ramp = float(quant_config.get('rank_depth_ramp', 0.0) or 0.0)
-    type_weights = parse_type_weights(quant_config.get('rank_type_weights', '') or '')
-    max_ratio = float(quant_config.get('rank_max_ratio', 1.0) or 1.0)
-    if max_ratio < 1.0:
-        raise ValueError("rank_max_ratio must be >= 1")
-    if budget == 'uniform' and (ramp or type_weights):
-        raise ValueError("rank_depth_ramp / rank_type_weights require rank_budget='parity' or 'full'")
-    if budget == 'uniform' and measured != 'none':
-        raise ValueError("rank_sensitivity requires rank_budget='parity' or 'full'")
+    if budget == 'uniform' and (ramp or measured != 'none'):
+        raise ValueError("rank_depth_ramp / rank_sensitivity require rank_budget='parity' or 'full'")
+    if budget != 'uniform' and measured == 'none':
+        raise ValueError("rank_budget='parity' / 'full' requires a measured rank_sensitivity ('admm' or 'svd')")
 
     print(f"Rank calculation: Bits = ({bits:.2f}), Scales: {num_scales}, budget: {budget}"
-          + (f", depth ramp {ramp:g}" if ramp else "") + (f", type weights {type_weights}" if type_weights else "")
-          + (f", rank ceiling {max_ratio:g} x min(in, out)" if max_ratio != 1.0 else "")
-          + (f", measured sensitivity ({measured})" if measured != 'none' else ""))
+          + (f", measured sensitivity ({measured})" if measured != 'none' else "")
+          + (f", depth ramp {ramp:g}" if ramp else ""))
     blocks = get_decoder_layers(model)
     shapes: dict[str, tuple[int, int]] = {}
     for i, layer in enumerate(blocks):
@@ -620,19 +462,14 @@ def calculate_ranks(model, layers_to_analyze, quant_config, sensitivity: dict | 
     legacy = {k: uniform_rank(a, b, bits, num_scales) for k, (a, b) in shapes.items()}
     if budget == 'uniform':
         return legacy
-    if measured != 'none':
-        if sensitivity is None:
-            print("Rank allocation: measured sensitivity pending (probe runs after calibration); "
-                  "showing the uniform rule")
-            return legacy
-        curves = sensitivity["curves"]
-        mult = budget_multipliers(shapes, len(blocks), ramp, type_weights) if (ramp or type_weights) else None
-        ranks = allocate_ranks_measured(shapes, curves, bits, num_scales, budget, legacy, max_ratio=max_ratio,
-                                        mult=mult)
-        print(_format_measured_summary(shapes, ranks, legacy, curves, num_scales))
-    else:
-        ranks = allocate_ranks(shapes, len(blocks), bits, num_scales, ramp, type_weights, budget, legacy,
-                               max_ratio=max_ratio)
+    if sensitivity is None:
+        print("Rank allocation: measured sensitivity pending (probe runs after calibration); "
+              "showing the uniform rule")
+        return legacy
+    curves = sensitivity["curves"]
+    mult = depth_multipliers(shapes, len(blocks), ramp) if ramp else None
+    ranks = allocate_ranks_measured(shapes, curves, bits, num_scales, budget, legacy, mult=mult)
+    print(_format_measured_summary(shapes, ranks, legacy, curves, num_scales))
     changed = sum(ranks[k] != legacy[k] for k in ranks)
     print(f"Rank allocation: {changed}/{len(ranks)} layers differ from the uniform rule; "
           f"ranks {min(ranks.values())}..{max(ranks.values())}")

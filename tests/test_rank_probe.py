@@ -135,9 +135,7 @@ def test_measured_allocation_respects_ceiling_and_missing_curves():
     curves = _flat_curves(shapes, beta=0.2)
     curves["1.mlp.up_proj"] = (30.0, 1.0)  # e^30 / r: its marginal gain dominates every other layer at any rank
     capped = U.allocate_ranks_measured(shapes, curves, 1.0, 2, "parity", legacy)
-    assert capped["1.mlp.up_proj"] == 1024  # min(1024, 3072)
-    lifted = U.allocate_ranks_measured(shapes, curves, 1.0, 2, "parity", legacy, max_ratio=2.0)
-    assert 1024 < lifted["1.mlp.up_proj"] <= 2048 and lifted["1.mlp.up_proj"] % 32 == 0
+    assert capped["1.mlp.up_proj"] == 1024  # the ceiling min(1024, 3072)
     # a layer without a curve keeps its legacy rank and its bits stay reserved
     del curves["0.self_attn.k_proj"]
     ranks = U.allocate_ranks_measured(shapes, curves, 1.0, 2, "parity", legacy)
@@ -196,12 +194,11 @@ def test_parse_probe_ranks_and_candidate_grid():
     for bad in ("", "0,1", "a", "-1"):
         with pytest.raises(ValueError):
             U.parse_probe_ranks(bad)
-    # candidates: multiples of the uniform rank on the 32-grid, clamped to [32, ceiling], de-duplicated, sorted
-    assert rank_probe.candidate_ranks(640, 1024, 2048, [0.5, 1.0, 1.5], 1.0) == [320, 640, 960]
-    assert rank_probe.candidate_ranks(736, 3072, 1024, [0.5, 1.0, 1.5], 1.0) == [352, 736, 1024]
-    assert rank_probe.candidate_ranks(736, 3072, 1024, [0.5, 1.0, 1.5], 2.0) == [352, 736, 1088]
-    assert rank_probe.candidate_ranks(32, 64, 64, [0.5, 1.0, 1.5], 1.0) == [32]  # 48 floors to 32: one probe
-    assert rank_probe.candidate_ranks(128, 256, 384, [0.5, 1.0, 1.5], 1.0) == [64, 128, 192]
+    # candidates: multiples of the uniform rank on the 32-grid, clamped to [32, min(in, out)], de-duplicated, sorted
+    assert rank_probe.candidate_ranks(640, 1024, 2048, [0.5, 1.0, 1.5]) == [320, 640, 960]
+    assert rank_probe.candidate_ranks(736, 3072, 1024, [0.5, 1.0, 1.5]) == [352, 736, 1024]
+    assert rank_probe.candidate_ranks(32, 64, 64, [0.5, 1.0, 1.5]) == [32]  # 48 floors to 32: one probe
+    assert rank_probe.candidate_ranks(128, 256, 384, [0.5, 1.0, 1.5]) == [64, 128, 192]
 
 
 def test_deployed_matrix_matches_the_module_forward():
@@ -240,8 +237,7 @@ def test_measure_sensitivity_on_a_tiny_model(dense):
     cfg = _cfg(rank_budget="parity", rank_sensitivity="admm", rank_probe_ranks="0.5,1.0,1.5", rank_probe_iters=20,
                admm_outer_iters=400, admm_inner_iters=5, admm_reg=3e-2, admm_penalty_scheduler="linear",
                admm_print_steps=False, curvature="kron" if dense else "diag", kron_eigh_dtype="float64",
-               admm_curvature_power=1.0, admm_curvature_cond_max=0.0, admm_curvature_spike_rank=0,
-               rank_max_ratio=1.0)
+               admm_curvature_power=1.0)
     before = {f"{i}.{k}": lx.weight.detach().clone()
               for i, blk in enumerate(model.model.layers) for k, lx in U.find_layers(blk).items()}
     sens = rank_probe.measure_sensitivity(model, NAMES, cfg, dev="cpu")
@@ -250,7 +246,7 @@ def test_measure_sensitivity_on_a_tiny_model(dense):
     for k, (a, b) in shapes.items():
         probes = sens["probes"][k]
         ranks = sorted(probes)
-        assert ranks == rank_probe.candidate_ranks(U.calculate_ranks(model, NAMES, _cfg())[k], a, b, [0.5, 1.0, 1.5], 1.0)
+        assert ranks == rank_probe.candidate_ranks(U.calculate_ranks(model, NAMES, _cfg())[k], a, b, [0.5, 1.0, 1.5])
         assert all(v > 0 for v in probes.values())
         # more rank, less curvature-weighted error (monotone up to ADMM noise at these tiny sizes)
         assert probes[ranks[0]] > probes[ranks[-1]]
@@ -298,7 +294,7 @@ def test_config_plumbing_and_cache_keys():
         assert C.chain_keys(base, 2)[0] != C.chain_keys(over(**{field: value}), 2)[0], field
         assert C.probe_key(base) != C.probe_key(over(**{field: value})), field
     # the probe key ignores the production iteration count and everything downstream of the ADMM inputs
-    assert C.probe_key(base) == C.probe_key(over(admm_outer_iters=7, tail_logit_blocks=4, model_kd_lr=1.0))
+    assert C.probe_key(base) == C.probe_key(over(admm_outer_iters=7, curvature_refresh_every=7, model_kd_lr=1.0))
     assert C.probe_key(base) != C.probe_key(over(calib_shrinkage=0.1))
     assert C.probe_key(base) != C.probe_key(over(bits=0.9))
     pipeline.validate_config(over(rank_budget="parity", rank_sensitivity="admm"))

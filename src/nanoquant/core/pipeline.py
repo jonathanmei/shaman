@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Samsung Electronics Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Single entry point of the quantisation pipeline (calibration → block reconstruction → KD).
+"""Single entry point of the quantisation pipeline (calibration → rank probe → block reconstruction → KD).
 
 Shared by ``modules.hub.NanoQuantModel.quantize_model`` and ``modules.auto_model.AutoNQModel``; wires the
 stage-level artifact cache so that repeated or interrupted runs reuse whatever is still valid.
@@ -25,7 +25,6 @@ from ..utils.utils import (
     get_layers_to_factorize,
     has_mid_scale,
     parse_probe_ranks,
-    parse_type_weights,
 )
 from .compress_model import compress_block_recon, compress_model_recon
 from .importance import (
@@ -35,14 +34,10 @@ from .importance import (
     get_shrunk_stats,
     register_stats,
 )
-from .latent import drop_latents
 from .rank_probe import PROBE_KIND, measure_sensitivity
 from .resume import compressed_state_dict
 
 PRE_KD_KIND = "model"
-BLOCK_LOSSES = ("diag", "mahalanobis")
-BLOCK_LOSS_SOURCES = ("nkp", "plain")
-KD_MODES = ("scales", "scales_latent")
 ADMM_INPUT_FACTORS = ("calib", "fresh")
 
 
@@ -57,8 +52,8 @@ def validate_config(quant_config: dict) -> None:
     Raises
     ------
     ValueError
-        For unknown enum values, a dense block loss without Kronecker curvature, latent KD without
-        retained latents, or a negative ``max_blocks``.
+        For unknown enum values, a non-uniform rank budget without a measured sensitivity, a curvature refresh
+        without Kronecker curvature, or a negative ``max_blocks``.
     """
     curvature = quant_config.get("curvature", "diag")
     if curvature not in CURVATURE_TYPES:
@@ -66,18 +61,15 @@ def validate_config(quant_config: dict) -> None:
     budget = quant_config.get("rank_budget", "uniform") or "uniform"
     if budget not in RANK_BUDGETS:
         raise ValueError(f"Unknown rank_budget: {budget}")
-    parse_type_weights(quant_config.get("rank_type_weights", "") or "")  # raises on malformed entries
-    if float(quant_config.get("rank_max_ratio", 1.0) or 1.0) < 1.0:
-        raise ValueError("rank_max_ratio must be >= 1")
-    if budget == "uniform" and (float(quant_config.get("rank_depth_ramp", 0.0) or 0.0)
-                                or (quant_config.get("rank_type_weights", "") or "").strip()):
-        raise ValueError("rank_depth_ramp / rank_type_weights require rank_budget='parity' or 'full'")
     sensitivity = quant_config.get("rank_sensitivity", "none") or "none"
     if sensitivity not in RANK_SENSITIVITIES:
         raise ValueError(f"Unknown rank_sensitivity: {sensitivity}")
+    ramp = float(quant_config.get("rank_depth_ramp", 0.0) or 0.0)
+    if budget == "uniform" and (ramp or sensitivity != "none"):
+        raise ValueError("rank_depth_ramp / rank_sensitivity require rank_budget='parity' or 'full'")
+    if budget != "uniform" and sensitivity == "none":
+        raise ValueError("rank_budget='parity' / 'full' requires a measured rank_sensitivity ('admm' or 'svd')")
     if sensitivity != "none":
-        if budget == "uniform":
-            raise ValueError("rank_sensitivity requires rank_budget='parity' or 'full'")
         parse_probe_ranks(quant_config.get("rank_probe_ranks", "0.5,1.0,1.5") or "")  # raises on malformed entries
         if int(quant_config.get("rank_probe_iters", 50) or 0) < 1:
             raise ValueError("rank_probe_iters must be >= 1")
@@ -85,43 +77,14 @@ def validate_config(quant_config: dict) -> None:
             raise ValueError("rank_sensitivity='admm' requires admm_type='nanoquant'")
     if quant_config.get("kron_fit", "frobenius") not in KRON_FITS:
         raise ValueError(f"Unknown kron_fit: {quant_config.get('kron_fit')}")
-    if int(quant_config.get("admm_curvature_spike_rank", 0) or 0) < 0:
-        raise ValueError("admm_curvature_spike_rank must be >= 0")
-    block_loss = quant_config.get("block_loss", "diag")
-    if block_loss not in BLOCK_LOSSES:
-        raise ValueError(f"Unknown block_loss: {block_loss}")
-    if block_loss == "mahalanobis" and curvature != "kron":
-        raise ValueError("block_loss='mahalanobis' requires curvature='kron' (dense output-side curvature)")
-    source = quant_config.get("block_loss_source", "nkp")
-    if source not in BLOCK_LOSS_SOURCES:
-        raise ValueError(f"Unknown block_loss_source: {source}")
-    if source == "plain" and curvature != "kron":
-        raise ValueError("block_loss_source='plain' requires curvature='kron' (the plain output-gradient covariance "
-                         "is collected during the Kronecker calibration passes)")
     if quant_config.get("admm_input_factor", "calib") not in ADMM_INPUT_FACTORS:
         raise ValueError(f"Unknown admm_input_factor: {quant_config.get('admm_input_factor')}")
-    kd_mode = quant_config.get("model_kd_mode", "scales")
-    if kd_mode not in KD_MODES:
-        raise ValueError(f"Unknown model_kd_mode: {kd_mode}")
-    if quant_config.get("tune_model", True) and kd_mode == "scales_latent" \
-            and not quant_config.get("retain_latent", False):
-        raise ValueError("model_kd_mode='scales_latent' requires retain_latent=true: the latent factors are "
-                         "dropped when each layer is hardened after block tuning otherwise")
     if int(quant_config.get("max_blocks", 0) or 0) < 0:
         raise ValueError("max_blocks must be >= 0")
     if int(quant_config.get("curvature_refresh_every", 0) or 0) < 0:
         raise ValueError("curvature_refresh_every must be >= 0")
-    if int(quant_config.get("tail_logit_blocks", 0) or 0) < 0:
-        raise ValueError("tail_logit_blocks must be >= 0")
-    if not 0.0 <= float(quant_config.get("tail_logit_mix", 1.0)) <= 1.0:
-        raise ValueError("tail_logit_mix must lie in [0, 1]")
     if int(quant_config.get("curvature_refresh_every", 0) or 0) > 0 and curvature != "kron":
         raise ValueError("curvature_refresh_every > 0 requires curvature='kron'")
-    if float(quant_config.get("model_kd_feature_weight", 0.0) or 0.0) > 0 \
-            and quant_config.get("model_kd_teacher", "ram") != "online":
-        raise ValueError("model_kd_feature_weight > 0 requires model_kd_teacher='online'")
-    if quant_config.get("model_kd_norm_weights", False) and float(quant_config.get("model_kd_norm_lr", 0.0)) <= 0:
-        raise ValueError("model_kd_norm_weights=true requires model_kd_norm_lr > 0")
     override = quant_config.get("pre_kd_checkpoint") or ""
     if override and not os.path.isfile(override):
         raise ValueError(f"pre_kd_checkpoint does not exist: {override}")
@@ -157,6 +120,8 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
     Stages and their cache behaviour (all governed by ``quant_config['cache_dir']``; empty disables):
 
     1. calibration statistics – ``stats`` artifact keyed by the calibration settings only;
+    1b. measured rank sensitivity (``rank_sensitivity != "none"``) – ``rank_probe`` artifact keyed by the
+        calibration key and the probe's ADMM inputs;
     2. block-wise reconstruction – per-block checkpoints and per-layer ADMM memo (see
        :mod:`nanoquant.core.resume` and :func:`nanoquant.core.compress_block.factorize_and_replace`);
        the fully reconstructed pre-KD model is stored as a ``model`` artifact;
@@ -192,8 +157,8 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
     dataloader = get_calib_loader(data, tokenizer, quant_config['num_calib_samples'], quant_config['seed'],
                                   quant_config['seqlen'])
     n_blocks = len(get_decoder_layers(fp_model))
-    print(format_accounting(static_accounting(fp_model, get_layers_to_factorize(fp_model.config.model_type),
-                                              quant_config), title="bpw budget"))
+    layers = get_layers_to_factorize(fp_model.config.model_type)
+    print(format_accounting(static_accounting(fp_model, layers, quant_config), title="bpw budget"))
 
     max_blocks = int(quant_config.get("max_blocks", 0) or 0)
     truncated = 0 < max_blocks < n_blocks
@@ -226,7 +191,6 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
         # 1b) measured rank sensitivity (short ADMM solves at candidate ranks against the registered curvature)
         sensitivity = None
         if (quant_config.get("rank_sensitivity", "none") or "none") != "none":
-            layers = get_layers_to_factorize(model.config.model_type)
             sensitivity = cache.load_or_compute(
                 PROBE_KIND, probe_key(quant_config),
                 lambda: measure_sensitivity(model, layers, quant_config, dev))
@@ -243,11 +207,9 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
             atomic_save(compressed_state_dict(model), cache.path(PRE_KD_KIND, pre_kd_key))
             print(f"[cache] saved {PRE_KD_KIND} {pre_kd_key[:12]}")
 
-    # 3) model-level KD (scale-only or scale + latent reconstruction)
+    # 3) model-level KD (scale reconstruction)
     if quant_config.get('tune_model', True) and not truncated:
         model = compress_model_recon(model, fp_model, dataloader, quant_config, dev=dev, cache=cache)
-    else:
-        drop_latents(model)
 
     print(format_accounting(model_accounting(model), title="bpw actual"))
     return model

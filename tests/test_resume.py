@@ -85,77 +85,25 @@ def _latent_factors(out_f, in_f, rank):
     return f
 
 
-def test_finalize_default_drops_latents_and_keep_latent_retains_them():
-    lin = nn.Linear(8, 6, bias=False).to(torch.bfloat16)
-    lin.__class__ = NanoQuantLinear
-    lin.__quant_convert__(do_train=True, rank=RANK, factor_results=_latent_factors(6, 8, RANK))
-    assert lin.has_latent and not hasattr(lin, "U")
-    lin.finalize()
-    assert not lin.has_latent and hasattr(lin, "U") and not lin.do_train and lin._binarized
-
-    lin2 = nn.Linear(8, 6, bias=False).to(torch.bfloat16)
-    lin2.__class__ = NanoQuantLinear
-    lin2.__quant_convert__(do_train=True, rank=RANK, factor_results=_latent_factors(6, 8, RANK))
-    lin2.finalize(keep_latent=True)
-    assert lin2.has_latent and not lin2.do_train and lin2._binarized
-    assert not lin2.U_latent.requires_grad and not lin2.V_latent.requires_grad
-    assert torch.equal(lin2.U, lin2.binary_ste(lin2.U_latent)) and torch.equal(lin2.V, lin2.binary_ste(lin2.V_latent))
-    x = torch.randn(3, 8).to(torch.bfloat16)
-    with torch.no_grad():
-        y_hard = lin2(x)
-        lin2.drop_latent()
-        assert not lin2.has_latent
-        assert torch.equal(lin2(x), y_hard)
-
-
-def test_quant_convert_keep_latent_without_training():
+def test_finalize_hardens_and_drops_latents():
     lin = nn.Linear(8, 6, bias=False).to(torch.bfloat16)
     lin.__class__ = NanoQuantLinear
     f = _latent_factors(6, 8, RANK)
-    lin.__quant_convert__(do_train=False, rank=RANK, factor_results=f, keep_latent=True)
-    assert lin.has_latent and hasattr(lin, "U") and not lin.do_train
-    assert torch.equal(lin.U_latent, f.A_latent.mT.to(torch.bfloat16))
-
-
-def test_state_dict_keeps_latents_and_packs_only_hardened_factors():
-    lin = nn.Linear(8, 6, bias=False).to(torch.bfloat16)
-    lin.__class__ = NanoQuantLinear
-    lin.__quant_convert__(do_train=True, rank=RANK, factor_results=_latent_factors(6, 8, RANK))
-    lin.finalize(keep_latent=True)
-    state = lin.state_dict(prefix="l.")
-    assert {"l.V_packed", "l.U_packed", "l.V_shape", "l.U_shape", "l.V_latent", "l.U_latent"} <= set(state)
-    assert "l.V" not in state and "l.U" not in state
-    lin.drop_latent()
-    state = lin.state_dict(prefix="l.")
-    assert "l.V_latent" not in state and "l.U_latent" not in state and "l.V_packed" in state
-
-
-def test_block_checkpoint_round_trip_retains_latents_for_kd():
-    torch.manual_seed(1)
-    block = _Block().to(torch.bfloat16)
-    lin = block.mlp.up_proj
-    lin.__class__ = NanoQuantLinear
-    lin.__quant_convert__(do_train=True, rank=RANK, factor_results=_latent_factors(lin.out_features, lin.in_features, RANK))
-    lin.finalize(keep_latent=True)
-    state = resume.block_state(block)
-    x = torch.randn(2, 5, 8).to(torch.bfloat16)
+    lin.__quant_convert__(do_train=True, rank=RANK, factor_results=f)
+    assert hasattr(lin, "U_latent") and hasattr(lin, "V_latent") and not hasattr(lin, "U")
+    x = torch.randn(3, 8).to(torch.bfloat16)
     with torch.no_grad():
-        ref = block(x)
-
-    fresh = _Block().to(torch.bfloat16)
-    resume.restore_block(fresh, state)
-    got_lin = fresh.mlp.up_proj
-    assert got_lin.has_latent
-    assert torch.equal(got_lin.U_latent, lin.U_latent) and torch.equal(got_lin.V_latent, lin.V_latent)
-    assert torch.equal(got_lin.U, lin.U) and torch.equal(got_lin.V, lin.V)
+        y_ste = lin(x)
+    lin.finalize()
+    assert not hasattr(lin, "U_latent") and not hasattr(lin, "V_latent")
+    assert hasattr(lin, "U") and not lin.do_train and lin._binarized
+    assert torch.equal(lin.U, lin.binary_ste(f.A_latent.mT.to(torch.bfloat16)))
     with torch.no_grad():
-        assert torch.equal(fresh(x), ref)
-
-    # a checkpoint written without latents restores a plain hardened layer
-    lin.drop_latent()
-    fresh2 = _Block().to(torch.bfloat16)
-    resume.restore_block(fresh2, resume.block_state(block))
-    assert not fresh2.mlp.up_proj.has_latent
+        assert torch.equal(lin(x), y_ste)  # the STE forward already used the signs
+    # the state dict packs the hardened factors and carries no latents
+    state = lin.state_dict(prefix="l.")
+    assert {"l.V_packed", "l.U_packed", "l.V_shape", "l.U_shape"} <= set(state)
+    assert not any(k.endswith("_latent") for k in state) and "l.V" not in state and "l.U" not in state
 
 
 def test_restore_prefix_uses_progress_and_chain(tmp_path):

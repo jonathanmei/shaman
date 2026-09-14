@@ -20,10 +20,6 @@ GRAD_SCALE_FACTOR = 1e6
 PERCENTILE = 0.999
 # Supported curvature estimates: diagonal (legacy) or Kronecker-factored (nearest Kronecker product)
 CURVATURE_TYPES = ("diag", "kron")
-# Layers whose output is written to the residual stream (block output); for these the plain, unweighted covariance of
-# the output gradient is collected alongside the Kronecker factors (``o_cov_plain``) for the dense block loss.
-PLAIN_COV_LAYERS: tuple[str, ...] = ("mlp.down_proj", "fc2")
-PLAIN_COV_KEY = "o_cov_plain"
 
 
 # -----------------------------------------------------------------------------
@@ -346,12 +342,9 @@ def _kron_clip(x: torch.Tensor, layer_name: str, side: str, clip_state, acc: dic
         gmax = tau
     elif tau > gmax:
         correction = (tau / (gmax + 1e-8)).square()
-        for key, layers in acc.items():
-            # the plain output covariance is quadratic in delta only: an input-side threshold change leaves it alone
-            if key == PLAIN_COV_KEY and side != "o":
-                continue
-            if layer_name in layers:
-                layers[layer_name].mul_(correction.to(layers[layer_name].device))
+        for key in ("i_cov", "o_cov"):
+            if layer_name in acc[key]:
+                acc[key][layer_name].mul_(correction.to(acc[key][layer_name].device))
         gmax = tau
     state["global_max"] = gmax
     return _clip_tokens(x, gmax)
@@ -387,10 +380,6 @@ def _kron_backward_hook(module, grad_input, grad_output, layer_name, run_states,
     acc_R = acc["i_cov"][layer_name]
     acc_L.add_(L.to(acc_L.device))
     acc_R.add_(R.to(acc_R.device))
-    if PLAIN_COV_KEY in acc and layer_name in acc[PLAIN_COV_KEY]:
-        acc_P = acc[PLAIN_COV_KEY][layer_name]
-        acc_P.add_((delta.mT @ delta).to(acc_P.device))
-    sq_sums[layer_name]["tokens"] += delta.shape[0]
     # running mean-square statistics used to put the factors on the legacy i_norm / o_norm scale
     sq_sums[layer_name]["i"] += x.square().mean().item()
     sq_sums[layer_name]["o"] += delta.square().mean().item() / GRAD_SCALE_FACTOR
@@ -399,7 +388,7 @@ def _kron_backward_hook(module, grad_input, grad_output, layer_name, run_states,
 
 def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Linear], strategy: str, nkp_iters: int,
                         stats_device: str, use_truefisher: bool, model_offload: bool,
-                        gpu_budget_gb: float = 0.0, plain_cov_layers: tuple[str, ...] = PLAIN_COV_LAYERS,
+                        gpu_budget_gb: float = 0.0,
                         init_factors: dict | None = None, fit: str = "frobenius") -> dict:
     """Multi-pass streaming Kronecker fit of the per-token empirical Fisher.
 
@@ -411,9 +400,6 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
     existing factors instead of the identity, which is how a curvature *refresh* on a partially quantised model
     gets away with a single pass.
 
-    For the layers whose name ends with one of ``plain_cov_layers`` (the block-output layers) the first pass
-    additionally accumulates the plain, unweighted covariance of the (clipped) output gradient,
-    ``o_cov_plain = sum_t delta_t delta_t^T / T`` on the legacy ``o_norm`` scale, for the dense block loss.
 
     Every ALS iteration updates **both** factors of every layer from the previous iteration's
     (unit-Frobenius-norm) factors; iteration 1 starts from identity. After the final iteration the
@@ -451,10 +437,9 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
     if init_factors is not None:
         prev = {key: {n: _frobenius_normalize(M.float()) for n, M in init_factors.get(key, {}).items()}
                 for key in ("i_cov", "o_cov")}
-    plain: dict[str, torch.Tensor] = {}
     sq_sums = None
     for it in range(nkp_iters):
-        sq_sums = defaultdict(lambda: {"i": 0.0, "o": 0.0, "n": 0, "tokens": 0})
+        sq_sums = defaultdict(lambda: {"i": 0.0, "o": 0.0, "n": 0})
         new = {"i_cov": {}, "o_cov": {}}
         for g, names in enumerate(groups):
             group_bytes = sum(_factor_bytes(linear_layers[n]) for n in names)
@@ -472,12 +457,6 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
                     for n in names
                 },
             }
-            if it == 0:
-                acc[PLAIN_COV_KEY] = {
-                    n: torch.zeros(linear_layers[n].out_features, linear_layers[n].out_features,
-                                   dtype=torch.float32, device=acc_device)
-                    for n in names if n.endswith(tuple(plain_cov_layers))
-                }
             # ALS weights of this pass for this group: the previous factors (Frobenius fit) or their damped
             # inverses (KL fit), computed on the accumulation device
             prev_group = _als_weights({key: {n: prev[key][n] for n in names if n in prev[key]}
@@ -502,9 +481,6 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
             for key in ("i_cov", "o_cov"):
                 for n in names:
                     new[key][n] = _frobenius_normalize(acc[key][n]).to(stats_device)
-            for n, P in acc.get(PLAIN_COV_KEY, {}).items():
-                tokens = max(1, sq_sums[n]["tokens"])
-                plain[n] = (P / (tokens * GRAD_SCALE_FACTOR)).to(stats_device)
             del acc, prev_group
             if torch.cuda.is_available():
                 cleanup_memory()
@@ -526,7 +502,6 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
             target = stats[side] / stats["n"]
             if mean_diag > 0 and target > 0:
                 M.mul_(target / mean_diag)
-    prev[PLAIN_COV_KEY] = plain
     return prev
 
 
@@ -628,9 +603,8 @@ def get_shrunk_stats(raw_stats: dict, shrinkage: float = 0.0) -> dict:
     }
     has_dense = 'i_cov' in raw_stats and 'o_cov' in raw_stats
     if has_dense:
-        for key in ('i_cov', 'o_cov', PLAIN_COV_KEY):
-            if key in raw_stats:
-                shrunk_stats[key] = {k: v.clone() for k, v in raw_stats[key].items()}
+        for key in ('i_cov', 'o_cov'):
+            shrunk_stats[key] = {k: v.clone() for k, v in raw_stats[key].items()}
 
     apply = 0.0 < shrinkage < 1.0
     if apply:
@@ -646,13 +620,6 @@ def get_shrunk_stats(raw_stats: dict, shrinkage: float = 0.0) -> dict:
                     cov.mul_(1.0 - shrinkage)
                     cov.diagonal().add_(mean_diag * shrinkage)
                 shrunk_stats[key_vec][layer_name] = cov.diagonal().clone()
-        if apply:
-            for cov in shrunk_stats.get(PLAIN_COV_KEY, {}).values():
-                if cov.numel() == 0:
-                    continue
-                mean_diag = cov.diagonal().mean()
-                cov.mul_(1.0 - shrinkage)
-                cov.diagonal().add_(mean_diag * shrinkage)
         return shrunk_stats
 
     # 2. Return early if no shrinkage is needed (just return the copy).
@@ -706,8 +673,8 @@ def register_stats(model, stats: dict):
             m.register_buffer("o_norm", stats['o_norm'][name], persistent=False)
         else:
             m.register_buffer("o_norm", torch.ones(m.weight.shape[0], device=device), persistent=False)
-        # 4. Dense Kronecker factors and the plain block-output gradient covariance (kron curvature only)
-        for key in ("i_cov", "o_cov", PLAIN_COV_KEY):
+        # 4. Dense Kronecker factors (kron curvature only)
+        for key in ("i_cov", "o_cov"):
             if key in stats and name in stats[key]:
                 m.register_buffer(key, stats[key][name], persistent=False)
 
@@ -721,7 +688,7 @@ def register_stats(model, stats: dict):
 # -----------------------------------------------------------------------------
 def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=False, vram_limit_gb=50, save_plots=False,
                   strategy='online', curvature='diag', nkp_iters=3, stats_device=None, gpu_budget_gb=0.0,
-                  plain_cov_layers=PLAIN_COV_LAYERS, init_factors=None, fit='frobenius'):
+                  init_factors=None, fit='frobenius'):
     """
     Main entry point for NanoQuant calibration statistics collection.
     Collects raw calibration statistics without applying shrinkage.
@@ -743,9 +710,6 @@ def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=Fa
         For ``curvature="kron"``: accumulate on ``dev`` for groups of layers whose factors fit within
         this budget (one calibration pass per group and iteration), instead of streaming every
         contribution to ``stats_device``. ``0`` keeps the legacy per-hook CPU accumulation.
-    plain_cov_layers : tuple of str
-        For ``curvature="kron"``: name suffixes of the block-output layers for which the plain output-gradient
-        covariance ``o_cov_plain`` is collected in addition to the Kronecker factors.
     init_factors : dict, optional
         For ``curvature="kron"``: previous factors that warm-start the ALS (see ``_collect_kron_stats``).
     fit : {"frobenius", "kl"}
@@ -790,13 +754,12 @@ def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=Fa
             raise ValueError(f"Unknown strategy: {strategy}")
         factors = _collect_kron_stats(model, dataloader, dev, linear_layers, strategy, nkp_iters, stats_device,
                                       use_truefisher, model_offload, gpu_budget_gb=gpu_budget_gb,
-                                      plain_cov_layers=tuple(plain_cov_layers), init_factors=init_factors, fit=fit)
+                                      init_factors=init_factors, fit=fit)
         raw_stats = {
             'i_norm': {n: factors['i_cov'][n].diagonal().clone() for n in linear_layers},
             'o_norm': {n: factors['o_cov'][n].diagonal().clone() for n in linear_layers},
             'i_cov': factors['i_cov'],
             'o_cov': factors['o_cov'],
-            PLAIN_COV_KEY: factors[PLAIN_COV_KEY],
             'n_samples': len(dataloader),
             'stats_device': stats_device,
         }
