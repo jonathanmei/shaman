@@ -10,13 +10,12 @@ import torch
 from tqdm import trange
 
 from ..core.compress_block import (
-    block_curvature,
+    block_importance,
     evaluate_block_loss,
     factor_drift,
     factorize_and_replace,
     format_drift,
     input_second_moment,
-    mahalanobis_weight_error,
     tune_fact,
     tune_nonfact,
 )
@@ -30,27 +29,17 @@ from ..utils.utils import (
     cleanup_memory,
     find_layers,
     get_decoder_layers,
-    get_final_norm_and_head,
     get_layers_to_factorize,
     set_seed,
 )
-from .curvature import format_spectrum
 from .importance import (
-    PLAIN_COV_KEY,
     collect_stats,
     get_shrunk_stats,
     register_stats,
     shrink_toward_identity,
 )
-from .latent import (
-    format_flip_stats,
-    format_margin_stats,
-    latent_flip_stats,
-    latent_margin_stats,
-    normalize_latents,
-)
+from .kd_loss import kd_kl_loss
 from .resume import restore_prefix, save_block_checkpoint, save_progress
-from .tail import TailLogitObjective, kd_kl_loss
 from .teacher import TeacherLogits
 
 KD_KIND = "kd"
@@ -60,10 +49,10 @@ def refresh_block_curvature(model, dataloader, dev: str, quant_config: dict) -> 
     """Re-estimate the Kronecker curvature of every not-yet-factorised layer on the *current* model.
 
     The remaining ``nn.Linear`` layers (the quantised ones are ``NanoQuantLinear`` and are skipped automatically)
-    get new ``i_cov``/``o_cov``/``i_norm``/``o_norm``/``o_cov_plain`` buffers from ``curvature_refresh_iters``
-    calibration passes warm-started from their present factors, shrunk with ``calib_shrinkage``. The forward
-    and backward passes run through the quantised prefix, so the statistics see the activations and gradients
-    that later blocks actually receive (docs/admm_block_tuning_curvature.html, section 5).
+    get new ``i_cov``/``o_cov``/``i_norm``/``o_norm`` buffers from ``curvature_refresh_iters`` calibration passes
+    warm-started from their present factors, shrunk with ``calib_shrinkage``. The forward and backward passes run
+    through the quantised prefix, so the statistics see the activations and gradients that later blocks actually
+    receive (docs/admm_block_tuning_curvature.html, section 5).
 
     Returns
     -------
@@ -83,8 +72,6 @@ def refresh_block_curvature(model, dataloader, dev: str, quant_config: dict) -> 
                 if n in layers:
                     init[key][n] = getattr(m, key).detach().to("cpu")
                 delattr(m, key)
-        if hasattr(m, PLAIN_COV_KEY):
-            delattr(m, PLAIN_COV_KEY)
     with torch.enable_grad():
         raw = collect_stats(model, dataloader, dev, strategy=quant_config['calib_strategy'], curvature='kron',
                             fit=quant_config.get('kron_fit', 'frobenius'),
@@ -101,36 +88,6 @@ def refresh_block_curvature(model, dataloader, dev: str, quant_config: dict) -> 
     model.config.use_cache = False
     cleanup_memory()
     return len(layers)
-
-
-def feature_loss(student_hidden, teacher_hidden, mask: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """Relative squared error of the residual stream after every block, averaged over blocks.
-
-    Parameters
-    ----------
-    student_hidden, teacher_hidden : sequence of torch.Tensor
-        ``output_hidden_states`` tuples ``(embedding output, block 1, ..., block N)``; the embedding entry is
-        skipped because it is identical for student and teacher.
-    mask : torch.Tensor
-        ``(1, seqlen)`` token mask.
-
-    Returns
-    -------
-    torch.Tensor
-        ``mean_b sum_t ||s_bt - t_bt||^2 / sum_t ||t_bt||^2`` over masked tokens.
-    """
-    m = mask.to(torch.float32).unsqueeze(-1)
-    total = None
-    n = 0
-    for s, t in zip(student_hidden[1:], teacher_hidden[1:]):
-        t32 = t.float()
-        num = ((s.float() - t32).square() * m).sum()
-        den = (t32.square() * m).sum().clamp_min(eps)
-        total = num / den if total is None else total + num / den
-        n += 1
-    return total / max(n, 1)
-# layers whose output is added straight to the residual stream (their weight error maps 1:1 onto the block error)
-BLOCK_OUTPUT_LAYERS = ("mlp.down_proj", "fc2")
 
 
 @torch.no_grad()
@@ -198,8 +155,6 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
     diagnostics = bool(quant_config.get('block_diagnostics', False))
     num_samples = quant_config['num_calib_samples']
     refresh_every = int(quant_config.get('curvature_refresh_every', 0) or 0)
-    tail_blocks = int(quant_config.get('tail_logit_blocks', 0) or 0)
-    tail_mix = float(quant_config.get('tail_logit_mix', 1.0))
 
     # block reconstruction loop
     for i in trange(start, stop, initial=start, total=stop, desc="Compressing Layers"):
@@ -227,21 +182,11 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
         tuning_inputs = compressed_inputs.clone().detach()
         # get all linear layers
         sublayers = find_layers(q_block)
-        # output-side curvature of the block (weights of the reconstruction losses)
-        curvature = block_curvature(sublayers, model.config.hidden_size, quant_config, dev)
-        if curvature.summary:
-            print("\t\t" + format_spectrum(curvature.summary, title=f"block {i} curvature"))
+        # output-side importance of the block (weights of the reconstruction loss)
+        importance = block_importance(sublayers, model.config.hidden_size, dev)
         # move data to GPU
         tuning_inputs = tuning_inputs.to(dev)
         target_outputs = target_outputs.to(dev)
-        # logit-level objective through the FP suffix for the last `tail_logit_blocks` blocks
-        tail = None
-        if tail_blocks > 0 and i >= n_blocks - tail_blocks:
-            fp_norm, fp_head = get_final_norm_and_head(fp_model)
-            tail = TailLogitObjective(list(fp_blocks[i + 1:]), fp_norm, fp_head, target_outputs, kwargs, device=dev,
-                                      mix=tail_mix)
-            print(f"\t\t[tail] block {i}: logit-level objective through {n_blocks - i - 1} FP suffix blocks"
-                  + (f", mix {tail_mix:g} with the block loss" if tail_mix < 1.0 else ""))
         # compress each linear layer
         memo_hits = 0
         for name in layers_to_factorize:
@@ -249,7 +194,7 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             # 1/3) tune non-factorized, full-precision weights to absorb quant error
             if quant_config['tune_nonfact']:
                 print(f"\t(1/3) Block {i+1}/{n_blocks}, {name} | Tuning Non-Factorized Weights...")
-                tune_nonfact(q_block, tuning_inputs, target_outputs, curvature, kwargs, quant_config, tail=tail)
+                tune_nonfact(q_block, tuning_inputs, target_outputs, importance, kwargs, quant_config)
                 cleanup_memory()
             # 2/3) ADMM to factorize/initialize low-rank binary matrices and scales
             print(f"\t(2/3) Block {i+1}/{n_blocks}, {name} | Initialization via ADMM...")
@@ -269,36 +214,21 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
                 if fresh_input:
                     input_factor = R_fresh_shrunk
             if diagnostics:
-                w_before = layer.weight.detach().clone()
-                loss_before = evaluate_block_loss(q_block, tuning_inputs, target_outputs, curvature, kwargs, num_samples)
+                loss_before = evaluate_block_loss(q_block, tuning_inputs, target_outputs, importance, kwargs,
+                                                  num_samples)
             nano_linear, final_factor_results = factorize_and_replace(q_block, name, curr_rank, quant_config,
                                                                       cache=cache, input_factor=input_factor)
             memo_hits += int(getattr(final_factor_results, "cache_hit", False))
             if diagnostics:
-                # eq. (9) of the design note: for down_proj the dense block-loss increase of the ADMM solution equals
-                # tr(L_blk dW R_fresh dW^T) with the *summed* fresh second moment (exact if tune_nonfact converged)
-                loss_after = evaluate_block_loss(q_block, tuning_inputs, target_outputs, curvature, kwargs, num_samples)
-                W_final = final_factor_results.W_final.to(w_before.device)
-                numel = target_outputs.numel()
-                tokens = tuning_inputs.shape[0] * tuning_inputs.shape[1]
-                msg = (f"\t\tblock loss before -> after ADMM: diag {loss_before[0]:.4e} -> {loss_after[0]:.4e}")
-                if loss_before[1] is not None:
-                    msg += (f" | dense {loss_before[1]:.4e} -> {loss_after[1]:.4e} "
-                            f"(delta {loss_after[1] - loss_before[1]:.4e}")
-                    if name in BLOCK_OUTPUT_LAYERS and w_before.shape[0] == curvature.dense.shape[0]:
-                        # only the block-output layer writes straight to the residual stream (eq. 9 exact)
-                        gn = mahalanobis_weight_error(w_before, W_final, curvature.dense, R_fresh) * tokens / numel
-                        msg += f", Gauss-Newton prediction with fresh R {gn:.4e}"
-                    msg += ")"
-                print(msg)
-                del w_before, W_final
+                loss_after = evaluate_block_loss(q_block, tuning_inputs, target_outputs, importance, kwargs,
+                                                 num_samples)
+                print(f"\t\tblock loss before -> after ADMM: diag {loss_before:.4e} -> {loss_after:.4e}")
             del final_factor_results, input_factor, R_fresh, R_fresh_shrunk
             cleanup_memory()
             # 3/3) tune low-rank binary and scales
             if quant_config['tune_fact']:
                 print(f"\t(3/3) Block {i+1}/{n_blocks}, {name} | Tuning Factorized Weights...")
-                tune_fact(q_block, nano_linear, tuning_inputs, target_outputs, curvature, kwargs, quant_config,
-                          tail=tail)
+                tune_fact(q_block, nano_linear, tuning_inputs, target_outputs, importance, kwargs, quant_config)
                 cleanup_memory()
             cleanup_memory()
         if cache is not None and cache.enabled:
@@ -317,7 +247,7 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
                 compressed_inputs[j:j + 1] = batch_output.cpu().detach()
         q_blocks[i] = q_block.cpu()
 
-        del q_block, fp_block, target_outputs, curvature, tail
+        del q_block, fp_block, target_outputs, importance
         cleanup_memory()
 
         # checkpoint the reconstructed blocks and the activations entering block i+1
@@ -338,67 +268,46 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
     return model
 
 
-def _kd_parameters(model, kd_mode: str) -> tuple[list, list]:
-    """Put every :class:`NanoQuantLinear` into the forward mode of ``kd_mode`` and collect its trainable parameters.
-
-    ``"scales"`` evaluates the hardened ``U``/``V`` (the deployed model) and trains the scales only;
-    ``"scales_latent"`` switches to the STE forward on the latents and trains scales and latents.
+def _kd_parameters(model) -> list:
+    """Put every :class:`NanoQuantLinear` into its deployed forward (hardened ``U``/``V``) and collect its scales.
 
     Returns
     -------
-    tuple of list
-        ``(scale_params, latent_params)``.
+    list
+        The trainable scale parameters (``scale_pre``, ``scale_mid``, ``scale_post``).
     """
-    scale_params, latent_params = [], []
+    scale_params = []
     for module in model.modules():
         if not isinstance(module, NanoQuantLinear):
             continue
-        module.do_train = kd_mode == "scales_latent"
-        module._binarized = kd_mode != "scales_latent"
-        if kd_mode == "scales_latent" and not module.has_latent:
-            raise ValueError("model_kd_mode='scales_latent' requires retained latent factors (retain_latent=true)")
+        module.do_train = False
+        module._binarized = True
         for name, param in module.named_parameters():
             if 'scale' in name:
                 param.requires_grad = True
                 scale_params.append(param)
-            elif kd_mode == "scales_latent" and "latent" in name:
-                param.requires_grad = True
-                latent_params.append(param)
-    return scale_params, latent_params
+    return scale_params
 
 
-def _finish_kd(model, kd_mode: str) -> None:
-    """Leave KD: harden latents (``scales_latent``) or drop retained ones (``scales``); deployed forward for all."""
+def _finish_kd(model) -> None:
+    """Leave KD with every factorised layer in its deployed forward mode."""
     for module in model.modules():
         if isinstance(module, NanoQuantLinear):
-            if kd_mode == "scales_latent":
-                module.finalize()
-            else:
-                module.drop_latent()
             module.do_train = False
             module._binarized = True
 
 
 def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", cache: ArtifactCache | None = None):
     """
-    Use knowledge distillation to globally tune scales (and, with ``model_kd_mode="scales_latent"``, the
-    latent binary factors through the straight-through estimator).
+    Use knowledge distillation to globally tune the scales of the factorised layers (binaries frozen).
 
     Teacher logits come from :class:`TeacherLogits` in the mode selected by ``model_kd_teacher``
     (``"ram"`` legacy host cache, ``"disk"`` memmap in the artifact cache, ``"online"`` recompute).
     With an enabled ``cache`` the tuned parameters, optimizer/scheduler state and RNG states are
     checkpointed after every epoch and restored on the next run with the same KD key.
-
-    Latent mode logs the sign-margin distribution of the latents at the start and the fraction of flipped
-    bits after every epoch; ``model_kd_eval_every_epoch`` additionally evaluates held-out perplexity per
-    epoch. The returned model is always hardened (no latents).
+    ``model_kd_eval_every_epoch`` evaluates held-out perplexity after every epoch.
     """
-    kd_mode = quant_config.get("model_kd_mode", "scales")
-    if kd_mode not in ("scales", "scales_latent"):
-        raise ValueError(f"Unknown model_kd_mode: {kd_mode}")
-    latent_mode = kd_mode == "scales_latent"
     eval_every_epoch = bool(quant_config.get("model_kd_eval_every_epoch", False))
-    feat_w = float(quant_config.get("model_kd_feature_weight", 0.0) or 0.0)
 
     # set seed
     set_seed(quant_config['seed'])
@@ -414,8 +323,6 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
 
     # teacher logits (ram / disk / online)
     teacher_mode = quant_config.get('model_kd_teacher', 'ram')
-    if feat_w > 0 and teacher_mode != "online":
-        raise ValueError("model_kd_feature_weight > 0 requires model_kd_teacher='online' (teacher hidden states)")
     use_cache = cache is not None and cache.enabled
     fp_model.eval()
     teacher = TeacherLogits(teacher_mode, fp_model, samples, dev, cache=cache if use_cache else None,
@@ -440,24 +347,15 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
         model.model.gradient_checkpointing_enable()
     model.cuda()
 
-    scale_params, latent_params = _kd_parameters(model, kd_mode)
-    params_to_tune = scale_params + latent_params
-    print(f"Total number of scale parameters to tune: {len(scale_params)}"
-          + (f", latent parameters: {len(latent_params)}" if latent_mode else ""))
+    params_to_tune = _kd_parameters(model)
+    print(f"Total number of scale parameters to tune: {len(params_to_tune)}")
     if not params_to_tune:
         print("No scales found to tune. Returning original model.")
-        _finish_kd(model, kd_mode)
+        _finish_kd(model)
         model.eval()
         return model
 
-    param_groups = [{'params': scale_params, 'lr': quant_config['model_kd_lr']}]
-    if latent_mode:
-        if quant_config.get("model_kd_latent_normalize", False):
-            normalize_latents(model)
-            print("[latent] rows rescaled to unit mean magnitude (forward unchanged)")
-        print(format_margin_stats(latent_margin_stats(model), title="latent margins at KD start"))
-        param_groups.append({'params': latent_params, 'lr': quant_config.get('model_kd_latent_lr', 1e-6)})
-    optimizer = AdamW(param_groups)
+    optimizer = AdamW([{'params': params_to_tune, 'lr': quant_config['model_kd_lr']}], weight_decay=0)
     epochs = quant_config["model_kd_epochs"]
     total_steps = epochs * len(dataloader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
@@ -481,13 +379,10 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
     # 3) KD-tuning loop (student model)
     # -------------------------------------------
     with torch.enable_grad():
-        step = 0
         for epoch in range(start_epoch, epochs + 1):
             model.train()
             random.shuffle(data_indices)
             total_train_loss = torch.zeros(1, device=dev)
-            total_kl = torch.zeros(1, device=dev)
-            total_feat = torch.zeros(1, device=dev)
             t_epoch = time.time()
 
             for idx in data_indices:
@@ -499,46 +394,27 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
                 else:
                     mask = torch.ones_like(batch).int().to(dev)
 
-                # KD Loss (logit KL, optionally plus residual-stream feature distillation)
-                if feat_w > 0:
-                    student_outputs = model(batch, output_hidden_states=True)
-                    teacher_logits, teacher_hidden = teacher.get(idx, batch, hidden=True)
-                else:
-                    student_outputs = model(batch)
-                    teacher_logits = teacher.get(idx, batch)
+                # KD Loss (forward KL on the logits)
+                student_outputs = model(batch)
+                teacher_logits = teacher.get(idx, batch)
                 student_logits = student_outputs.logits if hasattr(student_outputs, "logits") else student_outputs
-
-                kl = kd_kl_loss(student_logits, teacher_logits, mask)
-                loss = kl
-                if feat_w > 0:
-                    feat = feature_loss(student_outputs.hidden_states, teacher_hidden, mask)
-                    loss = kl + feat_w * feat
-                    total_feat += feat.detach()
-                    del teacher_hidden
-                total_kl += kl.detach()
+                loss = kd_kl_loss(student_logits, teacher_logits, mask)
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
                 scheduler.step()
-                step += 1
 
                 total_train_loss += loss.detach()
 
             avg_train = total_train_loss / len(dataloader)
-            msg = f"Epoch {epoch} - Loss: {avg_train.item():.4f}"
-            if feat_w > 0:
-                msg += (f" (KL {(total_kl / len(dataloader)).item():.4f}, "
-                        f"feature {(total_feat / len(dataloader)).item():.4e} x {feat_w:g})")
-            print(msg + f" ({time.time() - t_epoch:.0f}s)")
-            if latent_mode:
-                print(format_flip_stats(latent_flip_stats(model), title=f"latent flips after epoch {epoch}"))
+            print(f"Epoch {epoch} - Loss: {avg_train.item():.4f} ({time.time() - t_epoch:.0f}s)")
             if eval_every_epoch:
                 model.eval()
                 with torch.no_grad():
                     ppl = evaluate_ppl_after_block(model, model_name=quant_config['model_id'], dev=dev)
-                model.train()
                 print(f"Epoch {epoch} - Test Data PPL = {ppl:.3f}")
+                model.train()
 
             if ck_key is not None:
                 cache.save(KD_KIND, ck_key, {
@@ -553,12 +429,9 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda", 
     # -------------------------------------------
     # 4) Cleanup
     # -------------------------------------------
-    del params_to_tune, scale_params, latent_params, optimizer, scheduler, dataloader, samples, teacher
+    del params_to_tune, optimizer, scheduler, dataloader, samples, teacher, tokenizer
     cleanup_memory(verbose=True)
-
-    if latent_mode:
-        print(format_flip_stats(latent_flip_stats(model), title="latent flips at KD end"))
-    _finish_kd(model, kd_mode)
+    _finish_kd(model)
 
     model.eval()
     return model

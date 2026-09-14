@@ -1,5 +1,4 @@
-"""Tests for spectral tempering, warm-started curvature collection / refresh, feature distillation and the
-pre-KD checkpoint override."""
+"""Tests for spectral tempering, warm-started curvature collection / refresh and the pre-KD checkpoint override."""
 
 from types import SimpleNamespace
 
@@ -7,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from nanoquant.core import admm_nq, compress_model, pipeline, teacher
+from nanoquant.core import admm_nq, compress_model, pipeline
 from nanoquant.core import curvature as cv
 from nanoquant.core import importance as imp
 from nanoquant.modules.linear import NanoQuantLinear
@@ -22,16 +21,14 @@ def _spd(n, seed, spread=100.0):
     return (Q * lam) @ Q.mT
 
 
-def test_temper_eigenvalues_preserves_trace_and_bounds_condition():
+def test_temper_eigenvalues_preserves_trace_and_halves_log_condition():
     lam = torch.logspace(-2, 2, 9, dtype=torch.float64)
     same = cv.temper_eigenvalues(lam)
     assert torch.allclose(same, lam)
     half = cv.temper_eigenvalues(lam, power=0.5)
     assert half.sum() == pytest.approx(lam.sum().item())
     assert half.max() / half.min() == pytest.approx((lam.max() / lam.min()).sqrt().item())
-    capped = cv.temper_eigenvalues(lam, cond_max=10.0)
-    assert capped.sum() == pytest.approx(lam.sum().item())
-    assert capped.max() / capped.min() == pytest.approx(10.0)
+    assert torch.equal(cv.temper_eigenvalues(lam, power=1.0), lam)
 
 
 def test_normalized_curvature_tempering():
@@ -43,8 +40,6 @@ def test_normalized_curvature_tempering():
     assert lam_t.max() / lam_t.min() == pytest.approx((lam.max() / lam.min()).sqrt().item(), rel=1e-3)
     assert Sigma_t.trace().item() == pytest.approx(Sigma.trace().item(), rel=1e-4)
     assert torch.allclose(Sigma_t, (Q_t * lam_t) @ Q_t.mT, atol=1e-4)
-    _, lam_c, _ = admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, cond_max=20.0)
-    assert lam_c.max() / lam_c.min() == pytest.approx(20.0, rel=1e-3)
 
 
 def test_factorize_accepts_tempering_and_changes_solution():
@@ -160,52 +155,13 @@ def test_refresh_block_curvature_skips_quantised_layers(monkeypatch):
     assert not model.training and not model.gc
 
 
-def test_feature_loss_relative_error():
-    hs = [torch.randn(1, 4, 3) for _ in range(3)]
-    mask = torch.ones(1, 4, dtype=torch.int)
-    assert compress_model.feature_loss(hs, hs, mask).item() == pytest.approx(0.0)
-    zeros = [torch.zeros_like(h) for h in hs]
-    assert compress_model.feature_loss(zeros, hs, mask).item() == pytest.approx(1.0)  # embedding entry skipped
-    mask2 = torch.tensor([[1, 1, 0, 0]])
-    doubled = [hs[0]] + [2 * h for h in hs[1:]]
-    assert compress_model.feature_loss(doubled, hs, mask2).item() == pytest.approx(1.0, rel=1e-5)
-
-
-class _TinyLM(nn.Module):
-    def __init__(self, vocab=11, d=6):
-        super().__init__()
-        self.emb = nn.Embedding(vocab, d)
-        self.head = nn.Linear(d, vocab)
-
-    def forward(self, ids, output_hidden_states=False):
-        h0 = self.emb(ids)
-        h1 = torch.tanh(h0)
-        out = SimpleNamespace(logits=self.head(h1))
-        if output_hidden_states:
-            out.hidden_states = (h0, h1)
-        return out
-
-
-def test_teacher_hidden_states_online_only():
-    model = _TinyLM()
-    samples = [torch.randint(0, 11, (1, 5))]
-    t = teacher.TeacherLogits("online", model, samples, "cpu")
-    logits, hidden = t.get(0, samples[0], hidden=True)
-    assert logits.shape == (1, 5, 11) and len(hidden) == 2 and hidden[1].shape == (1, 5, 6)
-    assert torch.allclose(logits, t.get(0, samples[0]))
-    t_ram = teacher.TeacherLogits("ram", model, samples, "cpu")
-    with pytest.raises(ValueError):
-        t_ram.get(0, samples[0], hidden=True)
-
-
 def test_validate_config_new_fields(tmp_path):
     pipeline.validate_config(NanoQuantConfig(model_id="t", curvature="kron", curvature_refresh_every=7))
-    pipeline.validate_config(NanoQuantConfig(model_id="t", model_kd_teacher="online", model_kd_feature_weight=1.0))
     ck = tmp_path / "pre.pt"
     ck.write_bytes(b"x")
     pipeline.validate_config(NanoQuantConfig(model_id="t", pre_kd_checkpoint=str(ck)))
     for bad in ({"curvature_refresh_every": 7}, {"curvature_refresh_every": -1, "curvature": "kron"},
-                {"model_kd_feature_weight": 1.0}, {"pre_kd_checkpoint": str(tmp_path / "missing.pt")}):
+                {"pre_kd_checkpoint": str(tmp_path / "missing.pt")}, {"admm_input_factor": "banana"}):
         with pytest.raises(ValueError):
             pipeline.validate_config(NanoQuantConfig(model_id="t", **bad))
 
@@ -222,9 +178,8 @@ def test_cache_keys_track_new_fields():
     k = C.admm_key(W, torch.rand(6), torch.rand(8), None, None, 4, base)
     assert k != C.admm_key(W, torch.rand(6), torch.rand(8), None, None, 4, cfg(admm_curvature_power=0.5))
     keys = C.chain_keys(base, 2)
-    for field, value in (("admm_curvature_power", 0.5), ("admm_curvature_cond_max", 10.0),
-                         ("curvature_refresh_every", 7), ("curvature_refresh_iters", 2)):
+    for field, value in (("admm_curvature_power", 0.5), ("curvature_refresh_every", 7),
+                         ("curvature_refresh_iters", 2)):
         assert keys[0] != C.chain_keys(cfg(**{field: value}), 2)[0], field
-    assert keys == C.chain_keys(cfg(model_kd_feature_weight=1.0, pre_kd_checkpoint="x.pt"), 2)
-    assert C.kd_key(base, 2) != C.kd_key(cfg(model_kd_feature_weight=1.0), 2)
+    assert keys == C.chain_keys(cfg(pre_kd_checkpoint="x.pt", model_kd_eval_every_epoch=True), 2)
     assert C.kd_key(base, 2) != C.kd_key(cfg(pre_kd_checkpoint="x.pt"), 2)

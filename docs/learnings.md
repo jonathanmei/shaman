@@ -1,10 +1,14 @@
 # Learnings: 1-bit NanoQuant on Qwen3, September 2026
 
-Branch `rank-allocation` is the distillation of the `latent-kd-kl-kron` and `kd-norms-fact-stab` experiments: it keeps
-the rank allocator (hand multipliers, measured probe, depth ramp, rank ceiling, parity/full budgets), the tail-block
-logit objective and the curvature machinery, drops the knobs that did not move perplexity, and ships one "best recipe"
-config per model size with a seed-1 twin. Full run tables are in `results.md`; the allocator is derived in
-`rank_allocation_note.html`.
+`main` (merge of `rank-allocation`, `measured-rank-alloc-cleanup` and `fresh-factor-sharing`, 2026-09-14) is the
+distillation of the `latent-kd-kl-kron` and `kd-norms-fact-stab` experiments. It keeps only the recipe: KL Kronecker
+factors, tempered ADMM (p = ½), the fresh input factor (shared across q/k/v and gate/up), periodic curvature refresh,
+the measured rank allocator (ADMM probe, depth ramp as the prior, parity/full budgets) and scale-only KD, and ships
+one "best recipe" config per model size with a seed-1 twin. Everything that did not move perplexity was removed from
+the code: the hand-multiplier allocator (type weights, rank ceiling), the tail-block logit objective, latent KD, the
+dense block loss and the spike/cond curvature knobs. Their last implementation is commit `26d8fd4`
+(`kd-norms-fact-stab`), which the ledger entries below reference. Full run tables are in `results.md`; the allocator
+is derived in `rank_allocation_note.html`.
 
 ## Best recipes (WikiText-2 PPL, 1.0 bpw target)
 
@@ -12,7 +16,8 @@ config per model size with a seed-1 twin. Full run tables are in `results.md`; t
 |---|---|---|---|---|---|
 | Qwen3-0.6B-Base | `configs/qwen3_0p6b_best.json` | KL factors, ADMM p = ½, fresh input factor, refresh/7, **measured ranks × ramp 0.6, parity** | 0.9728 | **22.96** | 27.56 |
 | Qwen3-1.7B-Base | `configs/qwen3_1p7b_best.json` | same recipe with measured × ramp ranks (not yet run; 16.72 with uniform ranks) | 0.9863 | – | 19.21 |
-| Qwen3-4B-Base | `configs/qwen3_4b_best.json` | KL factors, p = ½, fresh R, refresh/9, **hand-table ranks (ramp 0.6 + type weights), parity** | 0.9864 | **13.55** | 14.29 |
+| Qwen3-4B-Base | `configs/qwen3_4b_best.json` | same recipe, refresh/9, measured × ramp 0.6 ranks (probe 0.6/1.0/1.4; running as job 5663775 from `26d8fd4`) | 0.9864 | pending | 14.29 |
+| Qwen3-4B-Base | commit `26d8fd4`, `configs/qwen3_4b_kl_ra_both.json` | KL factors, p = ½, fresh R, refresh/9, **hand-table ranks (ramp 0.6 + type weights), parity**; recorded best, code removed | 0.9864 | **13.55** | 14.29 |
 
 Every recipe keeps the paper's protocol: 128 × 2048 WikiText-2 calibration samples, seed 0, 2 scales, 8/8/8 epochs,
 scale-only KD, and the same total bits as the uniform rank rule (parity).

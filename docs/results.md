@@ -548,3 +548,10 @@ Summary across sizes (WikiText-2 PPL, best arm per size, 1.0 bpw target): 0.6B *
 1.7B 16.72 (not yet rerun with rank allocation), 4B **13.55** (hand-table ranks). The ADMM fast path
 (branch `admm-fast-sylvester`, inexact Sylvester solve with early stopping) reproduces the 1.7B recipe at 16.67
 vs 16.72 (job 5627825), i.e. lossless, and is the natural way to buy back the time the larger late ranks cost.
+
+### Config names after the 2026-09-14 merge
+
+The recipe configs were consolidated into `configs/qwen3_{0p6b,1p7b,4b}_best.json` (+ `_best_seed1.json` twins).
+Runs logged above under `qwen3_0p6b_kl_ms_ramp_parity`, `qwen3_1p7b_kl_ms_ramp_parity` and
+`qwen3_4b_kl_ms_ramp_parity` (job 5663775) used byte-identical settings apart from `qmodel_path`; the 4B hand-table
+config `qwen3_4b_kl_ra_both.json` and every other screening config survive only in history at `26d8fd4`.

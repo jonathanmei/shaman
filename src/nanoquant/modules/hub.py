@@ -44,26 +44,18 @@ class NanoQuantConfigDataclass:
     # quant precision
     bits: float = 1.0
     rank_budget: str = "uniform"
-    rank_depth_ramp: float = 0.0
-    rank_type_weights: str = ""
-    rank_max_ratio: float = 1.0
-    # measured sensitivity for the non-uniform allocation: "none", "admm" or "svd"; probe grid and ADMM iterations
+    # measured sensitivity for the non-uniform allocation: "none", "admm" or "svd"; probe grid and ADMM iterations;
+    # depth prior (log-ratio last/first block) on the measured curves
     rank_sensitivity: str = "none"
     rank_probe_ranks: str = "0.5,1.0,1.5"
     rank_probe_iters: int = 50
+    rank_depth_ramp: float = 0.0
     # calib
     seed: int = 0
     num_calib_samples: int = 128
     calib_dataset: str = "wikitext2"
     calib_shrinkage: float = 0.4
     calib_strategy: str = "online"
-    block_loss: str = "diag"
-    # block-loss curvature conditioning (dense block loss only), see modules.quant_config
-    block_loss_cond_max: float = 0.0
-    block_loss_power: float = 1.0
-    block_loss_mix: float = 1.0
-    # block-loss curvature source: "nkp" (Kronecker output factor) or "plain" (unweighted gradient covariance)
-    block_loss_source: str = "nkp"
     # curvature estimate: "diag" (legacy per-feature second moments) or "kron" (nearest Kronecker product)
     curvature: str = "diag"
     # Kronecker fit: "frobenius" (nearest Kronecker product) or "kl" (matrix-normal MLE, KL-Shampoo)
@@ -96,8 +88,6 @@ class NanoQuantConfigDataclass:
     # input-side curvature handed to ADMM: "calib" (calibration-time) or "fresh" (measured before binarisation)
     admm_input_factor: str = "calib"
     admm_curvature_power: float = 1.0
-    admm_curvature_cond_max: float = 0.0
-    admm_curvature_spike_rank: int = 0
     curvature_refresh_every: int = 0
     curvature_refresh_iters: int = 1
     block_diagnostics: bool = False
@@ -108,20 +98,12 @@ class NanoQuantConfigDataclass:
     fact_bias_lr: float = 1e-5
     fact_batch_size: int = 1
     fact_epochs: int = 8
-    tail_logit_blocks: int = 0
-    tail_logit_mix: float = 1.0
-    # keep the continuous latent factors (frozen) after block tuning; required by model_kd_mode="scales_latent"
-    retain_latent: bool = False
-    # tune_model
+    # tune_model (scale-only KD)
     tune_model: bool = True
     model_kd_lr: float = 1e-5
-    model_kd_latent_lr: float = 1e-6
     model_kd_batch_size: int = 1
     model_kd_epochs: int = 8
-    model_kd_mode: str = "scales"
-    model_kd_latent_normalize: bool = False
     model_kd_eval_every_epoch: bool = False
-    model_kd_feature_weight: float = 0.0
     pre_kd_checkpoint: str = ""
     # teacher logits for KD: "ram" (legacy host cache), "disk" (memmap in cache_dir), "online" (recompute)
     model_kd_teacher: str = "ram"

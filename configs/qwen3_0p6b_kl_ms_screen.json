@@ -44,6 +44,7 @@
   "max_blocks": 4,
   "block_diagnostics": true,
   "rank_budget": "parity",
+  "rank_depth_ramp": 0.6,
   "rank_sensitivity": "admm",
   "rank_probe_ranks": "0.5,1.0,1.5",
   "rank_probe_iters": 50

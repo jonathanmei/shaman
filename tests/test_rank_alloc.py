@@ -1,4 +1,4 @@
-"""Tests for the non-uniform rank allocation (depth ramp, per-layer-type weights, bit-budget matching)."""
+"""Tests for the rank budget rule: the paper's uniform rule and the plumbing of the measured allocation knobs."""
 
 from types import SimpleNamespace
 
@@ -51,107 +51,46 @@ def _by_block(ranks):
     return out
 
 
-def _total_bits(model, ranks, num_scales=2):
-    tot = 0
-    for i, blk in enumerate(model.model.layers):
-        for name, lx in U.find_layers(blk).items():
-            tot += U.layer_bits(lx.in_features, lx.out_features, ranks[f"{i}.{name}"], num_scales)
-    return tot
-
-
-def test_defaults_reproduce_the_legacy_rule_exactly():
+def test_defaults_reproduce_the_uniform_rule_exactly():
     ranks = U.calculate_ranks(_model(), NAMES, _cfg())
     for blk in _by_block(ranks).values():
         assert blk == LEGACY
-    # parity mode without multipliers is also the legacy rule (the budget already matches)
-    assert U.calculate_ranks(_model(), NAMES, _cfg(rank_budget="parity")) == ranks
+    assert all(U.uniform_rank(1024, 2048, 1.0, 2) == 640 for _ in range(1))
+    assert U.rank_ceiling(3072, 1024) == 1024
+    acc = B.static_accounting(_model(2), NAMES, _cfg())
+    assert acc["factorized_bpw"] == pytest.approx(0.9729, abs=5e-4)
 
 
-def test_parse_type_weights():
-    assert U.parse_type_weights("") == {}
-    assert U.parse_type_weights("v_proj:1.2, down_proj:1.15,q_proj:0.9") == {"v_proj": 1.2, "down_proj": 1.15,
-                                                                            "q_proj": 0.9}
-    for bad in ("v_proj", "v_proj:x", "v_proj:0", "v_proj:-1"):
-        with pytest.raises(ValueError):
-            U.parse_type_weights(bad)
-
-
-def test_multipliers_require_a_non_uniform_budget():
+def test_non_uniform_budget_requires_a_measured_sensitivity():
     with pytest.raises(ValueError):
-        U.calculate_ranks(_model(), NAMES, _cfg(rank_depth_ramp=0.5))
+        U.calculate_ranks(_model(), NAMES, _cfg(rank_budget="parity"))
     with pytest.raises(ValueError):
-        U.calculate_ranks(_model(), NAMES, _cfg(rank_type_weights="v_proj:1.2"))
-    with pytest.raises(ValueError):  # a type that does not exist in the model
-        U.calculate_ranks(_model(), NAMES, _cfg(rank_budget="parity", rank_type_weights="banana:1.2"))
-
-
-def test_depth_ramp_moves_bits_to_late_blocks_at_parity():
-    model = _model(4)
-    legacy = U.calculate_ranks(model, NAMES, _cfg())
-    ranks = U.calculate_ranks(model, NAMES, _cfg(rank_budget="parity", rank_depth_ramp=0.6))
-    by_blk = _by_block(ranks)
-    first = sum(U.layer_bits(lx.in_features, lx.out_features, by_blk[0][n], 2)
-                for n, lx in U.find_layers(model.model.layers[0]).items())
-    last = sum(U.layer_bits(lx.in_features, lx.out_features, by_blk[3][n], 2)
-               for n, lx in U.find_layers(model.model.layers[3]).items())
-    assert last > first
-    assert all(r % 32 == 0 and r >= 32 for r in ranks.values())
-    # parity: the same total bits as the legacy rule, to within one 32-rank step of the widest layer
-    tot, tot_legacy = _total_bits(model, ranks), _total_bits(model, legacy)
-    assert tot <= tot_legacy
-    assert tot_legacy - tot <= 32 * (3072 + 1024)
-    assert ranks != legacy
-
-
-def test_type_weights_shift_rank_between_layer_types():
-    model = _model(2)
-    ranks = U.calculate_ranks(model, NAMES, _cfg(rank_budget="parity", rank_type_weights="down_proj:1.3,q_proj:0.7"))
-    blk = _by_block(ranks)[0]
-    assert blk["mlp.down_proj"] > LEGACY["mlp.down_proj"]
-    assert blk["self_attn.q_proj"] < LEGACY["self_attn.q_proj"]
-    assert blk["self_attn.k_proj"] == LEGACY["self_attn.k_proj"]  # untouched type keeps ~its share
-    assert all(r <= min(lx.in_features, lx.out_features) for (n, lx), r in
-               zip(U.find_layers(model.model.layers[0]).items(), [blk[n] for n in U.find_layers(model.model.layers[0])]))
-
-
-def test_full_budget_spends_the_rounding_remainder():
-    model = _model(3)
-    cfg = _cfg(rank_budget="full")
-    legacy = U.calculate_ranks(model, NAMES, _cfg())
-    ranks = U.calculate_ranks(model, NAMES, cfg)
-    weights = sum(lx.in_features * lx.out_features for blk in model.model.layers for lx in U.find_layers(blk).values())
-    tot, tot_legacy = _total_bits(model, ranks), _total_bits(model, legacy)
-    assert tot_legacy < tot <= weights  # 1.0 bpw target
-    assert weights - tot <= 32 * (3072 + 1024)
-    assert all(ranks[k] >= legacy[k] for k in ranks)
-    acc = B.static_accounting(model, NAMES, cfg)
-    assert acc["factorized_bpw"] == pytest.approx(tot / weights)
-    assert acc["factorized_bpw"] > 0.99
-
-
-def test_rank_max_ratio_lets_late_blocks_exceed_min_dim():
-    model = _model(8)
-    strong = _cfg(rank_budget="parity", rank_depth_ramp=1.2, rank_type_weights="down_proj:1.3,up_proj:1.2")
-    capped = U.calculate_ranks(model, NAMES, strong)
-    lifted = U.calculate_ranks(model, NAMES, dict(strong, rank_max_ratio=2.0))
-    last_capped, last_lifted = _by_block(capped)[7], _by_block(lifted)[7]
-    assert last_capped["mlp.down_proj"] == 1024 == last_capped["mlp.up_proj"]  # min(3072, 1024), the legacy cap
-    assert last_lifted["mlp.down_proj"] > 1024 and last_lifted["mlp.up_proj"] > 1024
-    assert max(lifted.values()) <= 2 * 1024
-    assert all(r % 32 == 0 for r in lifted.values())
-    assert abs(_total_bits(model, lifted) - _total_bits(model, capped)) <= 32 * (3072 + 1024)  # same parity target
-    # ratio 1.0 is the legacy cap exactly; ratios below 1 are rejected
-    assert U.calculate_ranks(model, NAMES, dict(strong, rank_max_ratio=1.0)) == capped
+        U.calculate_ranks(_model(), NAMES, _cfg(rank_budget="full"))
+    with pytest.raises(ValueError):  # the depth prior alone does not define an allocation
+        U.calculate_ranks(_model(), NAMES, _cfg(rank_depth_ramp=0.6))
     with pytest.raises(ValueError):
-        U.calculate_ranks(model, NAMES, dict(strong, rank_max_ratio=0.5))
-    # the uniform rule never reaches min(a, n), so the ratio does not change it
-    assert U.calculate_ranks(model, NAMES, _cfg(rank_max_ratio=2.0)) == U.calculate_ranks(model, NAMES, _cfg())
+        U.calculate_ranks(_model(), NAMES, _cfg(rank_budget="banana"))
+    with pytest.raises(ValueError):
+        U.calculate_ranks(_model(), NAMES, _cfg(rank_budget="parity", rank_sensitivity="banana"))
+
+
+def test_depth_multipliers_are_a_geometric_ramp():
+    shapes = {f"{b}.x": (8, 8) for b in range(4)}
+    flat = U.depth_multipliers(shapes, 4, 0.0)
+    assert all(v == pytest.approx(1.0) for v in flat.values())
+    ramp = U.depth_multipliers(shapes, 4, 0.6)
+    assert ramp["3.x"] / ramp["0.x"] == pytest.approx(pytest.approx(2.718281828 ** 0.6))
+    assert ramp["1.x"] < ramp["2.x"]
+    assert U.depth_multipliers({"0.x": (8, 8)}, 1, 0.6) == {"0.x": 1.0}
 
 
 def test_config_plumbing_and_cache_keys():
     cfg = NanoQuantConfig(model_id="t")
-    assert cfg["rank_budget"] == "uniform" and cfg["rank_depth_ramp"] == 0.0 and cfg["rank_type_weights"] == ""
-    assert cfg["rank_max_ratio"] == 1.0
+    assert cfg["rank_budget"] == "uniform" and cfg["rank_sensitivity"] == "none" and cfg["rank_depth_ramp"] == 0.0
+    assert cfg["rank_probe_ranks"] == "0.5,1.0,1.5" and cfg["rank_probe_iters"] == 50
+    for gone in ("rank_type_weights", "rank_max_ratio", "block_loss", "tail_logit_blocks", "retain_latent",
+                 "model_kd_mode", "model_kd_feature_weight", "admm_curvature_spike_rank"):
+        assert gone not in cfg
     base = NanoQuantConfig(model_id="tiny/model", num_calib_samples=4, seqlen=16)
 
     def over(**kw):
@@ -159,13 +98,12 @@ def test_config_plumbing_and_cache_keys():
         c.update(kw)
         return c
 
-    for field, value in (("rank_budget", "full"), ("rank_depth_ramp", 0.5), ("rank_type_weights", "v_proj:1.2"),
-                         ("rank_max_ratio", 2.0)):
+    for field, value in (("rank_budget", "full"), ("rank_depth_ramp", 0.5), ("rank_sensitivity", "admm"),
+                         ("rank_probe_ranks", "0.75,1.25"), ("rank_probe_iters", 10)):
         assert C.chain_keys(base, 2)[0] != C.chain_keys(over(**{field: value}), 2)[0], field
-    pipeline.validate_config(over(rank_budget="parity", rank_depth_ramp=0.5, rank_type_weights="v_proj:1.2",
-                                  rank_max_ratio=2.0))
-    for bad in ({"rank_budget": "banana"}, {"rank_depth_ramp": 0.5}, {"rank_type_weights": "v_proj:x",
-                                                                       "rank_budget": "parity"},
-                {"rank_max_ratio": 0.9}):
+    pipeline.validate_config(over(rank_budget="parity", rank_sensitivity="admm", rank_depth_ramp=0.6))
+    pipeline.validate_config(over(rank_budget="full", rank_sensitivity="svd"))
+    for bad in ({"rank_budget": "banana"}, {"rank_depth_ramp": 0.5}, {"rank_budget": "parity"},
+                {"rank_sensitivity": "admm"}, {"rank_budget": "parity", "rank_sensitivity": "banana"}):
         with pytest.raises(ValueError):
             pipeline.validate_config(over(**bad))

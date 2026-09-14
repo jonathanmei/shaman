@@ -1,12 +1,10 @@
-"""Tests for the estimator × structure × tempering grid: spike-plus-flat projection, the KL-Shampoo Kronecker fit
-and their configuration keys."""
+"""Tests for the KL-Shampoo Kronecker fit and its configuration keys."""
 
 import pytest
 import torch
 from torch import nn
 
-from nanoquant.core import admm_nq, pipeline
-from nanoquant.core import curvature as cv
+from nanoquant.core import pipeline
 from nanoquant.core import importance as imp
 from nanoquant.modules.quant_config import NanoQuantConfig
 from nanoquant.utils import cache as C
@@ -30,31 +28,6 @@ def _fake_loop(dataloader, model, dev, model_offload, use_truefisher):
         loss = model(inp).square().mean()
         loss.backward()
         model.zero_grad(set_to_none=True)
-
-
-# ---------------------------------------------------------------- spike-plus-flat projection
-def test_spike_flat_projection_keeps_spikes_and_flattens_tail():
-    lam = torch.tensor([100.0, 50.0, 3.0, 2.0, 1.0, 0.5])
-    out = cv.spike_flat_eigenvalues(lam, 2)
-    assert torch.allclose(out[:2], lam[:2])
-    assert torch.allclose(out[2:], torch.full((4,), lam[2:].mean().item()))
-    assert out.sum() == pytest.approx(lam.sum().item())
-    assert torch.equal(cv.spike_flat_eigenvalues(lam, 0), lam) and torch.equal(cv.spike_flat_eigenvalues(lam, 6), lam)
-    shuffled = lam[torch.tensor([3, 0, 5, 1, 4, 2])]  # order-independent
-    out_s = cv.spike_flat_eigenvalues(shuffled, 2)
-    assert out_s[1] == 100.0 and out_s[3] == 50.0
-    assert torch.allclose(out_s[[0, 2, 4, 5]], torch.full((4,), 1.625))
-
-
-def test_temper_projection_then_power():
-    lam = torch.tensor([100.0, 50.0, 3.0, 2.0, 1.0, 0.5], dtype=torch.float64)
-    out = cv.temper_eigenvalues(lam, power=0.5, spike_rank=2)
-    ref = cv.spike_flat_eigenvalues(lam, 2).sqrt()
-    ref = ref * lam.sum() / ref.sum()
-    assert torch.allclose(out, ref)
-    cov = _spd(6, 4, 1e4)
-    _, lam_t, _ = admm_nq._normalized_curvature(cov, cov.diagonal().sqrt(), torch.float64, 1e-12, spike_rank=2)
-    assert torch.unique(torch.round(lam_t, decimals=5)).numel() == 3  # two spikes + one flat value
 
 
 # ---------------------------------------------------------------- KL-Shampoo fit
@@ -144,11 +117,7 @@ def test_grid_config_keys():
         return c
 
     assert C.stats_key(base) != C.stats_key(cfg(kron_fit="kl"))
-    assert C.chain_keys(base, 2)[0] != C.chain_keys(cfg(admm_curvature_spike_rank=64), 2)[0]
-    W = torch.randn(8, 6)
-    assert C.admm_key(W, torch.rand(6), torch.rand(8), None, None, 4, base) != \
-        C.admm_key(W, torch.rand(6), torch.rand(8), None, None, 4, cfg(admm_curvature_spike_rank=64))
-    pipeline.validate_config(cfg(curvature="kron", kron_fit="kl", admm_curvature_spike_rank=64))
-    for bad in ({"kron_fit": "banana"}, {"admm_curvature_spike_rank": -1}):
-        with pytest.raises(ValueError):
-            pipeline.validate_config(cfg(**bad))
+    assert C.chain_keys(base, 2)[0] != C.chain_keys(cfg(kron_fit="kl"), 2)[0]  # through the calibration key
+    pipeline.validate_config(cfg(curvature="kron", kron_fit="kl", admm_curvature_power=0.5))
+    with pytest.raises(ValueError):
+        pipeline.validate_config(cfg(kron_fit="banana"))

@@ -40,25 +40,20 @@ STATS_FIELDS: tuple[str, ...] = ("model_id", "seqlen", "calib_dataset", "num_cal
                                  "curvature", "kron_fit", "kron_nkp_iters")
 ADMM_FIELDS: tuple[str, ...] = ("admm_type", "admm_outer_iters", "admm_inner_iters", "admm_reg",
                                 "admm_penalty_scheduler", "admm_mid_scale", "kron_eigh_dtype", "seed",
-                                "admm_curvature_power", "admm_curvature_cond_max", "admm_curvature_spike_rank")
+                                "admm_curvature_power")
 # ``max_blocks`` and ``block_diagnostics`` are deliberately absent: a truncated screening run and a run with extra
 # logging share their per-block checkpoints with the plain full chain.
-BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits", "rank_budget", "rank_depth_ramp",
-                                 "rank_type_weights", "rank_max_ratio", "rank_sensitivity", "rank_probe_ranks",
-                                 "rank_probe_iters") + ADMM_FIELDS + (
-    "admm_input_factor", "curvature_refresh_every", "curvature_refresh_iters", "tail_logit_blocks", "tail_logit_mix",
-    "block_loss", "block_loss_source", "block_loss_cond_max", "block_loss_power", "block_loss_mix",
+BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits", "rank_budget", "rank_depth_ramp", "rank_sensitivity",
+                                 "rank_probe_ranks", "rank_probe_iters") + ADMM_FIELDS + (
+    "admm_input_factor", "curvature_refresh_every", "curvature_refresh_iters",
     "tune_nonfact", "nonfact_lr", "nonfact_batch_size", "nonfact_epochs", "tune_fact", "fact_binary_lr",
-    "fact_scale_lr", "fact_bias_lr", "fact_batch_size", "fact_epochs", "retain_latent")
-KD_FIELDS: tuple[str, ...] = ("model_kd_lr", "model_kd_latent_lr", "model_kd_batch_size", "model_kd_epochs",
-                              "model_kd_mode", "model_kd_latent_normalize", "model_kd_feature_weight",
-                              "pre_kd_checkpoint")
+    "fact_scale_lr", "fact_bias_lr", "fact_batch_size", "fact_epochs")
+KD_FIELDS: tuple[str, ...] = ("model_kd_lr", "model_kd_batch_size", "model_kd_epochs", "pre_kd_checkpoint")
 TEACHER_FIELDS: tuple[str, ...] = ("model_id", "seqlen", "calib_dataset", "num_calib_samples", "seed")
 # the calibration-time rank-sensitivity probe: everything the short ADMM solves and their curvature-weighted
 # errors depend on (not the production iteration count or the eigh precision: the probe fixes its own)
 PROBE_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits", "seed", "admm_type", "admm_inner_iters", "admm_reg",
                                  "admm_penalty_scheduler", "admm_mid_scale", "admm_curvature_power",
-                                 "admm_curvature_cond_max", "admm_curvature_spike_rank", "rank_max_ratio",
                                  "rank_sensitivity", "rank_probe_ranks", "rank_probe_iters")
 
 # source files whose algorithm determines each stage's output (relative to the ``nanoquant`` package)
@@ -66,8 +61,8 @@ SOURCE_GROUPS: dict[str, tuple[str, ...]] = {
     "stats": ("core/importance.py",),
     "admm": ("core/admm_nq.py", "core/admm_dbf.py", "core/compress_block.py", "core/curvature.py"),
     "blocks": ("core/admm_nq.py", "core/admm_dbf.py", "core/compress_block.py", "core/compress_model.py",
-               "modules/linear.py", "core/curvature.py", "core/tail.py", "core/rank_probe.py"),
-    "kd": ("core/compress_model.py", "core/teacher.py", "core/tail.py"),
+               "modules/linear.py", "core/curvature.py", "core/rank_probe.py"),
+    "kd": ("core/compress_model.py", "core/teacher.py", "core/kd_loss.py"),
     "curvature": ("core/curvature.py",),
     "rank_probe": ("core/rank_probe.py", "core/admm_nq.py", "core/curvature.py", "core/compress_block.py"),
 }

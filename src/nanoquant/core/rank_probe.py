@@ -24,13 +24,13 @@ from torch import nn
 
 from ..utils.utils import (
     RANK_STEP,
-    _rank_ceiling,
     cleanup_memory,
     find_layers,
     fit_power_law,
     get_decoder_layers,
     has_mid_scale,
     parse_probe_ranks,
+    rank_ceiling,
     set_seed,
     uniform_rank,
 )
@@ -43,9 +43,8 @@ PROBE_KIND = "rank_probe"
 PROBE_EIGH_DTYPE = torch.float32
 
 
-def candidate_ranks(legacy_rank: int, in_features: int, out_features: int, multipliers: list[float],
-                    max_ratio: float) -> list[int]:
-    """Probe ranks: ``multipliers`` times the uniform rank, floored to the 32-grid, clamped to ``[32, ceiling]``.
+def candidate_ranks(legacy_rank: int, in_features: int, out_features: int, multipliers: list[float]) -> list[int]:
+    """Probe ranks: ``multipliers`` times the uniform rank, floored to the 32-grid, clamped to ``[32, min(in, out)]``.
 
     Parameters
     ----------
@@ -55,15 +54,13 @@ def candidate_ranks(legacy_rank: int, in_features: int, out_features: int, multi
         Layer shape.
     multipliers : list of float
         Multiples of the uniform rank to probe.
-    max_ratio : float
-        Rank ceiling as a multiple of ``min(in, out)``.
 
     Returns
     -------
     list of int
         Sorted, de-duplicated candidate ranks.
     """
-    hi = _rank_ceiling(in_features, out_features, max_ratio)
+    hi = rank_ceiling(in_features, out_features)
     out = set()
     for m in multipliers:
         r = (int(legacy_rank * m) // RANK_STEP) * RANK_STEP
@@ -167,9 +164,7 @@ def probe_layer(lx: nn.Linear, ranks: list[int], quant_config: dict, dev: str) -
             is_transpose=is_transpose, rho_scheduler=quant_config.get("admm_penalty_scheduler", "linear"),
             print_admm_steps=False, i_cov=i_cov, o_cov=o_cov, eigh_dtype=PROBE_EIGH_DTYPE,
             mid_scale=has_mid_scale(quant_config),
-            curvature_power=float(quant_config.get("admm_curvature_power", 1.0)),
-            curvature_cond_max=float(quant_config.get("admm_curvature_cond_max", 0.0) or 0.0),
-            curvature_spike_rank=int(quant_config.get("admm_curvature_spike_rank", 0) or 0))
+            curvature_power=float(quant_config.get("admm_curvature_power", 1.0)))
         W_hat = deployed_matrix(res)
         out[r] = max(mahalanobis_weight_error(W, W_hat, L, R), 1e-30)
         del res, W_hat
@@ -188,8 +183,8 @@ def measure_sensitivity(model, layers_to_factorize, quant_config: dict, dev: str
     layers_to_factorize : iterable of str
         Sub-layer names within each decoder block.
     quant_config : dict
-        Quantisation configuration (``bits``, ``rank_probe_ranks``, ``rank_probe_iters``, ``rank_max_ratio``,
-        ``rank_sensitivity``, ADMM settings).
+        Quantisation configuration (``bits``, ``rank_probe_ranks``, ``rank_probe_iters``, ``rank_sensitivity``,
+        ADMM settings).
     dev : str
         Compute device.
 
@@ -201,7 +196,6 @@ def measure_sensitivity(model, layers_to_factorize, quant_config: dict, dev: str
     """
     method = quant_config.get("rank_sensitivity", "none") or "none"
     multipliers = parse_probe_ranks(quant_config.get("rank_probe_ranks", "0.5,1.0,1.5") or "0.5,1.0,1.5")
-    max_ratio = float(quant_config.get("rank_max_ratio", 1.0) or 1.0)
     num_scales = 3 if has_mid_scale(quant_config) else 2
     bits = quant_config["bits"]
     probes: dict[str, dict[int, float]] = {}
@@ -217,7 +211,7 @@ def measure_sensitivity(model, layers_to_factorize, quant_config: dict, dev: str
                 continue
             lx = subset[name]
             a, b = lx.in_features, lx.out_features
-            ranks = candidate_ranks(uniform_rank(a, b, bits, num_scales), a, b, multipliers, max_ratio)
+            ranks = candidate_ranks(uniform_rank(a, b, bits, num_scales), a, b, multipliers)
             key = f"{i}.{name}"
             probes[key] = probe_layer(lx, ranks, quant_config, dev)
             curves[key] = fit_power_law(probes[key])
