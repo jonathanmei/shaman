@@ -157,6 +157,16 @@ class TuneArguments:
     )
     admm_curvature_power: float = field(
         default=1.0, metadata={"help": "ADMM: raise the eigenvalues of the dense curvature factors to this power (1 = off)"})
+    admm_curvature_spike_rank: int = field(
+        default=0, metadata={"help": "ADMM: keep this many largest eigenvalues of each dense factor exactly and "
+                                     "replace the rest (two-sided spike-plus-flat projection; 0 = off)"})
+    admm_curvature_dip_rank: int = field(
+        default=0, metadata={"help": "ADMM: keep this many smallest eigenvalues exactly (spikes of the inverse "
+                                     "factor; 0 = off)"})
+    admm_curvature_flat_mean: str = field(
+        default="am", metadata={"help": "ADMM: shared value of the replaced eigenvalues: arithmetic (forward KL "
+                                        "fit), geometric or harmonic (inverse fit) mean",
+                                "choices": ["am", "gm", "hm"]})
     curvature_refresh_every: int = field(
         default=0, metadata={"help": ">0: every N blocks re-estimate the curvature of the remaining layers on the "
                                      "quantised prefix (curvature=kron)"})
@@ -287,6 +297,9 @@ def main():
         admm_mid_scale=tune_args.admm_mid_scale,
         admm_input_factor=tune_args.admm_input_factor,
         admm_curvature_power=tune_args.admm_curvature_power,
+        admm_curvature_spike_rank=tune_args.admm_curvature_spike_rank,
+        admm_curvature_dip_rank=tune_args.admm_curvature_dip_rank,
+        admm_curvature_flat_mean=tune_args.admm_curvature_flat_mean,
         curvature_refresh_every=tune_args.curvature_refresh_every,
         curvature_refresh_iters=tune_args.curvature_refresh_iters,
         block_diagnostics=tune_args.block_diagnostics,

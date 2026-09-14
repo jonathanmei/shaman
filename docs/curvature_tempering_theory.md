@@ -64,6 +64,28 @@ but the spectral projection transfers directly: keep the top-$r$ eigenpairs, rep
 (`admm_curvature_spike_rank`). It leaves the well-estimated spikes intact and denoises the bulk, a different
 regulariser from tempering, which compresses spikes and bulk alike.
 
+### Modelling the inverse instead (2026-09-14)
+
+Writing the *inverse* factor as low-rank plus identity, $\hat R^{-1} = \nu I + V T V^\top$, describes the same set
+of matrices: the family "$r$ free eigenvalues plus one shared eigenvalue on the complement" is closed under inversion
+(and under powers, so tempering commutes with it). Parametrising the inverse therefore changes three things, not the
+capacity. (a) *Which directions are exact*: the spikes of $\hat R^{-1}$ are the smallest eigenvalues of $R$, the
+cheap directions into which ADMM pushes its residual, whereas the forward model keeps the expensive ones. (b) *The
+shared value*: fitting the precision, i.e. the reverse divergence $\mathrm{KL}(\mathcal N(0,\hat R)\,\|\,\mathcal N(0,F))$
+with objective $\operatorname{tr}(F^{-1}\hat R) - \log\det \hat R$, makes the optimal shared value the **harmonic
+mean** of the replaced eigenvalues and the gap $\tfrac{m(n-r)}{2}\log\frac{\mathrm{GM}}{\mathrm{HM}}$; the forward
+M-projection gives the arithmetic mean and $\log\frac{\mathrm{AM}}{\mathrm{GM}}$. The forward fit is punished by
+large eigenvalues it drops, the inverse fit by tiny ones. (c) *Cost*: identical; both remove the $n\times n$ eigh
+and make the Sylvester step $O(nrk)$. Two consequences for the metric: underestimating a direction's curvature
+lets the fit dump error somewhere expensive (unbounded), overestimating wastes a cheap sink (bounded), so the
+harmonic mean is the risky side; and `calib_shrinkage` already lifts every eigenvalue by the same amount, which makes
+the bottom of the shrunk spectrum a near-degenerate plateau, so on shrunk factors the inverse projection spends its
+$r$ exact directions on an arbitrary subset of that plateau. The estimator side is where the inverse model is
+natural: the KL-Shampoo leverage weights $x^\top R^{-1} x$ are dominated by exactly its spikes. Both one-sided
+models are corners of a two-sided projection (top `spike_rank` and bottom `dip_rank` exact,
+`admm_curvature_flat_mean` for the middle); the screen in `results.md` (2026-09-14) tests the corners and the
+two-sided form on shrunk and unshrunk factors.
+
 ## The grid and what it showed (results.md, 2026-09-08)
 
 Estimator {Frobenius NKP, KL} × structure {full, spike-plus-flat, $r = 64$} × tempering {$p = 1$, $p = 1/2$} on the

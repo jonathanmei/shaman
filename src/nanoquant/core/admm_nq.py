@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .curvature import temper_eigenvalues
+from .curvature import IDENTITY_SPECTRUM, SpectrumSpec
 
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -177,8 +177,8 @@ class EigCache:
     q/k/v or gate/up).
 
     Only tensors registered with :meth:`register` are cached, so per-layer factors never pile up in memory. Entries
-    are keyed by the tensor's storage pointer, shape and the tempering power; the registered tensor is held alive
-    so its pointer cannot be recycled while the entry exists.
+    are keyed by the tensor's storage pointer, shape and the spectrum conditioning (:class:`SpectrumSpec`); the
+    registered tensor is held alive so its pointer cannot be recycled while the entry exists.
     """
 
     def __init__(self) -> None:
@@ -198,37 +198,42 @@ class EigCache:
         self._entries.clear()
 
     @staticmethod
-    def _key(cov: torch.Tensor, power: float, eigh_dtype: torch.dtype) -> tuple:
-        return (cov.data_ptr(), tuple(cov.shape), str(cov.device), float(power), str(eigh_dtype))
+    def _key(cov: torch.Tensor, spectrum: SpectrumSpec, eigh_dtype: torch.dtype) -> tuple:
+        return (cov.data_ptr(), tuple(cov.shape), str(cov.device), spectrum, str(eigh_dtype))
 
-    def get(self, cov: torch.Tensor, power: float,
+    def get(self, cov: torch.Tensor, spectrum: SpectrumSpec,
             eigh_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Cached ``(Sigma, lam, Q)`` of a registered ``cov`` under these knobs, else ``None``."""
         if cov.data_ptr() not in self._shared:
             return None
-        return self._entries.get(self._key(cov, power, eigh_dtype))
+        return self._entries.get(self._key(cov, spectrum, eigh_dtype))
 
-    def put(self, cov: torch.Tensor, power: float, eigh_dtype: torch.dtype,
+    def put(self, cov: torch.Tensor, spectrum: SpectrumSpec, eigh_dtype: torch.dtype,
             value: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> None:
         """Store ``value`` for a registered ``cov``; a no-op for unregistered tensors."""
         if cov.data_ptr() in self._shared:
-            self._entries[self._key(cov, power, eigh_dtype)] = value
+            self._entries[self._key(cov, spectrum, eigh_dtype)] = value
 
 
 @torch.no_grad()
 def _normalized_curvature(cov: torch.Tensor, norm_vec: torch.Tensor, eigh_dtype: torch.dtype, eps: float,
-                          power: float = 1.0,
-                          eig_cache: EigCache | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                          spectrum: SpectrumSpec = IDENTITY_SPECTRUM, eig_cache: EigCache | None = None,
+                          diagnostics: dict | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Unit-diagonal curvature factor ``D^-1/2 cov D^-1/2`` (with ``D = norm_vec^2``) and its eigendecomposition.
 
-    With ``power != 1`` the spectrum is tempered (:func:`temper_eigenvalues`, trace preserved) and ``Sigma`` is
-    rebuilt from the new eigenvalues, so the data term trusts the dominant directions less.
+    Unless ``spectrum`` is the identity, the eigenvalues are projected / tempered (:meth:`SpectrumSpec.apply`, trace
+    preserved) and ``Sigma`` is rebuilt from them.
 
     Parameters
     ----------
+    spectrum : SpectrumSpec
+        Spectral conditioning (tempering power, two-sided spike-plus-flat projection).
     eig_cache : EigCache, optional
         Cache consulted and filled for factors registered as shared (``norm_vec`` must be the diagonal of ``cov``
         for the cached result to be the right one, which holds for the fresh input factor).
+    diagnostics : dict, optional
+        Filled with :func:`nanoquant.core.curvature.projection_gaps` of the raw spectrum (left untouched on a cache
+        hit).
 
     Returns
     -------
@@ -236,7 +241,7 @@ def _normalized_curvature(cov: torch.Tensor, norm_vec: torch.Tensor, eigh_dtype:
         ``(Sigma, lam, Q)`` in fp32 with eigenvalues clamped at ``eps``.
     """
     if eig_cache is not None:
-        hit = eig_cache.get(cov, power, eigh_dtype)
+        hit = eig_cache.get(cov, spectrum, eigh_dtype)
         if hit is not None:
             return hit
     n = norm_vec.reshape(-1).to(torch.float32)
@@ -245,12 +250,14 @@ def _normalized_curvature(cov: torch.Tensor, norm_vec: torch.Tensor, eigh_dtype:
     lam, Q = torch.linalg.eigh(Sigma.to(eigh_dtype))
     lam = lam.to(torch.float32).clamp(min=eps)
     Q = Q.to(torch.float32)
-    if power != 1.0:
-        lam = temper_eigenvalues(lam, power=power).clamp(min=eps)
+    if diagnostics is not None:
+        diagnostics.update(spectrum.gaps(lam))
+    if not spectrum.is_identity:
+        lam = spectrum.apply(lam).clamp(min=eps)
         Sigma = (Q * lam) @ Q.mT
         Sigma = 0.5 * (Sigma + Sigma.mT)
     if eig_cache is not None:
-        eig_cache.put(cov, power, eigh_dtype, (Sigma, lam, Q))
+        eig_cache.put(cov, spectrum, eigh_dtype, (Sigma, lam, Q))
     return Sigma, lam, Q
 
 
@@ -271,8 +278,9 @@ def factorize_admm_nanoquant(
     o_cov: torch.Tensor | None = None,
     eigh_dtype: torch.dtype = torch.float64,
     mid_scale: bool = False,
-    curvature_power: float = 1.0,
+    spectrum: SpectrumSpec = IDENTITY_SPECTRUM,
     eig_cache: EigCache | None = None,
+    diagnostics: dict | None = None,
 ):
     """
     Decomposes the weight matrix W into two binary matrices A and B using ADMM.
@@ -303,16 +311,21 @@ def factorize_admm_nanoquant(
                rho penalty and the SVID projection stay Euclidean.
         eigh_dtype: Precision of the eigendecompositions used by the Mahalanobis solver.
         mid_scale: Export an explicit per-rank ``scale_mid`` (see above).
-        curvature_power: Spectral tempering of the unit-diagonal factors L, R (eigenvalues raised to this power,
-               trace preserved; ``core.curvature.temper_eigenvalues``); 1 leaves them untouched.
+        spectrum: Spectral conditioning of the unit-diagonal factors L, R (tempering power and two-sided
+               spike-plus-flat projection, trace preserved; ``core.curvature.SpectrumSpec``); the default leaves
+               them untouched.
         eig_cache: Cache of normalised eigendecompositions for curvature factors shared by several layers
                (see :class:`EigCache`); factors not registered there are never cached.
+        diagnostics: Optional dict filled with the projection gaps of the raw ``L`` and ``R`` spectra
+               (``core.curvature.projection_gaps``), keyed ``"L"`` / ``"R"`` in the orientation of ``W``.
     """
     if is_transpose:
         results = factorize_admm_nanoquant(W.mT, o_norm, i_norm, mid_rank, outer_iters, inner_iters, reg, False, eps,
                                            rho_scheduler, print_admm_steps, i_cov=o_cov, o_cov=i_cov,
                                            eigh_dtype=eigh_dtype, mid_scale=mid_scale,
-                                           curvature_power=curvature_power, eig_cache=eig_cache)
+                                           spectrum=spectrum, eig_cache=eig_cache, diagnostics=diagnostics)
+        if diagnostics is not None and {"L", "R"} <= set(diagnostics):
+            diagnostics["L"], diagnostics["R"] = diagnostics["R"], diagnostics["L"]
         swapped = {
             "W_final": results["W_final"].mT,
             "A": results["B"],
@@ -336,10 +349,14 @@ def factorize_admm_nanoquant(
     # Optional dense curvature -> Mahalanobis data term
     use_maha = i_cov is not None and o_cov is not None
     if use_maha:
-        Lt, lam_L, Q_L = _normalized_curvature(o_cov.to(device), norm_o, eigh_dtype, eps, curvature_power,
-                                               eig_cache=eig_cache)  # (out, out)
-        Rt, lam_R, Q_R = _normalized_curvature(i_cov.to(device), norm_i, eigh_dtype, eps, curvature_power,
-                                               eig_cache=eig_cache)  # (in, in)
+        diag_L = {} if diagnostics is not None else None
+        diag_R = {} if diagnostics is not None else None
+        Lt, lam_L, Q_L = _normalized_curvature(o_cov.to(device), norm_o, eigh_dtype, eps, spectrum,
+                                               eig_cache=eig_cache, diagnostics=diag_L)  # (out, out)
+        Rt, lam_R, Q_R = _normalized_curvature(i_cov.to(device), norm_i, eigh_dtype, eps, spectrum,
+                                               eig_cache=eig_cache, diagnostics=diag_R)  # (in, in)
+        if diagnostics is not None:
+            diagnostics["L"], diagnostics["R"] = diag_L, diag_R
         W_norm32 = W_norm.to(torch.float32)
         P = Lt @ W_norm32 @ Rt  # curvature-weighted target, (out, in)
         if print_admm_steps:

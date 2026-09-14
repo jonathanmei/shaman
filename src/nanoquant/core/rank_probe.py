@@ -36,6 +36,7 @@ from ..utils.utils import (
 )
 from .admm_nq import factorize_admm_nanoquant
 from .compress_block import mahalanobis_weight_error
+from .curvature import SpectrumSpec
 
 PROBE_KIND = "rank_probe"
 # eigendecompositions inside the probe's ADMM: single precision is enough for a sensitivity ranking and is the
@@ -164,7 +165,7 @@ def probe_layer(lx: nn.Linear, ranks: list[int], quant_config: dict, dev: str) -
             is_transpose=is_transpose, rho_scheduler=quant_config.get("admm_penalty_scheduler", "linear"),
             print_admm_steps=False, i_cov=i_cov, o_cov=o_cov, eigh_dtype=PROBE_EIGH_DTYPE,
             mid_scale=has_mid_scale(quant_config),
-            curvature_power=float(quant_config.get("admm_curvature_power", 1.0)))
+            spectrum=SpectrumSpec.from_config(quant_config))
         W_hat = deployed_matrix(res)
         out[r] = max(mahalanobis_weight_error(W, W_hat, L, R), 1e-30)
         del res, W_hat

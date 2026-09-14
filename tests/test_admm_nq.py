@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from nanoquant.core import admm_nq
+from nanoquant.core.curvature import SpectrumSpec
 from nanoquant.modules.quant_config import NanoQuantConfig
 from nanoquant.utils import utils as nq_utils
 
@@ -290,7 +291,8 @@ def test_normalized_curvature_eig_cache_hits_same_matrix(monkeypatch):
     second = admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, eig_cache=cache)
     assert calls["n"] == 2 and len(cache) == 1
     assert all(torch.equal(a, b) for a, b in zip(first, second))
-    admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, power=0.5, eig_cache=cache)  # other conditioning
+    admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, spectrum=SpectrumSpec(power=0.5),
+                                  eig_cache=cache)  # other conditioning
     assert calls["n"] == 3 and len(cache) == 2
     admm_nq._normalized_curvature(cov.clone(), norm, torch.float64, 1e-12, eig_cache=cache)  # other tensor
     assert calls["n"] == 4 and len(cache) == 2

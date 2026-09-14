@@ -58,6 +58,13 @@ def NanoQuantConfig(
     # spectral tempering of ADMM's unit-diagonal dense factors: eigenvalues raised to this power (1 = off; 0.5 = the
     # square-root metric, see docs/curvature_tempering_theory.md)
     admm_curvature_power: float = 1.0,
+    # two-sided spike-plus-flat projection of the same factors: keep the `spike_rank` largest and `dip_rank` smallest
+    # eigenvalues exactly, replace the middle by its arithmetic / geometric / harmonic mean ("am" | "gm" | "hm");
+    # spike-only = Pro-KLShampoo's low-rank + identity model of the factor, dip-only + "hm" = the same model of its
+    # inverse (both 0 = off)
+    admm_curvature_spike_rank: int = 0,
+    admm_curvature_dip_rank: int = 0,
+    admm_curvature_flat_mean: str = "am",
     # >0: every N blocks re-estimate the curvature of the remaining layers on the quantised prefix (kron only)
     curvature_refresh_every: int = 0,
     curvature_refresh_iters: int = 1,
@@ -125,6 +132,9 @@ def NanoQuantConfig(
         "admm_mid_scale": admm_mid_scale,
         "admm_input_factor": admm_input_factor,
         "admm_curvature_power": admm_curvature_power,
+        "admm_curvature_spike_rank": admm_curvature_spike_rank,
+        "admm_curvature_dip_rank": admm_curvature_dip_rank,
+        "admm_curvature_flat_mean": admm_curvature_flat_mean,
         "curvature_refresh_every": curvature_refresh_every,
         "curvature_refresh_iters": curvature_refresh_iters,
         "block_diagnostics": block_diagnostics,

@@ -27,6 +27,7 @@ from ..utils.utils import (
     parse_probe_ranks,
 )
 from .compress_model import compress_block_recon, compress_model_recon
+from .curvature import SpectrumSpec
 from .importance import (
     CURVATURE_TYPES,
     KRON_FITS,
@@ -79,6 +80,7 @@ def validate_config(quant_config: dict) -> None:
         raise ValueError(f"Unknown kron_fit: {quant_config.get('kron_fit')}")
     if quant_config.get("admm_input_factor", "calib") not in ADMM_INPUT_FACTORS:
         raise ValueError(f"Unknown admm_input_factor: {quant_config.get('admm_input_factor')}")
+    SpectrumSpec.from_config(quant_config)  # raises on negative ranks, an unknown flat mean or a non-positive power
     if int(quant_config.get("max_blocks", 0) or 0) < 0:
         raise ValueError("max_blocks must be >= 0")
     if int(quant_config.get("curvature_refresh_every", 0) or 0) < 0:

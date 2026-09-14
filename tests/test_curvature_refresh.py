@@ -36,7 +36,8 @@ def test_normalized_curvature_tempering():
     norm = cov.diagonal().sqrt()
     Sigma, lam, _ = admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12)
     assert torch.allclose(Sigma.diagonal(), torch.ones(6), atol=1e-5)  # unit-diagonal correlation form
-    Sigma_t, lam_t, Q_t = admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12, power=0.5)
+    Sigma_t, lam_t, Q_t = admm_nq._normalized_curvature(cov, norm, torch.float64, 1e-12,
+                                                        spectrum=cv.SpectrumSpec(power=0.5))
     assert lam_t.max() / lam_t.min() == pytest.approx((lam.max() / lam.min()).sqrt().item(), rel=1e-3)
     assert Sigma_t.trace().item() == pytest.approx(Sigma.trace().item(), rel=1e-4)
     assert torch.allclose(Sigma_t, (Q_t * lam_t) @ Q_t.mT, atol=1e-4)
@@ -51,7 +52,7 @@ def test_factorize_accepts_tempering_and_changes_solution():
     a = admm_nq.factorize_admm_nanoquant(W, i_norm, o_norm, 4, outer_iters=5, i_cov=i_cov, o_cov=o_cov)
     torch.manual_seed(1)
     b = admm_nq.factorize_admm_nanoquant(W, i_norm, o_norm, 4, outer_iters=5, i_cov=i_cov, o_cov=o_cov,
-                                         curvature_power=0.5)
+                                         spectrum=cv.SpectrumSpec(power=0.5))
     assert a["W_final"].shape == b["W_final"].shape == W.shape
     assert not torch.allclose(a["W_final"], b["W_final"])
 

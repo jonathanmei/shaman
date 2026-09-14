@@ -88,6 +88,9 @@ class NanoQuantConfigDataclass:
     # input-side curvature handed to ADMM: "calib" (calibration-time) or "fresh" (measured before binarisation)
     admm_input_factor: str = "calib"
     admm_curvature_power: float = 1.0
+    admm_curvature_spike_rank: int = 0
+    admm_curvature_dip_rank: int = 0
+    admm_curvature_flat_mean: str = "am"
     curvature_refresh_every: int = 0
     curvature_refresh_iters: int = 1
     block_diagnostics: bool = False

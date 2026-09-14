@@ -89,7 +89,7 @@ def test_config_plumbing_and_cache_keys():
     assert cfg["rank_budget"] == "uniform" and cfg["rank_sensitivity"] == "none" and cfg["rank_depth_ramp"] == 0.0
     assert cfg["rank_probe_ranks"] == "0.5,1.0,1.5" and cfg["rank_probe_iters"] == 50
     for gone in ("rank_type_weights", "rank_max_ratio", "block_loss", "tail_logit_blocks", "retain_latent",
-                 "model_kd_mode", "model_kd_feature_weight", "admm_curvature_spike_rank"):
+                 "model_kd_mode", "model_kd_feature_weight", "admm_curvature_cond_max"):
         assert gone not in cfg
     base = NanoQuantConfig(model_id="tiny/model", num_calib_samples=4, seqlen=16)
 

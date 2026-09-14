@@ -17,6 +17,7 @@ from ..utils.cache import ArtifactCache, admm_key
 from ..utils.utils import cleanup_memory, find_layers, set_seed
 from .admm_dbf import factorize_admm_dbf
 from .admm_nq import EigCache, factorize_admm_nanoquant
+from .curvature import SpectrumSpec
 from .importance import shrink_toward_identity
 
 
@@ -456,6 +457,7 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
         if cached is not None:
             factor_results = _to_device(cached, device)
     cache_hit = factor_results is not None
+    spectrum_diag: dict | None = {} if quant_config.get('block_diagnostics', False) else None
 
     if factor_results is None:
         if quant_config['admm_type'] == 'dbf':
@@ -466,6 +468,7 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
                                                 is_transpose=is_transpose)
         elif quant_config['admm_type'] == 'nanoquant':
             eigh_dtype = getattr(torch, quant_config.get('kron_eigh_dtype', 'float64'))
+            spectrum = SpectrumSpec.from_config(quant_config)
             factor_results = factorize_admm_nanoquant(
                 W_res.to(device), i_norm.to(device), lx_orig.o_norm.to(device), mid_rank=rank,
                 outer_iters=quant_config['admm_outer_iters'], inner_iters=quant_config['admm_inner_iters'],
@@ -475,8 +478,7 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
                 i_cov=None if i_cov is None else i_cov.to(device),
                 o_cov=None if o_cov is None else o_cov.to(device),
                 eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)),
-                curvature_power=float(quant_config.get('admm_curvature_power', 1.0)),
-                eig_cache=eig_cache)
+                spectrum=spectrum, eig_cache=eig_cache, diagnostics=spectrum_diag)
         else:
             raise ValueError(f"Unknown admm_type: {quant_config['admm_type']}")
         if memo_key is not None:
@@ -495,6 +497,11 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
             fresh = mahalanobis_weight_error(W_res, W_final, L, R_f)
             msg += f" | fresh-R {fresh / max(ref_f, 1e-30):.4e}"
         print(msg)
+        gaps = {k: v for k, v in (spectrum_diag or {}).items() if v}  # empty on an ADMM memo / EigCache hit
+        if gaps:
+            print("\t\tcurvature spectrum, replaced middle: " + " | ".join(
+                f"{k}: n {v['middle']} log(AM/GM) {v['log_am_gm']:.3f} log(GM/HM) {v['log_gm_hm']:.3f}"
+                for k, v in gaps.items()))
     # The dense factors are no longer needed for this layer: free the memory.
     for buf_name in ('i_cov', 'o_cov'):
         if hasattr(lx_orig, buf_name):
