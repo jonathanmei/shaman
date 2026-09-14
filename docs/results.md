@@ -555,3 +555,22 @@ The recipe configs were consolidated into `configs/qwen3_{0p6b,1p7b,4b}_best.jso
 Runs logged above under `qwen3_0p6b_kl_ms_ramp_parity`, `qwen3_1p7b_kl_ms_ramp_parity` and
 `qwen3_4b_kl_ms_ramp_parity` (job 5663775) used byte-identical settings apart from `qmodel_path`; the 4B hand-table
 config `qwen3_4b_kl_ra_both.json` and every other screening config survive only in history at `26d8fd4`.
+
+## Shared fresh input factors; the ADMM compute experiment (2026-09-10 to 2026-09-14, branch fresh-factor-sharing)
+
+Kept from branch `admm-fast-sylvester` (jobs 5627358 / 5627825 / 5627826, full write-up on that branch):
+
+- **Shared fresh input factors.** q, v and k read `input_layernorm`'s output and gate, up read
+  `post_attention_layernorm`'s; converted layers are not `nn.Linear`, so `tune_nonfact` cannot change those inputs
+  between the group's ADMM calls. The fresh factor is therefore measured once per group (`shared_input_groups`,
+  `fresh_input_factor` in `compress_block.py`), validated by a one-sample probe, and its normalised
+  eigendecomposition is cached for ADMM (`EigCache`, registered factors only). Saves 3 of 7 fresh-factor
+  measurements (128 block forwards each) and 3 small eigendecompositions per block; exact by construction.
+- **`kron_eigh_dtype: float32`** in the 1.7B and 4B best-arm configs: the knob only reaches the ADMM
+  eigendecompositions, whose eigenvalues are clamped and whose output feeds a sign projection.
+
+Dropped after measuring: an inexact Sylvester X-update (stale k×k eigenbasis as preconditioner with Rayleigh, QR and
+PCG rungs) saved ~10 % of ADMM time at 1.7B (14.3 vs 15.9 s per layer; PPL 16.66 vs 16.72) and nothing at 4B
+(26.1 vs 26.4 s): at k ≈ 2000, n = 9728 its extra `n²k` matmuls and residual syncs cost what the fp32 `eigh` costs.
+Early stopping on a frozen Z is inapplicable: at iteration 400 every layer still flips 30–20 000 signs per iteration
+under the linear ρ schedule. ADMM is ~40 % of 4B reconstruction; the tuning stages are the larger lever.

@@ -172,19 +172,73 @@ def _sylvester_solve_step(Q: torch.Tensor, lam: torch.Tensor, M: torch.Tensor, C
     return (Q @ F_hat @ Q_M.mT).to(orig_dtype)
 
 
+class EigCache:
+    """Normalised eigendecompositions of curvature factors that several layers share (e.g. the fresh input factor of
+    q/k/v or gate/up).
+
+    Only tensors registered with :meth:`register` are cached, so per-layer factors never pile up in memory. Entries
+    are keyed by the tensor's storage pointer, shape and the tempering power; the registered tensor is held alive
+    so its pointer cannot be recycled while the entry exists.
+    """
+
+    def __init__(self) -> None:
+        self._shared: dict[int, torch.Tensor] = {}
+        self._entries: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def register(self, cov: torch.Tensor) -> None:
+        """Mark ``cov`` as shared: its eigendecompositions will be cached."""
+        self._shared[cov.data_ptr()] = cov
+
+    def clear(self) -> None:
+        """Drop all entries and registrations."""
+        self._shared.clear()
+        self._entries.clear()
+
+    @staticmethod
+    def _key(cov: torch.Tensor, power: float, eigh_dtype: torch.dtype) -> tuple:
+        return (cov.data_ptr(), tuple(cov.shape), str(cov.device), float(power), str(eigh_dtype))
+
+    def get(self, cov: torch.Tensor, power: float,
+            eigh_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Cached ``(Sigma, lam, Q)`` of a registered ``cov`` under these knobs, else ``None``."""
+        if cov.data_ptr() not in self._shared:
+            return None
+        return self._entries.get(self._key(cov, power, eigh_dtype))
+
+    def put(self, cov: torch.Tensor, power: float, eigh_dtype: torch.dtype,
+            value: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> None:
+        """Store ``value`` for a registered ``cov``; a no-op for unregistered tensors."""
+        if cov.data_ptr() in self._shared:
+            self._entries[self._key(cov, power, eigh_dtype)] = value
+
+
 @torch.no_grad()
 def _normalized_curvature(cov: torch.Tensor, norm_vec: torch.Tensor, eigh_dtype: torch.dtype, eps: float,
-                          power: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                          power: float = 1.0,
+                          eig_cache: EigCache | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Unit-diagonal curvature factor ``D^-1/2 cov D^-1/2`` (with ``D = norm_vec^2``) and its eigendecomposition.
 
     With ``power != 1`` the spectrum is tempered (:func:`temper_eigenvalues`, trace preserved) and ``Sigma`` is
     rebuilt from the new eigenvalues, so the data term trusts the dominant directions less.
+
+    Parameters
+    ----------
+    eig_cache : EigCache, optional
+        Cache consulted and filled for factors registered as shared (``norm_vec`` must be the diagonal of ``cov``
+        for the cached result to be the right one, which holds for the fresh input factor).
 
     Returns
     -------
     tuple
         ``(Sigma, lam, Q)`` in fp32 with eigenvalues clamped at ``eps``.
     """
+    if eig_cache is not None:
+        hit = eig_cache.get(cov, power, eigh_dtype)
+        if hit is not None:
+            return hit
     n = norm_vec.reshape(-1).to(torch.float32)
     Sigma = cov.to(torch.float32) / (n.unsqueeze(1) * n.unsqueeze(0))
     Sigma = 0.5 * (Sigma + Sigma.mT)
@@ -195,6 +249,8 @@ def _normalized_curvature(cov: torch.Tensor, norm_vec: torch.Tensor, eigh_dtype:
         lam = temper_eigenvalues(lam, power=power).clamp(min=eps)
         Sigma = (Q * lam) @ Q.mT
         Sigma = 0.5 * (Sigma + Sigma.mT)
+    if eig_cache is not None:
+        eig_cache.put(cov, power, eigh_dtype, (Sigma, lam, Q))
     return Sigma, lam, Q
 
 
@@ -216,6 +272,7 @@ def factorize_admm_nanoquant(
     eigh_dtype: torch.dtype = torch.float64,
     mid_scale: bool = False,
     curvature_power: float = 1.0,
+    eig_cache: EigCache | None = None,
 ):
     """
     Decomposes the weight matrix W into two binary matrices A and B using ADMM.
@@ -248,12 +305,14 @@ def factorize_admm_nanoquant(
         mid_scale: Export an explicit per-rank ``scale_mid`` (see above).
         curvature_power: Spectral tempering of the unit-diagonal factors L, R (eigenvalues raised to this power,
                trace preserved; ``core.curvature.temper_eigenvalues``); 1 leaves them untouched.
+        eig_cache: Cache of normalised eigendecompositions for curvature factors shared by several layers
+               (see :class:`EigCache`); factors not registered there are never cached.
     """
     if is_transpose:
         results = factorize_admm_nanoquant(W.mT, o_norm, i_norm, mid_rank, outer_iters, inner_iters, reg, False, eps,
                                            rho_scheduler, print_admm_steps, i_cov=o_cov, o_cov=i_cov,
                                            eigh_dtype=eigh_dtype, mid_scale=mid_scale,
-                                           curvature_power=curvature_power)
+                                           curvature_power=curvature_power, eig_cache=eig_cache)
         swapped = {
             "W_final": results["W_final"].mT,
             "A": results["B"],
@@ -277,8 +336,10 @@ def factorize_admm_nanoquant(
     # Optional dense curvature -> Mahalanobis data term
     use_maha = i_cov is not None and o_cov is not None
     if use_maha:
-        Lt, lam_L, Q_L = _normalized_curvature(o_cov.to(device), norm_o, eigh_dtype, eps, curvature_power)  # (out, out)
-        Rt, lam_R, Q_R = _normalized_curvature(i_cov.to(device), norm_i, eigh_dtype, eps, curvature_power)  # (in, in)
+        Lt, lam_L, Q_L = _normalized_curvature(o_cov.to(device), norm_o, eigh_dtype, eps, curvature_power,
+                                               eig_cache=eig_cache)  # (out, out)
+        Rt, lam_R, Q_R = _normalized_curvature(i_cov.to(device), norm_i, eigh_dtype, eps, curvature_power,
+                                               eig_cache=eig_cache)  # (in, in)
         W_norm32 = W_norm.to(torch.float32)
         P = Lt @ W_norm32 @ Rt  # curvature-weighted target, (out, in)
         if print_admm_steps:

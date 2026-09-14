@@ -4,8 +4,8 @@ import pytest
 import torch
 from torch import nn
 
-from nanoquant.core import pipeline
 from nanoquant.core import importance as imp
+from nanoquant.core import pipeline
 from nanoquant.modules.quant_config import NanoQuantConfig
 from nanoquant.utils import cache as C
 
