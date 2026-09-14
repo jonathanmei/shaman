@@ -432,5 +432,119 @@ type's binarisation caused in the 4B logs), renormalised to the uniform rule's t
   the arms track the control exactly through block 23 and separate over the last four blocks. Pure KL and the
   0.5 mix are indistinguishable.
 - Cost: unchanged per block for the ranks; the tail objective adds ~25 % to the last four blocks at 0.6B.
-- Follow-ups running: rank ceiling lifted to 2 × min(in, out) (`rank_max_ratio`) at ρ = 0.6 and ρ = 1.0, ρ = 1.0
-  capped, ranks + tail combined; 4B with the parity allocation (job 5617467).
+- Follow-ups: rank ceiling lifted to 2 × min(in, out) (`rank_max_ratio`) at ρ = 0.6 and ρ = 1.0, ρ = 1.0
+  capped, ranks + tail combined, each at parity and at the full budget (below); 4B with the parity allocation
+  (job 5617467, running).
+
+### Follow-ups: rank ceiling, steeper ramp, ranks + tail, parity vs full (2026-09-09, Qwen3-0.6B, full runs)
+
+Same recipe and type weights as above; ρ is the depth ramp, cap is `rank_max_ratio` × min(in, out).
+
+| arm | job | actual bpw | pre-KD PPL (block 27) | **WikiText-2 PPL** |
+|---|---|---|---|---|
+| ρ = 0.6, cap 1× , parity (reference, above) | 5616772 | 0.9728 | 24.19 | 23.25 |
+| ρ = 0.6, cap 2×, parity | 5617472 | 0.9728 | 24.04 | **23.17** |
+| ρ = 1.0, cap 2×, parity | 5617473 | 0.9729 | 24.42 | 23.68 |
+| ρ = 1.0, cap 1×, parity | 5617474 | 0.9728 | 27.04 | 25.94 |
+| ρ = 0.6, cap 1×, parity + tail K = 4 | 5617475 | 0.9728 | 23.95 | 23.82 |
+| ρ = 0.6, cap 2×, full 1.0 bpw | 5617476 | 0.9999 | 24.12 | 23.33 |
+| ρ = 1.0, cap 2×, full 1.0 bpw | 5617477 | 1.0000 | 23.98 | 23.32 |
+| ρ = 1.0, cap 1×, full 1.0 bpw | 5617478 | 0.9999 | 25.30 | 24.35 |
+| ρ = 0.6, cap 1×, full + tail K = 4 | 5617479 | 1.0000 | 24.81 | 24.51 |
+
+- **Lifting the rank ceiling is neutral at ρ = 0.6** (23.17 vs 23.25, inside the ±0.5 noise) and necessary at
+  ρ = 1.0: with the cap the steeper ramp cannot place its bits (late MLP layers saturate at 1024) and loses 2.7 PPL
+  (25.94); with the cap lifted it recovers to 23.68, still no better than ρ = 0.6. The depth ramp is at or past its
+  optimum around 0.6 for this model.
+- **Parity vs full is noise**: full lost at ρ = 0.6 (23.33 vs 23.17) and won at ρ = 1.0 (23.32 vs 23.68), so the
+  earlier 0.9 gap (24.15 vs 23.25) was not systematic. The 2.7 % of extra bits are worth little wherever the current
+  fill rule puts them.
+- **The tail objective does not stack with the rank allocation** (23.82 vs 23.25) although it still lowers the pre-KD
+  perplexity (23.95 vs 24.19): once the last blocks have the extra rank, the logit-level fit buys less and KD recovers
+  less on top of it. Single runs, so a 0.6 deficit is at the edge of the noise band; there is no sign of the −0.9 it
+  gave on uniform ranks. The full-budget twin (5617479, 24.51) confirms it: both tail arms are the two worst ρ = 0.6
+  results.
+- Everything at ρ = 0.6 sits at 23.2–23.3 whatever the cap or budget: the hand-set allocation has plateaued, which is
+  the motivation for the measured allocation below.
+
+## Measured-sensitivity rank allocation (2026-09-09/10, Qwen3-0.6B, commit da395d6)
+
+Replaces the hand-set depth ramp and type table by a per-layer sensitivity curve measured at calibration time
+(`rank_sensitivity: admm`; `core/rank_probe.py`): after the Kronecker statistics are registered, every layer is
+solved by a 50-iteration ADMM at 0.5 / 1.0 / 1.5 × its uniform rank (`rank_probe_ranks`, `rank_probe_iters`), the
+deployed binary matrix is rebuilt and scored by the Gauss–Newton weight error `J(r) = tr(L ΔW R ΔWᵀ)` with the
+layer's own Fisher factors (raw scale, comparable across layers), and a power law `J = exp(a) r^-β` is fitted. The
+allocator (`allocate_ranks_measured`) starts every layer at rank 32 and hands out 32-steps by largest predicted loss
+decrease per bit until the parity or full bit target is met. The ramp / type multipliers, if set, act as a prior on
+the curve level. Probe cost at 0.6B: 707 s for 196 layers (25 s per block), cached under its own artifact key and
+shared by all arms of the same calibration.
+
+What the probe measured (0.6B): exponents are nearly uniform, β = 0.75–0.97 for every layer and depth, so the
+allocation is driven by the *level* of the curve (Fisher magnitude × reconstruction error), not by its slope. The
+resulting allocation at parity: v_proj 843 (uniform 480), up 803, down 779, gate 663, o 533, k 521, q 427; bits per
+block relative to uniform 1.31 1.10 1.13 1.25 1.25 1.16 1.02 0.96 0.92 0.92 0.86 0.88 0.78 0.76 0.76 0.81 0.93 0.90
+0.92 1.04 0.99 1.02 0.99 0.96 0.94 0.98 1.20 1.25, i.e. U-shaped in depth (blocks 0–5 and 26–27 up, 12–15 down),
+unlike the monotone hand ramp. One outlier: `2.mlp.down_proj` has a curve level 100× every other layer (J = 1.85 vs
+≈ 0.01) and takes the rank cap; its logged block-loss jump is ordinary, so the Fisher of that layer is inflated
+rather than the layer being fragile.
+
+Predictor check (4-block screen, job 5617824, `block_diagnostics`): Spearman correlation between the fitted J at the
+chosen rank and the logged diagonal block-loss jump caused by binarising the layer, over the 28 layers of blocks 0–3:
+0.77 overall, 0.96 / 0.86 / 0.82 / 0.71 within blocks 0–3 (ranking the seven layer types within a block), not
+resolvable across depth within a type (n = 4). The block-3 PPL of the screen (14.01) is below the uniform control
+range (14.78–14.88) by construction: the allocation gives blocks 0–3 10–31 % more bits.
+
+| arm | job | actual bpw | pre-KD PPL (block 27) | **WikiText-2 PPL** |
+|---|---|---|---|---|
+| uniform ranks (control) | 5616769 | 0.9729 | 27.35 | 25.48 |
+| hand table: ramp 0.6 + type weights, parity | 5616772 | 0.9728 | 24.19 | **23.25** |
+| measured (admm), parity, no multipliers | 5617842 | 0.9729 | 24.53 | 23.75 |
+| **measured × ramp 0.6 prior, parity** | 5617843 | 0.9728 | 23.96 | **22.96** |
+| measured, full 1.0 bpw | 5617844 → 5627853 | 1.0000 | 24.68 | 23.60 |
+
+(5617844 hit the 4 h limit at block 20, the probe plus the larger late ranks making 640 s blocks; 5627853 resumed from
+its block checkpoints and finished in 25 min.)
+
+- **Measured × ramp prior is the new 0.6B best (22.96)**: the Fisher-weighted predictor supplies the within-block
+  ranking and the ramp supplies the depth weighting it under-values, and the two combine to −2.5 PPL against uniform
+  ranks (−0.3 against the hand table, inside the single-run band but in the predicted direction).
+
+- **The measured allocation recovers most of the hand table's gain with no tuned knob**: −1.7 PPL against uniform
+  ranks (23.75 vs 25.48) versus −2.2 for the hand table; the 0.5 gap to the hand table is at the edge of the ±0.5
+  single-run band. The trajectories differ in shape: measured is ahead of the hand table at every block boundary
+  through block 24 (block 3: 14.10 vs 15.24; block 14: 16.72 vs 17.72; block 21: 19.61 vs 20.17) and is overtaken
+  over the last three blocks (24.53 vs 24.19 pre-KD), where the hand ramp holds 35 % more bits and the measured
+  allocation about 20–25 % more. The Fisher-weighted predictor therefore under-values the last blocks relative to
+  what the end-to-end perplexity rewards, which is exactly what the ramp-prior arm tests.
+- **Measured, full budget (23.60) vs parity (23.75)**: within noise, as for the hand table; the 2.7 % of extra bits
+  remain worth little.
+- Open: a 4B run of measured × ramp; its probe (36 blocks, 9728-wide factors) runs at calibration time and is cached
+  under its own key, so the run spans two to three 4 h jobs resuming from the cache.
+
+## Qwen3-4B-Base with the hand-table rank allocation (2026-09-10)
+
+`configs/qwen3_4b_kl_ra_both.json`: the 14.11 recipe (KL factors, ADMM p = ½, fresh input factor, refresh every 9)
+with `rank_budget: parity`, depth ramp 0.6 and the type weights above; 241 of 252 layers differ from the uniform rule,
+ranks 448–2560. Jobs 5617467 (timed out at block 35/36; its checkpoints were then invalidated by commit da395d6),
+5620415 (recomputed from a checkout pinned at ba41b0d, `ob:~/code/shaman-4b`, timed out at block 31) and 5627852
+(resumed from block 31, 63 min incl. KD and evaluation).
+
+| arm | actual bpw | block 35 (pre-KD) | KD loss ep8 | **WikiText-2 PPL** | zero-shot mean |
+|---|---|---|---|---|---|
+| uniform ranks (2026-09-09) | 0.9864 | 15.77 (diag) / – | 2.186 | 14.11 | 0.463 |
+| **ramp 0.6 + type weights, parity** | 0.9864 | 13.82 | 2.163 | **13.55** | 0.450 |
+| paper (Table 2) | | | | 14.29 | |
+
+- **−0.56 PPL (−4.0 %) at identical bits**, 5.2 % below the paper and 8.8 % below the paper-faithful diag baseline
+  (14.86). The pre-KD perplexity (13.82) is already below the previous *post*-KD result. Zero-shot mean 0.450 vs
+  0.463: a 1.3-point drop, inside the noise noted for these tasks but the first time perplexity and zero-shot move in
+  opposite directions; worth a second seed before drawing conclusions.
+- Cost: the late blocks with rank up to 2560 take 450–490 s (vs ~360 s uniform), so a full 4B run no longer fits one
+  4 h job even without KD; two jobs with block resume are the norm now.
+- Ledger caveat as before: job 5627852 ran ba41b0d code (the ledger hash matches because it ran from the pinned
+  checkout).
+
+Summary across sizes (WikiText-2 PPL, best arm per size, 1.0 bpw target): 0.6B **22.96** (measured × ramp),
+1.7B 16.72 (not yet rerun with rank allocation), 4B **13.55** (hand-table ranks). The ADMM fast path
+(branch `admm-fast-sylvester`, inexact Sylvester solve with early stopping) reproduces the 1.7B recipe at 16.67
+vs 16.72 (job 5627825), i.e. lossless, and is the natural way to buy back the time the larger late ranks cost.
