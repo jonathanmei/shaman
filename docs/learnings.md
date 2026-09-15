@@ -19,6 +19,7 @@ is derived in `rank_allocation_note.html`.
 | Qwen3-4B-Base | `configs/qwen3_4b_best.json` | same recipe, refresh/9, measured × ramp 0.6 ranks (probe 0.6/1.0/1.4; jobs 5663775 → 5666862 from `26d8fd4`); zero-shot mean 0.463 | 0.9864 | 13.80 | 14.29 |
 | Qwen3-4B-Base | commit `26d8fd4`, `configs/qwen3_4b_kl_ra_both.json` | KL factors, p = ½, fresh R, refresh/9, **hand-table ranks (ramp 0.6 + type weights), parity**; recorded best, code removed | 0.9864 | **13.55** | 14.29 |
 | Qwen3-8B-Base | `configs/qwen3_8b_best.json` | same recipe as 4B (refresh/9, probe 0.6/1.0/1.4) plus the efficiency fixes and `tune_epoch_weights: type`; 2 scales, no KD middle scale (job 5721334, h200 on `lgpus`, running 2026-09-15) | – | pending | – |
+| Qwen3-14B-Base | `configs/qwen3_14b_best.json` | same as 8B with refresh/10 (40 blocks) and an 80 GB GPU factor budget (job id in `results.md`, second h200 on `lgpus`, launched 2026-09-15) | – | pending | – |
 
 Every recipe keeps the paper's protocol: 128 × 2048 WikiText-2 calibration samples, seed 0, 2 scales, 8/8/8 epochs,
 scale-only KD, and the same total bits as the uniform rank rule (parity).

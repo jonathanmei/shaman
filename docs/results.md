@@ -709,3 +709,10 @@ blocks, 2 scales, no KD middle scale. Job **5721334**: one h200 on partition `lg
 checkout, log `.objob/logs/nq-8b-best-5721334.out`. Everything (stats, probe, blocks, KD) is computed from scratch.
 Readout pending: WikiText-2 PPL, bpw, zero-shot mean, wall time per stage (calibration, probe, per block, KD) for
 comparison with the 4B fixes run 5713834 and the paper's 8B point.
+
+Qwen3-14B-Base, same recipe, launched concurrently on a second h200 (job **5723553**, `lgpus`, 5-day request, 800G,
+pinned checkout `ob:~/code/shaman-14b` @ af857a1, log `.objob/logs/nq-14b-best-5723553.out`).
+`configs/qwen3_14b_best.json` differs from the 8B config only in `curvature_refresh_every: 10` (40 blocks) and
+`kron_gpu_budget_gb: 80` (28 GB bf16 model on the 141 GB card). Sizing: Kronecker stats scale as the per-block
+sum of in² + out² (8B 606 M elements × 36 blocks = 87 GB fp32, matching the cache file; 14B 1147 M × 40 ≈ 184 GB),
+peak RSS was ~3.2× the stats file at 4B, hence 800G. Readout pending as for 8B.
