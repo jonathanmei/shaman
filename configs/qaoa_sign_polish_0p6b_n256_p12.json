@@ -1,0 +1,23 @@
+{
+  "pipeline_config": "configs/qwen3_0p6b_best.json",
+  "out_dir": "runs/qaoa_sign_polish/qwen3_0p6b_n256_p12",
+  "block": 27,
+  "module": "mlp.down_proj",
+  "n": 256,
+  "depths": [1, 2],
+  "backend": "pauli",
+  "prop_weight": 1,
+  "max_active": 16,
+  "pair_top": 8,
+  "n_starts": 8,
+  "reoptimize_every": 4,
+  "opt_maxiter": 150,
+  "depth_overrides": {
+    "2": {"pair_top": 4, "angles_sub_tile": 32, "n_starts": 4}
+  },
+  "shots": 0,
+  "seed": 0,
+  "n_stop": 4,
+  "eps": 0.1,
+  "device": "cuda"
+}

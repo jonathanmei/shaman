@@ -62,6 +62,42 @@ A confidently *wrong* warm start can mislead `p = 1` RQAOA (anti-aligned seeds a
 random 8-spin instances); the realistic case, mostly-right bits with the wrong ones flagged by low confidence, recovers
 the optimum on every tested instance, as does a plain `|+>` start (`tests/test_rqaoa.py`).
 
+## Beyond the statevector: 64 and 256 bits, depth 2 and 3
+
+The statevector solver doubles in cost per added bit (measured RQAOA wall time 0.23 s at 9 bits, 0.7 s at 12, 1.6 s at
+14, 4.9 s at 16) and stops near 22 bits; no QPU has 256 qubits and one dense p = 1 layer at 256 bits is 32 640
+two-qubit gates. Larger tiles run on two other engines.
+
+**Pauli propagation** (`nanoquant.quantum.pauli_prop`). The observable is propagated backwards through the layers as a
+sum of product operators `coef * prod_q (alpha_q I + x_q X + y_q Y + z_q Z)`. A mixer layer rotates each site's
+`(x, y, z)` about the warm-start axis by `-2 beta` (exact). A cost layer acts through the off-diagonal sites `A`:
+`U_C^dag P U_C = P exp(-2i gamma sum_{q in A} Z_q (h_q + sum_{r notin A} J_qr Z_r))`, and resolving the `Z_q` on `A`
+into eigenvalues `z_q` gives, per `(A, z_A)`, one product operator again (`o_q -> ((x + i z y) X + (y - i z x) Y) / 2`
+on `A`, `d_r -> (a C - i b S) I + (b C - i a S) Z` with `C, S = cos, sin(2 gamma sum_q z_q J_qr)` elsewhere). The
+observable's own sites (roots) are enumerated exactly (`3^|roots|` choices per layer); every other site only carries
+off-diagonal content of order `sin(2 gamma J)`, so choosing it into `A` is a perturbative order and `k` bounds the
+total number of such choices. `k = 0` is exact at p = 1; at p = 2 the measured error ladder on a weak-coupling
+8-spin instance is 8e-2, 4e-3, 2e-4 for k = 0, 1, 2 and machine precision when untruncated. `max_active` limits the
+eligible non-root sites to the strongest-coupled ones and `pair_top` limits which `<Z_i Z_j>` are evaluated (the energy
+the optimiser sees then sums those pairs only). The bits RQAOA returns are always scored exactly; the truncation only
+influences which variable each step fixes.
+
+Measured cost of one `(energy, z, zz)` evaluation on the laptop (the recursion does one per step plus a few dozen per
+angle optimisation): 64 bits p = 1 all pairs 0.09 s; p = 2 (k = 1, 16 active, 572 pairs) 4.2 s; p = 3 (k = 1, 16
+active, 298 pairs) 87 s; 256 bits p = 1 all 32 640 pairs 4.6 s; p = 2 (k = 1, 32 active, 1222 pairs) 118 s. Hence the
+run design: full optimisation each step at p = 1; angles carried and re-optimised every 16 steps at p = 2 on 64 bits;
+for p = 3 and for 256 bits at p = 2 the angles are optimised once on a 24- or 32-spin sub-instance (normalised by the
+cost scale) and held fixed (`angles_sub_tile`), with `pair_top` 4 and `max_active` 8-16 (`depth_overrides` in the
+configs).
+
+**MPS cross-check** (`nanoquant.quantum.mps_check`, quimb `CircuitMPS`, bond dimension capped). Same circuit as the
+IonQ backend; non-adjacent RZZ gates go through quimb's swap-and-split, which is where the bond cap bites on an
+all-to-all cost layer. Used only in the `crosscheck` stage: statevector vs Pauli propagation (k = 0, 1, 2) vs MPS
+(chi = 16, 64) on a 16-bit sub-instance, and Pauli propagation vs MPS against each other on the 32-bit dump.
+
+Classical references above 22 bits (no brute force): greedy single-flip descent from the ADMM bits and best-of-8
+simulated annealing; `fraction_captured` is then relative to the better of the two and flagged as such.
+
 ## Running it
 
 ```
@@ -73,7 +109,16 @@ uv run python scripts/qaoa_sign_polish.py solve      configs/qaoa_sign_polish_0p
 #   backend "ionq": uv sync --extra quantum, export IONQ_API_KEY, ionq_target "simulator" (+ noise model) or "qpu.aria-1"
 # cluster
 uv run python scripts/qaoa_sign_polish.py verify     configs/qaoa_sign_polish_0p6b.json   # verify.json
+
+# larger tiles / deeper circuits: one cluster job each, everything (dump, solve per depth, verify per depth) in-process
+objob submit --partition gpus --time 04:00:00 --mem 64G --gres gpu:a100:1 -- \
+  uv run python scripts/qaoa_sign_polish.py all        configs/qaoa_sign_polish_0p6b_n64_p123.json
+objob submit ... -- uv run python scripts/qaoa_sign_polish.py all        configs/qaoa_sign_polish_0p6b_n256_p12.json
+objob submit ... -- uv run python scripts/qaoa_sign_polish.py crosscheck configs/qaoa_sign_polish_0p6b_n32_crosscheck.json  # dumps first if needed
 ```
+
+The 9/12-bit runs used a local `solve` only because the IonQ backend needs the API token and outbound internet; the
+64/256-bit solves are minutes to hours of numpy, so they run where the dump is.
 
 `dump` factorises the layer against the FP model's calibration curvature (what the rank probe does), not the
 error-fed block inputs or the fresh input factor of the block loop: the instance is a faithful stand-alone layer

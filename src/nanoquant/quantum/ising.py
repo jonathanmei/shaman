@@ -218,3 +218,61 @@ def back_substitute(records: Sequence[Elimination], final: dict[int, int]) -> di
         else:
             full[rec.i] = rec.sign
     return full
+
+
+# ----------------------------------------------------------------------------------------------------
+# Classical references for sizes beyond brute force
+# ----------------------------------------------------------------------------------------------------
+def _local_fields(inst: IsingInstance, s: np.ndarray) -> np.ndarray:
+    """``dE/ds_i`` contribution: flipping ``s_i`` changes the energy by ``-2 s_i (h_i + sum_j J_ij s_j)``."""
+    return inst.h_array() + inst.J_array() @ s
+
+
+def local_search(inst: IsingInstance, s0: Sequence[int]) -> tuple[list[int], float]:
+    """Greedy single-flip descent from ``s0`` to a 1-flip local minimum (best-improvement order)."""
+    s = np.asarray(s0, dtype=np.float64).copy()
+    while True:
+        gains = -2.0 * s * _local_fields(inst, s)  # energy change of flipping each spin
+        i = int(np.argmin(gains))
+        if gains[i] >= -1e-15 * max(1.0, abs(inst.const)):
+            break
+        s[i] = -s[i]
+    spins = [int(v) for v in s]
+    return spins, inst.energy(spins)
+
+
+def simulated_annealing(inst: IsingInstance, seed: int = 0, restarts: int = 8, sweeps: int = 200,
+                        s0: Sequence[int] | None = None) -> tuple[list[int], float]:
+    """Best of ``restarts`` geometric-schedule annealing runs, each polished by :func:`local_search`.
+
+    Parameters
+    ----------
+    inst : IsingInstance
+        Model.
+    seed : int
+        Random seed.
+    restarts : int
+        Independent runs (the first starts from ``s0`` if given, the rest at random).
+    sweeps : int
+        Metropolis sweeps per run; the temperature falls geometrically from the largest to 1e-3 of the largest
+        single-flip energy change.
+    s0 : sequence of int, optional
+        Warm start for the first run.
+    """
+    rng = np.random.default_rng(seed)
+    n = inst.n
+    h, J = inst.h_array(), inst.J_array()
+    scale = float(np.abs(h).sum() + np.abs(J).sum() / max(1, n)) / max(1, n) * 2.0 or 1.0
+    temps = np.geomspace(scale, 1e-3 * scale, sweeps)
+    best_s, best_e = None, np.inf
+    for r in range(max(1, restarts)):
+        s = np.asarray(s0, dtype=np.float64).copy() if (r == 0 and s0 is not None) else rng.choice([-1.0, 1.0], size=n)
+        for T in temps:
+            for i in rng.permutation(n):
+                dE = -2.0 * s[i] * (h[i] + J[i] @ s)
+                if dE <= 0 or rng.random() < np.exp(-dE / T):
+                    s[i] = -s[i]
+        spins, e = local_search(inst, [int(v) for v in s])
+        if e < best_e:
+            best_s, best_e = spins, e
+    return best_s, best_e

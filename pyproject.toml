@@ -31,6 +31,7 @@ dev = ["pytest", "ruff", "mypy"]
 quantum = [
     "qiskit>=2.5.2",
     "qiskit-ionq>=1.1.1",
+    "quimb>=1.11.2",
 ]
 
 [project.scripts]

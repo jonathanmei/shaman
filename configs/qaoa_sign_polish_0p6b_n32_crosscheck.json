@@ -1,0 +1,15 @@
+{
+  "pipeline_config": "configs/qwen3_0p6b_best.json",
+  "out_dir": "runs/qaoa_sign_polish/qwen3_0p6b_n32_crosscheck",
+  "block": 27,
+  "module": "mlp.down_proj",
+  "n": 32,
+  "depths": [1, 2, 3],
+  "backend": "pauli",
+  "prop_weight": 1,
+  "sub_tile": 16,
+  "mps_bonds": [16, 64],
+  "seed": 0,
+  "eps": 0.1,
+  "device": "cuda"
+}

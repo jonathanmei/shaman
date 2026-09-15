@@ -109,6 +109,42 @@ def test_rqaoa_recovers_the_optimum_from_plus_state(seed):
     assert res.energy == pytest.approx(best_e)
 
 
+@pytest.mark.parametrize("p", [1, 2])
+def test_pauli_correlator_rqaoa_recovers_the_optimum(p):
+    inst = _dense_instance(8, seed=2)
+    best_s, best_e = inst.brute_force()
+    start = [-s if q < 3 else s for q, s in enumerate(best_s)]
+    theta = Q.warm_start_angles(start, [0.2] * 3 + [0.9] * 5)
+    # p = 1 is exact at any k; at p = 2 the second-order truncation is accurate to ~1e-4 on these couplings
+    res = Q.rqaoa(inst, theta, Q.PauliPropCorrelator(k=2), shots=0, seed=0, n_stop=4, p=p, n_starts=2)
+    assert res.energy == pytest.approx(best_e)
+    assert all(step.reoptimized for step in res.steps)
+
+
+def test_carried_and_fixed_angles_paths_run():
+    inst = _dense_instance(7, seed=3)
+    theta = Q.warm_start_angles([1] * 7, [0.0] * 7)
+    res = Q.rqaoa(inst, theta, Q.PauliPropCorrelator(k=1, pair_top=3), shots=0, seed=0, n_stop=3, p=1,
+                  reoptimize_every=2, n_starts=2)
+    assert [s.reoptimized for s in res.steps] == [True, False, True, False]
+    assert res.steps[1].expectation is None and res.steps[0].expectation is not None
+    fixed = Q.normalized_angles(inst, res.steps[0].gammas, res.steps[0].betas)
+    res2 = Q.rqaoa(inst, theta, Q.StatevectorSampler(), shots=500, seed=0, n_stop=3, fixed_angles=fixed.tolist())
+    assert not any(s.reoptimized for s in res2.steps)
+    assert inst.energy(res2.spins) == pytest.approx(res2.energy)
+    assert res.seconds > 0 and all(s.seconds >= 0 for s in res.steps)
+
+
+def test_statevector_refuses_large_instances():
+    n = Q.MAX_STATEVECTOR_N + 1
+    inst = I.IsingInstance(h=[0.1] * n, J=np.zeros((n, n)).tolist())
+    with pytest.raises(ValueError):
+        Q.expectation(inst, [0.0] * n, [0.1], [0.1])
+    _, z, _ = __import__("nanoquant.quantum.pauli_prop", fromlist=["expectations"]).expectations(
+        inst, [0.0] * n, [0.1], [0.1], k=0, pairs=[])
+    assert np.allclose(z, 1.0)  # all spins up, no couplings: <Z> = cos(0) = 1 regardless of angles
+
+
 def test_rqaoa_result_json_round_trip(tmp_path):
     inst = _dense_instance(5, seed=6)
     theta = Q.warm_start_angles([1] * 5, [0.0] * 5)

@@ -108,6 +108,28 @@ def test_back_substitution_reconstructs_full_assignment():
     assert red3.energy([final[k] for k in red3.labels]) == pytest.approx(inst.energy([full[k] for k in range(6)]))
 
 
+def test_local_search_never_worsens_and_reaches_a_1flip_minimum():
+    inst = _random_instance(8, seed=8)
+    rng = np.random.default_rng(9)
+    for _ in range(5):
+        s0 = rng.choice([-1, 1], size=8)
+        s, e = I.local_search(inst, s0)
+        assert e <= inst.energy(s0) + 1e-12
+        for i in range(8):
+            flipped = list(s)
+            flipped[i] = -flipped[i]
+            assert inst.energy(flipped) >= e - 1e-9
+
+
+def test_simulated_annealing_finds_the_brute_force_optimum_on_small_instances():
+    for seed in (10, 11, 12):
+        inst = _random_instance(10, seed=seed)
+        _, best = inst.brute_force()
+        s, e = I.simulated_annealing(inst, seed=0, restarts=6, sweeps=150)
+        assert e == pytest.approx(best)
+        assert inst.energy(s) == pytest.approx(e)
+
+
 def test_scaled_instance_scales_energies():
     inst = _random_instance(4, seed=7)
     sc = inst.scaled(0.25)
