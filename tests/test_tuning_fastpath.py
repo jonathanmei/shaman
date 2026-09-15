@@ -1,7 +1,9 @@
 """Tests for the MLP-only tuning forward (frozen attention half skipped) and the tuning loop's ``forward_fn`` hook."""
 
 import copy
+import math
 
+import pytest
 import torch
 from torch import nn
 
@@ -77,6 +79,76 @@ def _tune(block, x, y, forward_fn):
         cb._tune_loop(block, opt, sched, x, y, torch.ones(D), {}, batch_size=2, epochs=2, num_samples=N,
                       forward_fn=forward_fn)
     return [p.detach().clone() for p in params]
+
+
+NAMES = ['self_attn.q_proj', 'self_attn.v_proj', 'self_attn.o_proj', 'self_attn.k_proj', 'mlp.gate_proj',
+         'mlp.up_proj', 'mlp.down_proj']
+
+
+def test_scaled_epochs():
+    assert cb.scaled_epochs(8, 1.0) == 8 and cb.scaled_epochs(8, 0.25) == 2 and cb.scaled_epochs(8, 0.05) == 1
+    assert cb.scaled_epochs(8, 0.75) == 6
+
+
+def test_tuning_epoch_weights_modes():
+    assert cb.tuning_epoch_weights(None, None, 0, NAMES, {}) == {n: 1.0 for n in NAMES}
+    typed = cb.tuning_epoch_weights(None, None, 0, NAMES, {"tune_epoch_weights": "type"})
+    assert typed["self_attn.q_proj"] == 0.25 and typed["mlp.down_proj"] == 1.0 and typed["mlp.gate_proj"] == 0.75
+    # floor applies to the type table too
+    assert cb.tuning_epoch_weights(None, None, 0, NAMES, {"tune_epoch_weights": "type", "tune_epoch_min_frac": 0.5})[
+        "self_attn.k_proj"] == 0.5
+    assert cb.tuning_epoch_weights(None, None, 0, ["fc1", "fc2"], {"tune_epoch_weights": "type"}) == {"fc1": 1.0,
+                                                                                                        "fc2": 1.0}
+    # measured: predicted loss exp(a) r^-beta at the allocated rank, normalised to the block's largest, floored
+    curves = {f"1.{n}": (a, 1.0) for n, a in zip(NAMES, [0.0, 0.0, 1.0, -2.0, 2.0, 2.5, 3.0])}
+    ranks = {f"1.{n}": 100 for n in NAMES}
+    w = cb.tuning_epoch_weights({"curves": curves}, ranks, 1, NAMES, {"tune_epoch_weights": "measured",
+                                                                       "tune_epoch_min_frac": 0.1})
+    assert w["mlp.down_proj"] == 1.0
+    assert abs(w["mlp.up_proj"] - math.exp(-0.5)) < 1e-9 and abs(w["mlp.gate_proj"] - math.exp(-1.0)) < 1e-9
+    assert w["self_attn.k_proj"] == 0.1  # exp(-5) floored
+    # a larger rank lowers the predicted loss and hence the weight
+    ranks2 = dict(ranks, **{"1.mlp.down_proj": 400})
+    w2 = cb.tuning_epoch_weights({"curves": curves}, ranks2, 1, NAMES, {"tune_epoch_weights": "measured"})
+    assert w2["mlp.down_proj"] < 1.0 and w2["mlp.up_proj"] == 1.0
+    # missing curves -> type table fallback; unknown mode -> error
+    fb = cb.tuning_epoch_weights({"curves": {}}, ranks, 1, NAMES, {"tune_epoch_weights": "measured"})
+    assert fb == cb.tuning_epoch_weights(None, None, 1, NAMES, {"tune_epoch_weights": "type"})
+    with pytest.raises(ValueError):
+        cb.tuning_epoch_weights(None, None, 0, NAMES, {"tune_epoch_weights": "banana"})
+
+
+def test_nonfact_rounds_per_group():
+    groups = {"self_attn.q_proj": "self_attn.q_proj", "self_attn.v_proj": "self_attn.q_proj",
+              "self_attn.k_proj": "self_attn.q_proj", "self_attn.o_proj": "self_attn.o_proj",
+              "mlp.gate_proj": "mlp.gate_proj", "mlp.up_proj": "mlp.gate_proj", "mlp.down_proj": "mlp.down_proj"}
+    assert list(cb.nonfact_rounds(NAMES, groups, True).values()) == [True, False, True, False, True, False, True]
+    assert all(cb.nonfact_rounds(NAMES, groups, False).values())
+    assert all(cb.nonfact_rounds(NAMES, {}, True).values())
+
+
+def test_tune_loop_plateau_stop():
+    torch.manual_seed(4)
+    x, y = _data(6)
+    calls = {"n": 0}
+
+    def _run(tol):
+        block = _Block()
+        params = list(block.mlp.parameters())
+        opt = AdamW(params, lr=1e-9, weight_decay=0)  # tiny lr: the loss barely moves -> plateau at epoch 2
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=5 * N, eta_min=1e-12)
+        calls["n"] = 0
+
+        def fn(idx):
+            calls["n"] += 1
+            return block(x[idx:idx + 1])[0]
+
+        with torch.enable_grad():
+            return cb._tune_loop(block, opt, sched, x, y, torch.ones(D), {}, batch_size=2, epochs=5, num_samples=N,
+                                 forward_fn=fn, plateau_tol=tol)
+
+    assert _run(0.0) == 5 and calls["n"] == 5 * N
+    assert _run(0.5) == 2 and calls["n"] == 2 * N
 
 
 def test_tune_loop_with_mlp_forward_matches_full_forward():

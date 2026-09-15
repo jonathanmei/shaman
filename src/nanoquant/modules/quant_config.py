@@ -44,6 +44,13 @@ def NanoQuantConfig(
     nonfact_lr: float = 1e-4,
     nonfact_batch_size: int = 4,
     nonfact_epochs: int = 8,
+    # one non-factorized retuning round per shared-input group (q/k/v, gate/up) instead of before every layer
+    nonfact_per_group: bool = False,
+    # tuning budget per layer: "none" | "type" (fixed table by layer type) | "measured" (rank-probe error at the
+    # allocated rank, normalised per block); floor of the multiplier; plateau stop tolerance (0 = off)
+    tune_epoch_weights: str = "none",
+    tune_epoch_min_frac: float = 0.25,
+    tune_plateau_tol: float = 0.0,
     # fact (admm)
     admm_type: str = "nanoquant",
     admm_outer_iters: int = 400,
@@ -124,6 +131,10 @@ def NanoQuantConfig(
         "nonfact_lr": nonfact_lr,
         "nonfact_batch_size": nonfact_batch_size,
         "nonfact_epochs": nonfact_epochs,
+        "nonfact_per_group": nonfact_per_group,
+        "tune_epoch_weights": tune_epoch_weights,
+        "tune_epoch_min_frac": tune_epoch_min_frac,
+        "tune_plateau_tol": tune_plateau_tol,
         # fact (admm)
         "admm_type": admm_type,
         "admm_outer_iters": admm_outer_iters,

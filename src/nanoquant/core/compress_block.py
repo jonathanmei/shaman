@@ -14,7 +14,7 @@ import torch.nn as nn
 from ..modules.linear import NanoQuantLinear
 from ..optimi import AdamW
 from ..utils.cache import ArtifactCache, admm_key
-from ..utils.utils import cleanup_memory, find_layers, set_seed
+from ..utils.utils import cleanup_memory, find_layers, predicted_loss, set_seed
 from .admm_dbf import factorize_admm_dbf
 from .admm_nq import EigCache, factorize_admm_nanoquant
 from .curvature import SpectrumSpec
@@ -399,17 +399,101 @@ def mlp_only_forward(block, block_inputs, kwargs, target_name: str | None):
     return forward_fn
 
 
+# ----------------------------------------------------------------------------------------------------
+# Tuning budget: epochs per layer from its sensitivity, plateau stopping, and which layers get a
+# non-factorized retuning round
+# ----------------------------------------------------------------------------------------------------
+TUNE_EPOCH_WEIGHT_MODES = ("none", "type", "measured")
+
+# Relative tuning effort per layer type, from the median relative block-loss jump each layer's binarisation causes
+# (k/q ~ +2 %, o/v ~ +10 %, gate +23 %, up +32 %, down +44 %; docs/learnings.md). Anything else (OPT fc1/fc2,
+# out_proj) keeps the full budget.
+TYPE_EPOCH_WEIGHTS = {"q_proj": 0.25, "k_proj": 0.25, "v_proj": 0.5, "o_proj": 0.5, "gate_proj": 0.75,
+                      "up_proj": 1.0, "down_proj": 1.0}
+
+
+def scaled_epochs(epochs: int, scale: float) -> int:
+    """``round(epochs * scale)``, at least 1."""
+    return max(1, round(epochs * scale))
+
+
+def tuning_epoch_weights(sensitivity: dict | None, admm_ranks: dict | None, block: int, names: list[str],
+                         quant_config: dict) -> dict[str, float]:
+    """Per-layer multipliers of the tuning epochs for one block (``tune_epoch_weights``).
+
+    Parameters
+    ----------
+    sensitivity : dict or None
+        Output of :func:`nanoquant.core.rank_probe.measure_sensitivity` (``"curves"``: ``"{block}.{name}" ->
+        (a, beta)``), or ``None``.
+    admm_ranks : dict or None
+        Allocated ranks keyed ``"{block}.{name}"``.
+    block : int
+        Block index.
+    names : list of str
+        Layer names of the block in factorisation order.
+    quant_config : dict
+        ``tune_epoch_weights`` (``none`` = all 1; ``type`` = :data:`TYPE_EPOCH_WEIGHTS`; ``measured`` = the probe's
+        predicted curvature-weighted error at the allocated rank, normalised to the block's largest, falling back to
+        ``type`` when no curve is available) and ``tune_epoch_min_frac`` (floor of every weight).
+
+    Returns
+    -------
+    dict
+        ``name -> weight in [min_frac, 1]``.
+    """
+    mode = quant_config.get("tune_epoch_weights", "none") or "none"
+    if mode not in TUNE_EPOCH_WEIGHT_MODES:
+        raise ValueError(f"Unknown tune_epoch_weights: {mode!r} (choices: {TUNE_EPOCH_WEIGHT_MODES})")
+    if mode == "none":
+        return {n: 1.0 for n in names}
+    floor = float(quant_config.get("tune_epoch_min_frac", 0.25))
+    if mode == "measured":
+        curves = (sensitivity or {}).get("curves", {})
+        raw = {}
+        for n in names:
+            key = f"{block}.{n}"
+            rank = (admm_ranks or {}).get(key)
+            if key in curves and rank:
+                raw[n] = predicted_loss(curves[key], int(rank))
+        if len(raw) == len(names) and max(raw.values()) > 0:
+            top = max(raw.values())
+            return {n: max(floor, min(1.0, raw[n] / top)) for n in names}
+    return {n: max(floor, TYPE_EPOCH_WEIGHTS.get(n.rsplit(".", 1)[-1], 1.0)) for n in names}
+
+
+def nonfact_rounds(names: list[str], groups: dict[str, str], per_group: bool) -> dict[str, bool]:
+    """Which layers are preceded by a non-factorized retuning round.
+
+    With ``per_group`` (``nonfact_per_group``) only the first layer of each shared-input group
+    (:func:`shared_input_groups`; layers reading the same activation cannot change each other's inputs) gets a
+    round; the errors of the skipped members are absorbed by the next group's round. For the Qwen/Llama order
+    q, v, o, k, gate, up, down that is q, o, gate, down: four rounds instead of seven.
+    """
+    if not per_group or not groups:
+        return {n: True for n in names}
+    return {n: groups.get(n, n) == n for n in names}
+
+
 def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs,
-               batch_size: int, epochs: int, num_samples: int, forward_fn=None) -> None:
+               batch_size: int, epochs: int, num_samples: int, forward_fn=None, plateau_tol: float = 0.0) -> int:
     """Shared epoch loop of :func:`tune_nonfact` and :func:`tune_fact`.
 
     Minimises the weighted block reconstruction loss with gradient accumulation over ``batch_size`` samples and
     logs the per-element loss every epoch. ``forward_fn(idx)`` replaces the full block forward when given
-    (:func:`mlp_only_forward`).
+    (:func:`mlp_only_forward`). With ``plateau_tol > 0`` the loop stops once an epoch improves the loss by less
+    than that fraction (the cosine schedule keeps its full length and is simply truncated).
+
+    Returns
+    -------
+    int
+        Number of epochs run.
     """
     device = block_target_outputs.device
     numel = block_target_outputs.numel()
     t0 = time.time()
+    prev = None
+    run = 0
     for epoch in range(epochs):
         data_idx = torch.randperm(num_samples, device="cpu", dtype=torch.long)
         epoch_loss = torch.zeros(1, device=device)
@@ -423,22 +507,32 @@ def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, 
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-        msg = f"\t\t(Epoch {epoch+1:02d}/{epochs:02d}) Block Loss: {(epoch_loss / numel).item():.4e}"
-        if epoch == epochs - 1:
+        run = epoch + 1
+        cur = (epoch_loss / numel).item()
+        plateau = plateau_tol > 0 and prev is not None and (prev - cur) / max(abs(prev), 1e-30) < plateau_tol
+        msg = f"\t\t(Epoch {epoch+1:02d}/{epochs:02d}) Block Loss: {cur:.4e}"
+        if plateau:
+            msg += " | plateau: stop"
+        if epoch == epochs - 1 or plateau:
             msg += f" | {time.time() - t0:.0f}s"
         print(msg)
+        if plateau:
+            break
+        prev = cur
+    return run
 
 
 @torch.enable_grad()
 def tune_nonfact(block, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs, quant_config,
-                 target_name: str | None = None):
+                 target_name: str | None = None, epochs_scale: float = 1.0):
     """Tune the still full-precision linear layers of ``block`` to absorb the quantisation error so far.
 
-    ``target_name`` (the layer about to be binarised) enables the MLP-only forward of :func:`mlp_only_forward`.
+    ``target_name`` (the layer about to be binarised) enables the MLP-only forward of :func:`mlp_only_forward`;
+    ``epochs_scale`` multiplies ``nonfact_epochs`` (:func:`tuning_epoch_weights`).
     """
     set_seed(quant_config['seed'])
     batch_size = quant_config['nonfact_batch_size']
-    epochs = quant_config['nonfact_epochs']
+    epochs = scaled_epochs(quant_config['nonfact_epochs'], epochs_scale)
     num_samples = quant_config['num_calib_samples']
     total_steps = math.ceil(num_samples / batch_size) * epochs
     lr = quant_config['nonfact_lr']
@@ -452,7 +546,7 @@ def tune_nonfact(block, block_inputs, block_target_outputs, importance: torch.Te
     optimizer = AdamW(params, lr=lr, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-4 * lr)
     _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, importance, kwargs, batch_size, epochs,
-               num_samples, forward_fn=forward_fn)
+               num_samples, forward_fn=forward_fn, plateau_tol=float(quant_config.get('tune_plateau_tol', 0.0) or 0.0))
     del forward_fn
     for p in params:
         p.requires_grad = False
@@ -605,16 +699,16 @@ def _hard_sign(x: torch.Tensor) -> torch.Tensor:
 
 @torch.enable_grad()
 def tune_fact(block, target_linear, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs,
-              quant_config, target_name: str | None = None):
+              quant_config, target_name: str | None = None, epochs_scale: float = 1.0):
     """Tune the latent binary factors and scales of ``target_linear`` (STE forward), then harden it.
 
     The number of sign flips relative to the ADMM initialisation is logged as a diagnostic. ``target_name`` enables
-    the MLP-only forward of :func:`mlp_only_forward`.
+    the MLP-only forward of :func:`mlp_only_forward`; ``epochs_scale`` multiplies ``fact_epochs``.
     """
     set_seed(quant_config['seed'])
     forward_fn = mlp_only_forward(block, block_inputs, kwargs, target_name)
     batch_size = quant_config['fact_batch_size']
-    epochs = quant_config['fact_epochs']
+    epochs = scaled_epochs(quant_config['fact_epochs'], epochs_scale)
     num_samples = quant_config['num_calib_samples']
     total_steps = math.ceil(num_samples / batch_size) * epochs
     binary_lr = quant_config['fact_binary_lr']
@@ -626,7 +720,7 @@ def tune_fact(block, target_linear, block_inputs, block_target_outputs, importan
     with torch.no_grad():
         init_signs = {n: _hard_sign(p.detach()) for n, p in target_linear.named_parameters() if "latent" in n}
     _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, importance, kwargs, batch_size, epochs,
-               num_samples, forward_fn=forward_fn)
+               num_samples, forward_fn=forward_fn, plateau_tol=float(quant_config.get('tune_plateau_tol', 0.0) or 0.0))
     del forward_fn
     with torch.no_grad():
         flips = sum(int((_hard_sign(getattr(target_linear, n).detach()) != s).sum().item())

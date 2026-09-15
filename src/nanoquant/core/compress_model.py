@@ -16,9 +16,11 @@ from ..core.compress_block import (
     factorize_and_replace,
     format_drift,
     fresh_input_factor,
+    nonfact_rounds,
     shared_input_groups,
     tune_fact,
     tune_nonfact,
+    tuning_epoch_weights,
 )
 from ..modules.linear import NanoQuantLinear
 from ..optimi import AdamW
@@ -211,17 +213,25 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
         # layers reading the same activation (q/k/v, gate/up) share one fresh input factor and its eigendecomposition
         fresh_cache: dict = {}
         eig_cache = EigCache() if fresh_input else None
+        per_group = bool(quant_config.get('nonfact_per_group', False))
         groups = (shared_input_groups(q_block, sublayers, layers_to_factorize, tuning_inputs[:1], kwargs)
-                  if (fresh_input or diagnostics) else {})
+                  if (fresh_input or diagnostics or per_group) else {})
+        # tuning budget per layer (sensitivity-weighted epochs) and which layers open a non-factorized round
+        present = [n for n in layers_to_factorize if n in sublayers]
+        epoch_weights = tuning_epoch_weights(sensitivity, admm_ranks, i, present, quant_config)
+        rounds = nonfact_rounds(present, groups, per_group)
+        pending: list[str] = []  # layers binarised since the last non-factorized round
         # compress each linear layer
         memo_hits = 0
-        for name in layers_to_factorize:
-            if name not in sublayers: continue
+        for name in present:
             # 1/3) tune non-factorized, full-precision weights to absorb quant error
-            if quant_config['tune_nonfact']:
-                print(f"\t(1/3) Block {i+1}/{n_blocks}, {name} | Tuning Non-Factorized Weights...")
+            if quant_config['tune_nonfact'] and rounds[name]:
+                scale = max((epoch_weights[n] for n in pending), default=1.0)
+                tag = f" (epochs x{scale:.2f})" if scale != 1.0 else ""
+                print(f"\t(1/3) Block {i+1}/{n_blocks}, {name} | Tuning Non-Factorized Weights...{tag}")
                 tune_nonfact(q_block, tuning_inputs, target_outputs, importance, kwargs, quant_config,
-                             target_name=name)
+                             target_name=name, epochs_scale=scale)
+                pending = []
                 cleanup_memory()
             # 2/3) ADMM to factorize/initialize low-rank binary matrices and scales
             print(f"\t(2/3) Block {i+1}/{n_blocks}, {name} | Initialization via ADMM...")
@@ -259,10 +269,13 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             cleanup_memory()
             # 3/3) tune low-rank binary and scales
             if quant_config['tune_fact']:
-                print(f"\t(3/3) Block {i+1}/{n_blocks}, {name} | Tuning Factorized Weights...")
+                w = epoch_weights[name]
+                tag = f" (epochs x{w:.2f})" if w != 1.0 else ""
+                print(f"\t(3/3) Block {i+1}/{n_blocks}, {name} | Tuning Factorized Weights...{tag}")
                 tune_fact(q_block, nano_linear, tuning_inputs, target_outputs, importance, kwargs, quant_config,
-                          target_name=name)
+                          target_name=name, epochs_scale=w)
                 cleanup_memory()
+            pending.append(name)
             cleanup_memory()
         fresh_cache.clear()
         if eig_cache is not None:

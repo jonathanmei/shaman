@@ -128,6 +128,19 @@ class TuneArguments:
     nonfact_lr: float = field(default=1e-4, metadata={"help": "LR for non-factorized binary parameters"})
     nonfact_batch_size: int = field(default=4, metadata={"help": "Batch size for non-factorized tuning"})
     nonfact_epochs: int = field(default=8, metadata={"help": "Epochs for non-factorized tuning"})
+    nonfact_per_group: bool = field(
+        default=False, metadata={"help": "Run the non-factorized retuning once per shared-input group (q/k/v, "
+                                         "gate/up) instead of before every layer"})
+    tune_epoch_weights: str = field(
+        default="none", metadata={"help": "Scale each layer's tuning epochs by its sensitivity: 'none', 'type' "
+                                          "(fixed table by layer type) or 'measured' (rank-probe error at the "
+                                          "allocated rank, normalised per block)",
+                                  "choices": ["none", "type", "measured"]})
+    tune_epoch_min_frac: float = field(
+        default=0.25, metadata={"help": "Floor of the per-layer epoch multiplier"})
+    tune_plateau_tol: float = field(
+        default=0.0, metadata={"help": ">0: stop a tuning stage once an epoch improves the block loss by less "
+                                       "than this fraction"})
     admm_type: str = field(
         default="nanoquant",
         metadata={
@@ -291,6 +304,10 @@ def main():
         nonfact_lr=tune_args.nonfact_lr,
         nonfact_batch_size=tune_args.nonfact_batch_size,
         nonfact_epochs=tune_args.nonfact_epochs,
+        nonfact_per_group=tune_args.nonfact_per_group,
+        tune_epoch_weights=tune_args.tune_epoch_weights,
+        tune_epoch_min_frac=tune_args.tune_epoch_min_frac,
+        tune_plateau_tol=tune_args.tune_plateau_tol,
         admm_type=tune_args.admm_type,
         admm_outer_iters=tune_args.admm_outer_iters,
         admm_inner_iters=tune_args.admm_inner_iters,

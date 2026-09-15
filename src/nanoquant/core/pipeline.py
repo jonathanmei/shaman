@@ -26,6 +26,7 @@ from ..utils.utils import (
     has_mid_scale,
     parse_probe_ranks,
 )
+from .compress_block import TUNE_EPOCH_WEIGHT_MODES
 from .compress_model import compress_block_recon, compress_model_recon
 from .curvature import SpectrumSpec
 from .importance import (
@@ -81,6 +82,12 @@ def validate_config(quant_config: dict) -> None:
     if quant_config.get("admm_input_factor", "calib") not in ADMM_INPUT_FACTORS:
         raise ValueError(f"Unknown admm_input_factor: {quant_config.get('admm_input_factor')}")
     SpectrumSpec.from_config(quant_config)  # raises on negative ranks, an unknown flat mean or a non-positive power
+    if (quant_config.get("tune_epoch_weights", "none") or "none") not in TUNE_EPOCH_WEIGHT_MODES:
+        raise ValueError(f"Unknown tune_epoch_weights: {quant_config.get('tune_epoch_weights')}")
+    if not 0.0 < float(quant_config.get("tune_epoch_min_frac", 0.25)) <= 1.0:
+        raise ValueError("tune_epoch_min_frac must be in (0, 1]")
+    if float(quant_config.get("tune_plateau_tol", 0.0) or 0.0) < 0.0:
+        raise ValueError("tune_plateau_tol must be >= 0")
     if int(quant_config.get("max_blocks", 0) or 0) < 0:
         raise ValueError("max_blocks must be >= 0")
     if int(quant_config.get("curvature_refresh_every", 0) or 0) < 0:

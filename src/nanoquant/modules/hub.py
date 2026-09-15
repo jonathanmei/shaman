@@ -77,6 +77,10 @@ class NanoQuantConfigDataclass:
     nonfact_lr: float = 1e-4
     nonfact_batch_size: int = 4
     nonfact_epochs: int = 8
+    nonfact_per_group: bool = False
+    tune_epoch_weights: str = "none"
+    tune_epoch_min_frac: float = 0.25
+    tune_plateau_tol: float = 0.0
     # fact (admm)
     admm_type: str = "nanoquant"
     admm_outer_iters: int = 400

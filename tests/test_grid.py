@@ -271,6 +271,14 @@ def test_grid_config_keys():
     # the per-block perplexity evaluation is logging only: no key depends on it
     assert C.chain_keys(base, 2) == C.chain_keys(cfg(block_ppl_every=3), 2)
     assert "block_ppl_every" in base and base["block_ppl_every"] == 0
+    # the tuning-budget knobs change the block chain and are validated
+    for knob, value in (("nonfact_per_group", True), ("tune_epoch_weights", "type"), ("tune_epoch_min_frac", 0.5),
+                        ("tune_plateau_tol", 0.01)):
+        assert C.chain_keys(base, 2)[0] != C.chain_keys(cfg(**{knob: value}), 2)[0], knob
+    pipeline.validate_config(cfg(tune_epoch_weights="measured", tune_plateau_tol=0.01, nonfact_per_group=True))
+    for bad in ({"tune_epoch_weights": "banana"}, {"tune_epoch_min_frac": 0.0}, {"tune_plateau_tol": -1.0}):
+        with pytest.raises(ValueError):
+            pipeline.validate_config(cfg(**bad))
 
 
 def test_eval_block_ppl_gating():
