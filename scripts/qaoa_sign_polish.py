@@ -86,6 +86,8 @@ class PolishConfig(BaseModel):
         IonQ backend (``"simulator"``, ``"qpu.aria-1"``, ...) and simulator noise model (``"aria-1"``, ...).
     device : str
         Torch device for the cluster stages.
+    instance_path : str, optional
+        Solve this dumped ``instance.json`` instead of ``out_dir/instance.json`` (other backend, same tile).
     """
 
     pipeline_config: str
@@ -101,6 +103,12 @@ class PolishConfig(BaseModel):
     ionq_target: str = "simulator"
     ionq_noise_model: str | None = None
     device: str = "cuda"
+    instance_path: str | None = None
+
+    @property
+    def instance_file(self) -> Path:
+        """``instance_path`` if set (re-solving a dumped instance with another backend), else ``out_dir/instance.json``."""
+        return Path(self.instance_path) if self.instance_path else Path(self.out_dir) / INSTANCE
 
     @classmethod
     def from_json(cls, path: str | Path) -> PolishConfig:
@@ -226,7 +234,8 @@ def make_sampler(cfg: PolishConfig) -> Sampler:
 def solve(cfg: PolishConfig) -> dict:
     """Run warm-started RQAOA on ``instance.json`` and write ``solution.json``."""
     out = Path(cfg.out_dir)
-    inst = IsingInstance.from_json(out / INSTANCE)
+    out.mkdir(parents=True, exist_ok=True)
+    inst = IsingInstance.from_json(cfg.instance_file)
     signs, conf = inst.meta["admm_signs"], inst.meta["confidence"]
     theta = warm_start_angles(signs, conf, eps=cfg.eps)
     sampler = make_sampler(cfg)
@@ -272,7 +281,7 @@ def verify(cfg: PolishConfig) -> dict:
     W, L, R, result = state["W"], state["L"], state["R"], state["result"]
     before = mahalanobis_weight_error(W, deployed_matrix(result), L, R)
     after = mahalanobis_weight_error(W, deployed_matrix(apply_tile(result, tile, sol["spins"])), L, R)
-    inst = IsingInstance.from_json(out / INSTANCE)
+    inst = IsingInstance.from_json(cfg.instance_file)
     report = {"layer": state["layer"], "rank": state["rank"], "n": tile.n,
               "error_before": before, "error_after": after, "delta_measured": before - after,
               "delta_predicted": inst.energy(tile.signs) - inst.energy(sol["spins"]),

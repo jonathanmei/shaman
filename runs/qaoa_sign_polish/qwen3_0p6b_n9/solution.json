@@ -1,0 +1,142 @@
+{
+ "layer": "27.mlp.down_proj",
+ "n": 9,
+ "backend": "statevector",
+ "ionq_target": null,
+ "shots": 2000,
+ "seed": 0,
+ "eps": 0.1,
+ "n_stop": 4,
+ "admm_energy": 0.046067444114324535,
+ "brute_force_energy": 0.046066040883235966,
+ "rqaoa_energy": 0.046066040883235966,
+ "delta_vs_admm": 1.4032310885689347e-06,
+ "gain_available": 1.4032310885689347e-06,
+ "fraction_captured": 1.0,
+ "hit_optimum": true,
+ "admm_bits_optimal": false,
+ "two_qubit_gates_first_step": 36,
+ "hardware_jobs": 5,
+ "seconds": 0.25770998001098633,
+ "job_ids": [],
+ "spins": [
+  1,
+  -1,
+  -1,
+  1,
+  -1,
+  1,
+  1,
+  -1,
+  1
+ ],
+ "brute_force_spins": [
+  1,
+  -1,
+  -1,
+  1,
+  -1,
+  1,
+  1,
+  -1,
+  1
+ ],
+ "admm_spins": [
+  1,
+  1,
+  1,
+  1,
+  1,
+  -1,
+  1,
+  1,
+  1
+ ],
+ "steps": [
+  {
+   "n": 9,
+   "gammas": [
+    2667614.634472036
+   ],
+   "betas": [
+    -0.7885367295782985
+   ],
+   "expectation": 0.046066310322106716,
+   "elimination": {
+    "kind": "single",
+    "i": 3,
+    "j": null,
+    "sign": 1
+   },
+   "correlation": 0.995
+  },
+  {
+   "n": 8,
+   "gammas": [
+    10996578.913390689
+   ],
+   "betas": [
+    2.340655717517749
+   ],
+   "expectation": 0.046066149288220073,
+   "elimination": {
+    "kind": "pair",
+    "i": 0,
+    "j": 5,
+    "sign": 1
+   },
+   "correlation": 0.974
+  },
+  {
+   "n": 7,
+   "gammas": [
+    9248358.938240206
+   ],
+   "betas": [
+    2.3412430994931768
+   ],
+   "expectation": 0.04606609182759895,
+   "elimination": {
+    "kind": "single",
+    "i": 5,
+    "j": null,
+    "sign": 1
+   },
+   "correlation": 0.988
+  },
+  {
+   "n": 6,
+   "gammas": [
+    -8097371.259637108
+   ],
+   "betas": [
+    0.7959431687140568
+   ],
+   "expectation": 0.04606607780903642,
+   "elimination": {
+    "kind": "single",
+    "i": 7,
+    "j": null,
+    "sign": -1
+   },
+   "correlation": -1.0
+  },
+  {
+   "n": 5,
+   "gammas": [
+    52270532.01353477
+   ],
+   "betas": [
+    0.7930089194467175
+   ],
+   "expectation": 0.046066093953984144,
+   "elimination": {
+    "kind": "single",
+    "i": 4,
+    "j": null,
+    "sign": -1
+   },
+   "correlation": -0.981
+  }
+ ]
+}

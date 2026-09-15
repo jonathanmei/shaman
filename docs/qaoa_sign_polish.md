@@ -79,10 +79,31 @@ uv run python scripts/qaoa_sign_polish.py verify     configs/qaoa_sign_polish_0p
 error-fed block inputs or the fresh input factor of the block loop: the instance is a faithful stand-alone layer
 problem, not literally the one the pipeline solved at that position.
 
-## Readout template
+## Readout (2026-09-15, Qwen3-0.6B-Base, best recipe, `configs/qaoa_sign_polish_0p6b*.json`)
 
-| layer | n | backend | ADMM energy | RQAOA energy | brute force | gain captured | optimum hit | 2q gates | jobs |
-|---|---|---|---|---|---|---|---|---|---|
+`pick-layer` (cluster job 5702981, cache hit on the calibration statistics, rank probe recomputed) ranked the last
+third of blocks (19-27); the top five were `27.mlp.down_proj` (score 8.0e-2, level 23.1), `27.mlp.up_proj` (2.4e-2),
+`27.mlp.gate_proj` (1.8e-2), `26.mlp.up_proj` (1.4e-2), `26.mlp.down_proj` (1.1e-2). Chosen: **block 27,
+`mlp.down_proj`**, allocated rank 1024 (the cap), shape 1024 x 3072. The tile bits (smallest `|A_latent|`) have
+confidence 0.008-0.064, i.e. their ADMM sign is close to a coin flip; fields `|h|` up to 3.5e-7 and couplings `|J|` up
+to 1.1e-8 (couplings roughly ten times weaker than fields on this tile).
 
-`gain captured = (ADMM - RQAOA) / (ADMM - brute force)`; `verify` adds the fp32 `mahalanobis_weight_error` before /
-after and its relative change. Results: pending (see the run directory under `runs/qaoa_sign_polish/`).
+| layer | n | backend | ADMM energy | RQAOA energy | brute force | gain captured | optimum hit | bits flipped | 2q gates | jobs |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 27.mlp.down_proj | 9 | statevector | 4.606744e-2 | 4.606604e-2 | 4.606604e-2 | 100% | yes | 5 / 9 | 36 | 5 |
+| 27.mlp.down_proj | 12 | statevector | 4.606744e-2 | 4.606597e-2 | 4.606597e-2 | 100% | yes | 6 / 12 | 66 | 8 |
+
+`gain captured = (ADMM - RQAOA) / (ADMM - brute force)`. The ADMM bits were **not** optimal on either tile: the exact
+optimum lowers the layer error by 1.40e-6 (n = 9) and 1.47e-6 (n = 12), i.e. by 3.1e-5 and 3.2e-5 relative.
+`verify` on the cluster re-applied the RQAOA bits to the saved layer: fp32 `mahalanobis_weight_error`
+4.606745e-2 -> 4.606604e-2 (n = 9, measured drop 1.408e-6 vs 1.403e-6 predicted) and -> 4.606597e-2 (n = 12,
+1.475e-6 vs 1.472e-6), the residual being fp32 accumulation. Every recursion step fixed a variable with
+|correlation| >= 0.93 (mostly single-spin `<Z>` because the fields dominate; one pair elimination at n = 9).
+
+**IonQ stages not run.** `configs/qaoa_sign_polish_0p6b_n9_ionq_sim.json` (Aria-1 noise model) and
+`..._n9_ionq_qpu.json` are ready, and the circuits are validated against qiskit's statevector, but the API rejected the
+submission with `403 Your account is disabled` for the token in `QISKIT_IONQ_API_TOKEN`; re-run `solve` with those
+configs once the account is re-enabled (`IONQ_API_KEY` or `QISKIT_IONQ_API_TOKEN`).
+
+Caveat repeated: a 3e-5 relative change of one layer's weight error is invisible in perplexity; the demo shows the
+pipeline -> Ising -> RQAOA -> pipeline loop closes exactly, nothing more.

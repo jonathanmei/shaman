@@ -102,7 +102,7 @@ class IonQSampler:
     noise_model : str or None
         For the simulator: ``"aria-1"``, ``"forte-1"``, ... (``None`` = ideal).
     token : str or None
-        API key; defaults to ``IONQ_API_KEY``.
+        API key; defaults to ``IONQ_API_KEY``, then to qiskit-ionq's own ``QISKIT_IONQ_API_TOKEN``.
     """
 
     def __init__(self, target: str = "simulator", noise_model: str | None = None, token: str | None = None):

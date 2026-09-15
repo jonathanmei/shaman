@@ -1,0 +1,202 @@
+{
+ "layer": "27.mlp.down_proj",
+ "n": 12,
+ "backend": "statevector",
+ "ionq_target": null,
+ "shots": 4000,
+ "seed": 0,
+ "eps": 0.1,
+ "n_stop": 4,
+ "admm_energy": 0.04606744411432453,
+ "brute_force_energy": 0.04606597184139883,
+ "rqaoa_energy": 0.04606597184139883,
+ "delta_vs_admm": 1.4722729256982925e-06,
+ "gain_available": 1.4722729256982925e-06,
+ "fraction_captured": 1.0,
+ "hit_optimum": true,
+ "admm_bits_optimal": false,
+ "two_qubit_gates_first_step": 66,
+ "hardware_jobs": 8,
+ "seconds": 0.7070760726928711,
+ "job_ids": [],
+ "spins": [
+  1,
+  -1,
+  -1,
+  1,
+  -1,
+  1,
+  1,
+  -1,
+  1,
+  1,
+  1,
+  -1
+ ],
+ "brute_force_spins": [
+  1,
+  -1,
+  -1,
+  1,
+  -1,
+  1,
+  1,
+  -1,
+  1,
+  1,
+  1,
+  -1
+ ],
+ "admm_spins": [
+  1,
+  1,
+  1,
+  1,
+  1,
+  -1,
+  1,
+  1,
+  1,
+  1,
+  -1,
+  -1
+ ],
+ "steps": [
+  {
+   "n": 12,
+   "gammas": [
+    11616753.496077511
+   ],
+   "betas": [
+    2.3454645293268754
+   ],
+   "expectation": 0.04606630273118548,
+   "elimination": {
+    "kind": "single",
+    "i": 6,
+    "j": null,
+    "sign": 1
+   },
+   "correlation": 0.9485
+  },
+  {
+   "n": 11,
+   "gammas": [
+    11653500.246725444
+   ],
+   "betas": [
+    2.34356077388456
+   ],
+   "expectation": 0.0460663095616563,
+   "elimination": {
+    "kind": "single",
+    "i": 0,
+    "j": null,
+    "sign": 1
+   },
+   "correlation": 0.9335
+  },
+  {
+   "n": 10,
+   "gammas": [
+    2754514.1488310676
+   ],
+   "betas": [
+    2.353210835723538
+   ],
+   "expectation": 0.04606626349923545,
+   "elimination": {
+    "kind": "single",
+    "i": 3,
+    "j": null,
+    "sign": 1
+   },
+   "correlation": 0.9935
+  },
+  {
+   "n": 9,
+   "gammas": [
+    11267187.114373652
+   ],
+   "betas": [
+    2.3449488239414737
+   ],
+   "expectation": 0.04606612045491218,
+   "elimination": {
+    "kind": "single",
+    "i": 5,
+    "j": null,
+    "sign": 1
+   },
+   "correlation": 0.968
+  },
+  {
+   "n": 8,
+   "gammas": [
+    53343554.624227256
+   ],
+   "betas": [
+    0.7872125912674284
+   ],
+   "expectation": 0.04606618404515834,
+   "elimination": {
+    "kind": "single",
+    "i": 9,
+    "j": null,
+    "sign": 1
+   },
+   "correlation": 0.9835
+  },
+  {
+   "n": 7,
+   "gammas": [
+    8045018.301860878
+   ],
+   "betas": [
+    2.3507223232986982
+   ],
+   "expectation": 0.04606601735271343,
+   "elimination": {
+    "kind": "single",
+    "i": 7,
+    "j": null,
+    "sign": -1
+   },
+   "correlation": -0.9965
+  },
+  {
+   "n": 6,
+   "gammas": [
+    8295981.177396252
+   ],
+   "betas": [
+    2.355432977009325
+   ],
+   "expectation": 0.04606601538896738,
+   "elimination": {
+    "kind": "single",
+    "i": 2,
+    "j": null,
+    "sign": -1
+   },
+   "correlation": -0.998
+  },
+  {
+   "n": 5,
+   "gammas": [
+    8498016.883059094
+   ],
+   "betas": [
+    2.3597926303676364
+   ],
+   "expectation": 0.04606601506547073,
+   "elimination": {
+    "kind": "single",
+    "i": 11,
+    "j": null,
+    "sign": -1
+   },
+   "correlation": -0.9955
+  }
+ ]
+}
