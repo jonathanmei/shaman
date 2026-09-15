@@ -98,6 +98,47 @@ all-to-all cost layer. Used only in the `crosscheck` stage: statevector vs Pauli
 Classical references above 22 bits (no brute force): greedy single-flip descent from the ADMM bits and best-of-8
 simulated annealing; `fraction_captured` is then relative to the better of the two and flagged as such.
 
+## Readout: 64 and 256 bits, depths 1-3 (2026-09-15, jobs 5710925-5710927, run records under `runs/`)
+
+Same layer (`27.mlp.down_proj`, rank 1024), tiles nested by the least-confident-bit rule. Energies are the
+curvature-weighted layer error; the ADMM bits give 4.606744e-2 on every tile. Reference above 22 bits = better of
+greedy 1-flip descent from the ADMM bits and best-of-8 simulated annealing (they agreed on both tiles).
+
+| tile | p | engine | RQAOA energy | gain captured | 1-flip local min | bits flipped | wall time | verify (fp32 drop) |
+|---|---|---|---|---|---|---|---|---|
+| 64 | 1 | exact p = 1, all pairs, re-optimised each step | 4.606017e-2 | 100% (= reference) | yes | 29 / 64 | 3.5 min | 7.264e-6 vs 7.272e-6 predicted |
+| 64 | 2 | Pauli k = 1, 16 active, top-8 pairs, re-opt every 16 | 4.606017e-2 (same bits as p = 1) | 100% | yes | 29 / 64 | 2.6 h (2.5 h in the 8-start first step) | same |
+| 64 | 3 | Pauli k = 1, 8 active, top-4 pairs, angles from 24-spin sub-tile | 4.606017e-2 (same bits) | 100% | yes | 29 / 64 | 54 min (47 min sub-tile optimisation) | same |
+| 256 | 1 | exact p = 1, top-8 pairs, re-opt every 4 | 4.605325e-2 | 97% | no | 78 / 256 | 23 min | 1.419e-5 vs 1.420e-5 |
+| 256 | 2 | Pauli k = 1, 16 active, top-4 pairs, angles from 32-spin sub-tile | 4.605302e-2 | 98% | no | 76 / 256 | 53 min (10 min sub-tile) | 1.442e-5 vs 1.443e-5 |
+
+Relative layer-error change: -1.6e-4 (64 bits), -3.1e-4 (256 bits). Depth did not change the answer at 64 bits and
+moved 8 of 256 bits at 256 bits (p = 2 slightly better than p = 1, still short of a 1-flip local minimum: the
+restricted pair set and fixed angles leave a residue that one greedy pass would close).
+
+**Cross-check on the 32-bit tile** (`runs/qaoa_sign_polish/qwen3_0p6b_n32_crosscheck/crosscheck.json`). Angles were
+optimised on the statevector of the 16-bit sub-instance per depth and reused on the full tile.
+
+| depth | sub-instance (16 bits) vs statevector, max |d<ZZ>| | full 32 bits, methods vs each other |
+|---|---|---|
+| 1 | Pauli k = 0..2: 6e-14; MPS chi = 16: 1.6e-6, chi = 64: 1.1e-7 | all agree to 1e-6 |
+| 2 | Pauli k = 0: 1.8e-1, k = 1: 4.6e-2, k = 2: 1.3e-2; MPS chi = 16: 1.9e-3, chi = 64: 3.4e-6 | Pauli k = 1 vs k = 2: 7e-2; MPS chi = 16 vs chi = 64: ~2e-2 apart; k = 2 vs chi = 64: 1.9e-2 |
+| 3 | Pauli k = 1: 4.1e-2, k = 2: 3.8e-3; MPS chi = 16: 3.1e-4, chi = 64: 6.5e-7 | Pauli k = 0 vs k = 1: 8e-2; MPS chi = 16 vs chi = 64: 4e-2 |
+
+Reading: at p = 1 everything is exact, as designed. At p >= 2 on the *real* tile the optimised angles put the coupling
+phases at `gamma J ~ 0.1-0.2 rad`, so the perturbative truncation converges slowly (a few percent error in
+individual correlations at k = 1, ~1% at k = 2) while the MPS at chi = 64 is exact on 16 qubits; on 32 qubits neither
+engine is converged (chi = 16 vs 64 differ by 2e-2, k = 1 vs 2 by 7e-2). Energies nevertheless agree to ~3e-8 because
+the fields dominate. So the p > 1 recursions above ran on correlations with a few percent error; that was enough to
+make the same eliminations as p = 1 at 64 bits, and the 256-bit p = 2 result should be read as consistent with p = 1
+rather than independently confirmed. The right p > 1 engine for a definitive statement at 32-64 bits is the MPS at
+chi >= 64 (exact-checked at 16), which cost 37-45 min per evaluation on the cluster (50-80 s on a laptop: the cluster
+numpy/quimb run was effectively single-threaded).
+
+Lessons for the next round: `python -u` in Slurm jobs (stdout is block-buffered, logs appear only at exit); never 8
+random angle starts at a few seconds per evaluation (2.5 h at 64 bits p = 2) - optimise on a sub-tile or carry angles;
+check BLAS threading on the cluster before MPS runs.
+
 ## Running it
 
 ```
