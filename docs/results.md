@@ -641,3 +641,61 @@ Verdict: closed for accuracy. A structured, eigh-free Sylvester step would only 
 the cheapest acceptable one (two-sided on shrunk factors, +0.10) is within noise but on the wrong side at every
 block, and the ADMM compute saving would be at most the ~40 % ADMM share of block reconstruction. The knobs stay in
 the code (defaults off; part of the cache keys) and the projection-gap diagnostic is useful on its own.
+
+### Structured solver at 4B (job 5701940, 2026-09-15): no compute case
+
+The low-rank-plus-identity fast path (`CurvatureFactor`, on whenever the spectrum is projected) was run on the 4B
+best recipe with spike 256 / dip 256 / GM. Per-block ADMM totals against the dense run 5663775: block 0 162 vs
+175 s, 4 226 vs 247, 7 242 vs 260, 12 198 vs 204, 17 167 vs 173 (5-8 % of ADMM, 1-2 % of block time); block-17
+per-layer 16.5 / 12.9 / 28.1 / 12.8 / 23.9 / 36.0 / 36.5 s vs 16.7 / 12.7 / 28.0 / 12.5 / 26.2 / 38.6 / 38.6 s. The
+`n^2 k` products the projection removes are not where 4B ADMM time goes; the fp64 `k x k` eigendecomposition run
+twice per iteration and the rank-1 projections are. The job was left to time out at block 23 and not resumed; the
+projection is not part of any recipe. (At 0.6B, job 5701939, the same arm was within noise, 14.18 vs 14.15, at
+identical ADMM time.)
+
+## Efficiency fixes, tuning-budget screen and the KD-only middle scale (2026-09-15, branch `spectral-projection-screen`)
+
+Code (commits 87f0521, e877a52, 815f3d1, ef298c6): fp32 for the per-iteration `k x k` Sylvester eigh
+(`SYLVESTER_EIGH_DTYPE`) and `kron_eigh_dtype: float32` in the 1.7B/4B best configs; per-block perplexity evaluation
+gated (`block_ppl_every`, screens keep it via `block_diagnostics`) with the tokenised test set cached; `EigCache` in
+the rank probe (one decomposition per factor instead of one per candidate rank; the 4B probe went from ~45 to ~13
+min); MLP-only tuning forward once the attention half is frozen (`mlp_only_forward`); calibration without
+per-sample GPU syncs and with bf16 previous-pass ALS weights on the GPU (4B: 2 layer groups instead of 3, 6 model
+passes instead of 9; the first version materialised a whole group in fp32 and OOMed, job 5713189, fixed in
+ef298c6); on-device reconstruction error, single weight clone, no per-epoch allocator flush, block targets kept on
+the GPU, copy-free tensor hash. Tuning-budget knobs: `tune_epoch_weights` (`type` table from the block-loss jumps,
+q/k 0.25, v/o 0.5, gate 0.75, up/down 1; or `measured` from the probe's predicted error at the allocated rank),
+`tune_epoch_min_frac`, `tune_plateau_tol`, `nonfact_per_group` (rounds before q, o, gate, down only).
+
+0.6B 4-block screen on the fixed code (`qwen3_0p6b_proj_ctrl_s02.json` = current recipe; jobs 5713182-5713188,
+22-25 min each incl. recomputed calibration):
+
+| arm | knob | block 0 | block 1 | block 2 | **block 3** | wall per block |
+|---|---|---|---|---|---|---|
+| reference (fixes only) | – | 13.72 | 13.55 | 13.87 | **14.15** | 145-150 s |
+| plateau | `tune_plateau_tol 0.01` | 13.79 | 13.60 | 13.96 | 14.23 | 109-127 s |
+| **type** | `tune_epoch_weights type` | 14.37 | 13.59 | 13.88 | **14.16** | 103-109 s |
+| measured | `tune_epoch_weights measured` | 14.44 | 13.60 | 14.04 | 14.30 | 102-110 s |
+| group | `nonfact_per_group` | 14.25 | 13.79 | 14.13 | 14.43 | 114-119 s |
+| all | type + plateau + group | 14.60 | 13.67 | 14.04 | 14.30 | 102-114 s |
+
+- The fixes are lossless: the reference reproduces the dense control's block-3 PPL (14.15 vs 14.149, job 5666720)
+  at 145-150 s per block against 146-169 s (~5 % at 0.6B, where the screen keeps the fp64 eigh and the per-block
+  evaluation; the 4B saving is measured by job 5713834).
+- **Type-weighted epochs: −28 % block time at +0.01 block-3 PPL** (block 0 is worse by 0.6 and the gap closes by
+  block 1: the first block's q/k/v/o get 2-4 epochs and the later blocks absorb it). Adopted into the recipes.
+- Plateau stop: −20 % at +0.08, within noise but dominated by `type`; not adopted (can be combined later).
+- Measured weights are no better than the type table (+0.15) and cost the same; the table wins on simplicity.
+- **Skipping non-factorized rounds hurts** (+0.28, outside noise): every layer's round matters, including the
+  intra-group ones. Not adopted.
+
+KD-only middle scale (`model_kd_mid_scale`: a per-rank `scale_mid` initialised to ones is inserted before the
+scale-only KD; nothing upstream changes). From the cached pre-KD artifact of job 5617842 (measured ranks, parity, no
+ramp; its recorded final PPL 23.75): reference KD rerun **23.78** (job 5713832, reproduces the recorded run to 0.03),
+with the middle scale **23.69** (job 5713833): −0.09 PPL for 16 bits per rank (+0.4 % of the factorised bits). KD is
+deterministic to ~0.02 on a fixed pre-KD model, so the gain is real but small. Adopted (cheap and positive).
+
+Record of the earlier middle-scale arms (2026-09-02/05): the exact SVID triple through tuning and KD lost 3.5-5 PPL
+at 0.6B; the mean-1 rebalanced export (`kron_midbal`) 25.44 vs 25.82 two-scale, within noise; the mid-scale LR-ratio
+sweep 26.58 / 26.72 / 26.59 / 27.26 for ratios 0 / 1 / 10 / 100, flat to negative. The degree of freedom only pays
+when it enters at the end-to-end stage from the identity.

@@ -22,6 +22,15 @@ is derived in `rank_allocation_note.html`.
 Every recipe keeps the paper's protocol: 128 × 2048 WikiText-2 calibration samples, seed 0, 2 scales, 8/8/8 epochs,
 scale-only KD, and the same total bits as the uniform rank rule (parity).
 
+Recipe additions of 2026-09-15 (branch `spectral-projection-screen`, `results.md` "Efficiency fixes, tuning-budget
+screen and the KD-only middle scale"): `tune_epoch_weights: type` (q/k 2 epochs, v/o 4, gate 6, up/down 8 per
+stage: −28 % block time at +0.01 block-3 PPL on the 0.6B screen) and `model_kd_mid_scale: true` (a per-rank
+middle scale initialised to ones and trained only by KD: −0.09 PPL for +0.4 % bits). Plus the lossless efficiency
+fixes (fp32 Sylvester eigh, gated per-block eval, probe eigen cache, MLP-only tuning forward, leaner calibration).
+Not adopted after measurement: the spike-plus-flat / structured ADMM (5-8 % of 4B ADMM time, 1-2 % of block time),
+plateau stopping (dominated by the type table), measured epoch weights (no better than the table), non-factorized
+retuning per input group (+0.28 PPL: every round matters).
+
 ## Three things to keep
 
 ### 1. Where the bits go matters more than how well each layer is fit
