@@ -699,3 +699,13 @@ Record of the earlier middle-scale arms (2026-09-02/05): the exact SVID triple t
 at 0.6B; the mean-1 rebalanced export (`kron_midbal`) 25.44 vs 25.82 two-scale, within noise; the mid-scale LR-ratio
 sweep 26.58 / 26.72 / 26.59 / 27.26 for ratios 0 / 1 / 10 / 100, flat to negative. The degree of freedom only pays
 when it enters at the end-to-end stage from the identity.
+
+## Qwen3-8B-Base, best fast 2-scale recipe (2026-09-15, branch `spectral-projection-screen` @ fe181ac)
+
+First 8B run. `configs/qwen3_8b_best.json` = the 4B best config with `tune_epoch_weights: type`,
+`kron_gpu_budget_gb: 96` and the fp32 eigh; measured × ramp 0.6 parity ranks (probe 0.6/1.0/1.4), refresh every 9
+blocks, 2 scales, no KD middle scale. Job **5721334**: one h200 on partition `lgpus` (no 4 h limit; 3-day request,
+400G), from the pinned checkout `ob:~/code/shaman-8b` with `cache/` and `checkpoints/` symlinked to the shared
+checkout, log `.objob/logs/nq-8b-best-5721334.out`. Everything (stats, probe, blocks, KD) is computed from scratch.
+Readout pending: WikiText-2 PPL, bpw, zero-shot mean, wall time per stage (calibration, probe, per block, KD) for
+comparison with the 4B fixes run 5713834 and the paper's 8B point.
