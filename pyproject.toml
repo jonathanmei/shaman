@@ -16,7 +16,9 @@ dependencies = [
     "gemlite>=0.4.0",
     "lm_eval>=0.4.9",
     "loguru>=0.7.0",
+    "numpy>=2.2.6",
     "optimum>=1.27.0",
+    "scipy>=1.15.3",
     "torch>=2.6.0,<2.9",
     "tqdm>=4.60.0",
     "transformers==4.51.3",
@@ -26,6 +28,10 @@ dependencies = [
 [project.optional-dependencies]
 kernels = []
 dev = ["pytest", "ruff", "mypy"]
+quantum = [
+    "qiskit>=2.5.2",
+    "qiskit-ionq>=1.1.1",
+]
 
 [project.scripts]
 nanoquant = "nanoquant.main:main"

@@ -1,0 +1,15 @@
+{
+  "pipeline_config": "configs/qwen3_0p6b_best.json",
+  "out_dir": "runs/qaoa_sign_polish/qwen3_0p6b_n12",
+  "block": null,
+  "module": null,
+  "n": 12,
+  "shots": 4000,
+  "seed": 0,
+  "n_stop": 4,
+  "eps": 0.1,
+  "backend": "statevector",
+  "ionq_target": "simulator",
+  "ionq_noise_model": "aria-1",
+  "device": "cuda"
+}

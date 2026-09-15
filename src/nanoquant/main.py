@@ -244,13 +244,15 @@ def parse_arguments(argv: list[str] | None = None):
     return parser.parse_args_into_dataclasses(args=argv)
 
 
-def main():
-    model_args, quant_args, tune_args, eval_args = parse_arguments()
+def build_quant_config(model_args, quant_args, tune_args) -> NanoQuantConfigDataclass:
+    """Merge the parsed argument groups into one :class:`NanoQuantConfigDataclass`.
 
-    init_logging()
-
-    # Merge into NanoQuantConfigDataclass
-    quant_config = NanoQuantConfigDataclass(
+    Parameters
+    ----------
+    model_args, quant_args, tune_args
+        ``ModelArguments``, ``QuantArguments``, ``TuneArguments`` from :func:`parse_arguments`.
+    """
+    return NanoQuantConfigDataclass(
         model_id=model_args.model_id,
         bits=quant_args.bits,
         rank_budget=quant_args.rank_budget,
@@ -304,6 +306,20 @@ def main():
         model_kd_epochs=tune_args.model_kd_epochs,
         model_kd_teacher=tune_args.model_kd_teacher,
     )
+
+
+def load_quant_config(json_path: str) -> dict:
+    """The quantisation config dict of a pipeline JSON config file (as ``main`` builds it)."""
+    model_args, quant_args, tune_args, _ = parse_arguments([json_path])
+    return build_quant_config(model_args, quant_args, tune_args).to_dict()
+
+
+def main():
+    model_args, quant_args, tune_args, eval_args = parse_arguments()
+
+    init_logging()
+
+    quant_config = build_quant_config(model_args, quant_args, tune_args)
     logger.info(f"Quantization config:\n{json.dumps(quant_config.to_dict(), indent=2)}")
 
     if model_args.from_hub:
