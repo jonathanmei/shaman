@@ -187,6 +187,9 @@ class TuneArguments:
     block_ppl_every: int = field(
         default=0, metadata={"help": ">0: evaluate WikiText-2 perplexity every N blocks and after the last one "
                                      "(0 = only with --block_diagnostics)"})
+    model_kd_mid_scale: bool = field(
+        default=False, metadata={"help": "KD: add a per-rank middle scale initialised to ones to every factorised "
+                                         "layer that has none and train it with the other scales"})
     block_diagnostics: bool = field(
         default=False,
         metadata={"help": "Log input-factor drift, Mahalanobis weight errors (stale vs fresh factor) and the "
@@ -324,6 +327,7 @@ def main():
         curvature_refresh_iters=tune_args.curvature_refresh_iters,
         block_diagnostics=tune_args.block_diagnostics,
         block_ppl_every=tune_args.block_ppl_every,
+        model_kd_mid_scale=tune_args.model_kd_mid_scale,
         tune_fact=tune_args.tune_fact,
         fact_binary_lr=tune_args.fact_binary_lr,
         fact_scale_lr=tune_args.fact_scale_lr,

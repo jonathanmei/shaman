@@ -50,7 +50,8 @@ BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits", "rank_budget", "rank
     "tune_nonfact", "nonfact_lr", "nonfact_batch_size", "nonfact_epochs", "nonfact_per_group",
     "tune_epoch_weights", "tune_epoch_min_frac", "tune_plateau_tol", "tune_fact", "fact_binary_lr",
     "fact_scale_lr", "fact_bias_lr", "fact_batch_size", "fact_epochs")
-KD_FIELDS: tuple[str, ...] = ("model_kd_lr", "model_kd_batch_size", "model_kd_epochs", "pre_kd_checkpoint")
+KD_FIELDS: tuple[str, ...] = ("model_kd_lr", "model_kd_batch_size", "model_kd_epochs", "pre_kd_checkpoint",
+                              "model_kd_mid_scale")
 TEACHER_FIELDS: tuple[str, ...] = ("model_id", "seqlen", "calib_dataset", "num_calib_samples", "seed")
 # the calibration-time rank-sensitivity probe: everything the short ADMM solves and their curvature-weighted
 # errors depend on (not the production iteration count or the eigh precision: the probe fixes its own)
@@ -64,7 +65,7 @@ SOURCE_GROUPS: dict[str, tuple[str, ...]] = {
     "admm": ("core/admm_nq.py", "core/admm_dbf.py", "core/compress_block.py", "core/curvature.py"),
     "blocks": ("core/admm_nq.py", "core/admm_dbf.py", "core/compress_block.py", "core/compress_model.py",
                "modules/linear.py", "core/curvature.py", "core/rank_probe.py"),
-    "kd": ("core/compress_model.py", "core/teacher.py", "core/kd_loss.py"),
+    "kd": ("core/compress_model.py", "core/teacher.py", "core/kd_loss.py", "core/kd_mid_scale.py"),
     "curvature": ("core/curvature.py",),
     "rank_probe": ("core/rank_probe.py", "core/admm_nq.py", "core/curvature.py", "core/compress_block.py"),
 }

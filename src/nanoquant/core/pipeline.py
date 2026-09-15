@@ -36,6 +36,7 @@ from .importance import (
     get_shrunk_stats,
     register_stats,
 )
+from .kd_mid_scale import insert_unit_mid_scales
 from .rank_probe import PROBE_KIND, measure_sensitivity
 from .resume import compressed_state_dict
 
@@ -218,6 +219,10 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
 
     # 3) model-level KD (scale reconstruction)
     if quant_config.get('tune_model', True) and not truncated:
+        if quant_config.get('model_kd_mid_scale', False):
+            # per-rank middle scales, identity-initialised, trained by the scale-only KD (block stage untouched)
+            n_mid = insert_unit_mid_scales(model)
+            print(f"[kd] inserted a unit middle scale into {n_mid} factorised layers")
         model = compress_model_recon(model, fp_model, dataloader, quant_config, dev=dev, cache=cache)
 
     print(format_accounting(model_accounting(model), title="bpw actual"))
