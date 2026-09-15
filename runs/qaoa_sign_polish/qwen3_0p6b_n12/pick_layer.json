@@ -1,0 +1,506 @@
+[
+ {
+  "key": "27.mlp.down_proj",
+  "block": 27,
+  "name": "mlp.down_proj",
+  "rank": 1024,
+  "level": 23.102292165856312,
+  "score": 0.08048711954796312
+ },
+ {
+  "key": "27.mlp.up_proj",
+  "block": 27,
+  "name": "mlp.up_proj",
+  "rank": 1024,
+  "level": 7.071695346893497,
+  "score": 0.024333471614041598
+ },
+ {
+  "key": "27.mlp.gate_proj",
+  "block": 27,
+  "name": "mlp.gate_proj",
+  "rank": 1024,
+  "level": 4.9470759003574765,
+  "score": 0.017556063105881453
+ },
+ {
+  "key": "26.mlp.up_proj",
+  "block": 26,
+  "name": "mlp.up_proj",
+  "rank": 1024,
+  "level": 5.199023532340011,
+  "score": 0.013636610672267202
+ },
+ {
+  "key": "26.mlp.down_proj",
+  "block": 26,
+  "name": "mlp.down_proj",
+  "rank": 1024,
+  "level": 3.5734563132299946,
+  "score": 0.01086499653925618
+ },
+ {
+  "key": "27.self_attn.v_proj",
+  "block": 27,
+  "name": "self_attn.v_proj",
+  "rank": 1024,
+  "level": 3.2911317600213295,
+  "score": 0.010505555412295909
+ },
+ {
+  "key": "26.mlp.gate_proj",
+  "block": 26,
+  "name": "mlp.gate_proj",
+  "rank": 928,
+  "level": 2.7872199729208234,
+  "score": 0.009268686887293485
+ },
+ {
+  "key": "25.mlp.down_proj",
+  "block": 25,
+  "name": "mlp.down_proj",
+  "rank": 928,
+  "level": 3.770991579944904,
+  "score": 0.008922219293400618
+ },
+ {
+  "key": "22.mlp.down_proj",
+  "block": 22,
+  "name": "mlp.down_proj",
+  "rank": 928,
+  "level": 4.442675844085913,
+  "score": 0.008791922371476751
+ },
+ {
+  "key": "19.mlp.up_proj",
+  "block": 19,
+  "name": "mlp.up_proj",
+  "rank": 896,
+  "level": 3.0336914084601627,
+  "score": 0.008680674512035495
+ },
+ {
+  "key": "21.mlp.down_proj",
+  "block": 21,
+  "name": "mlp.down_proj",
+  "rank": 928,
+  "level": 4.363690064745843,
+  "score": 0.008594882071818485
+ },
+ {
+  "key": "24.mlp.down_proj",
+  "block": 24,
+  "name": "mlp.down_proj",
+  "rank": 896,
+  "level": 3.8829709149266325,
+  "score": 0.008590457783094273
+ },
+ {
+  "key": "25.mlp.up_proj",
+  "block": 25,
+  "name": "mlp.up_proj",
+  "rank": 896,
+  "level": 3.1946000009169375,
+  "score": 0.008446977604143724
+ },
+ {
+  "key": "20.mlp.up_proj",
+  "block": 20,
+  "name": "mlp.up_proj",
+  "rank": 832,
+  "level": 2.753430930979019,
+  "score": 0.008347943224920622
+ },
+ {
+  "key": "23.mlp.down_proj",
+  "block": 23,
+  "name": "mlp.down_proj",
+  "rank": 896,
+  "level": 4.180134421388529,
+  "score": 0.008225894938856362
+ },
+ {
+  "key": "21.mlp.up_proj",
+  "block": 21,
+  "name": "mlp.up_proj",
+  "rank": 832,
+  "level": 2.75071938090289,
+  "score": 0.008042145097238159
+ },
+ {
+  "key": "19.mlp.down_proj",
+  "block": 19,
+  "name": "mlp.down_proj",
+  "rank": 832,
+  "level": 3.5696966619484916,
+  "score": 0.007954222183565026
+ },
+ {
+  "key": "20.mlp.down_proj",
+  "block": 20,
+  "name": "mlp.down_proj",
+  "rank": 832,
+  "level": 3.819843473127124,
+  "score": 0.0077851066484673
+ },
+ {
+  "key": "24.mlp.up_proj",
+  "block": 24,
+  "name": "mlp.up_proj",
+  "rank": 800,
+  "level": 2.7788046444219123,
+  "score": 0.007766397725884165
+ },
+ {
+  "key": "23.mlp.up_proj",
+  "block": 23,
+  "name": "mlp.up_proj",
+  "rank": 768,
+  "level": 2.587446184990709,
+  "score": 0.007636801832744879
+ },
+ {
+  "key": "22.mlp.up_proj",
+  "block": 22,
+  "name": "mlp.up_proj",
+  "rank": 768,
+  "level": 2.494839415337132,
+  "score": 0.007509740771436571
+ },
+ {
+  "key": "25.mlp.gate_proj",
+  "block": 25,
+  "name": "mlp.gate_proj",
+  "rank": 736,
+  "level": 1.9649989453219485,
+  "score": 0.007192589710513295
+ },
+ {
+  "key": "24.mlp.gate_proj",
+  "block": 24,
+  "name": "mlp.gate_proj",
+  "rank": 704,
+  "level": 2.04290543710955,
+  "score": 0.0071215848444609355
+ },
+ {
+  "key": "23.mlp.gate_proj",
+  "block": 23,
+  "name": "mlp.gate_proj",
+  "rank": 704,
+  "level": 2.0078693337899916,
+  "score": 0.0070446634637893815
+ },
+ {
+  "key": "22.mlp.gate_proj",
+  "block": 22,
+  "name": "mlp.gate_proj",
+  "rank": 672,
+  "level": 1.7200785862827823,
+  "score": 0.006603460762109754
+ },
+ {
+  "key": "24.self_attn.v_proj",
+  "block": 24,
+  "name": "self_attn.v_proj",
+  "rank": 1024,
+  "level": 5.487542896340645,
+  "score": 0.006573805568604086
+ },
+ {
+  "key": "21.mlp.gate_proj",
+  "block": 21,
+  "name": "mlp.gate_proj",
+  "rank": 640,
+  "level": 1.4715762637634524,
+  "score": 0.006193787002517591
+ },
+ {
+  "key": "20.mlp.gate_proj",
+  "block": 20,
+  "name": "mlp.gate_proj",
+  "rank": 640,
+  "level": 1.4218159250814586,
+  "score": 0.006171187576683889
+ },
+ {
+  "key": "19.mlp.gate_proj",
+  "block": 19,
+  "name": "mlp.gate_proj",
+  "rank": 608,
+  "level": 1.3062865625800348,
+  "score": 0.006062867803077566
+ },
+ {
+  "key": "25.self_attn.v_proj",
+  "block": 25,
+  "name": "self_attn.v_proj",
+  "rank": 1024,
+  "level": 5.0340642634595145,
+  "score": 0.0059864355519611764
+ },
+ {
+  "key": "23.self_attn.v_proj",
+  "block": 23,
+  "name": "self_attn.v_proj",
+  "rank": 1024,
+  "level": 3.349730393733251,
+  "score": 0.005854630305126462
+ },
+ {
+  "key": "26.self_attn.v_proj",
+  "block": 26,
+  "name": "self_attn.v_proj",
+  "rank": 1024,
+  "level": 3.350758156287182,
+  "score": 0.005816033424586394
+ },
+ {
+  "key": "27.self_attn.o_proj",
+  "block": 27,
+  "name": "self_attn.o_proj",
+  "rank": 704,
+  "level": 1.245764076505438,
+  "score": 0.005410363708626338
+ },
+ {
+  "key": "26.self_attn.o_proj",
+  "block": 26,
+  "name": "self_attn.o_proj",
+  "rank": 704,
+  "level": 1.3380578883466525,
+  "score": 0.005403765771037826
+ },
+ {
+  "key": "26.self_attn.q_proj",
+  "block": 26,
+  "name": "self_attn.q_proj",
+  "rank": 704,
+  "level": 1.6128077961906315,
+  "score": 0.004946327508023115
+ },
+ {
+  "key": "21.self_attn.v_proj",
+  "block": 21,
+  "name": "self_attn.v_proj",
+  "rank": 1024,
+  "level": 2.8502450650678246,
+  "score": 0.004872440866255851
+ },
+ {
+  "key": "20.self_attn.v_proj",
+  "block": 20,
+  "name": "self_attn.v_proj",
+  "rank": 960,
+  "level": 1.986847615671962,
+  "score": 0.0045991705885921295
+ },
+ {
+  "key": "19.self_attn.k_proj",
+  "block": 19,
+  "name": "self_attn.k_proj",
+  "rank": 896,
+  "level": 1.3176708493526172,
+  "score": 0.004579609511686909
+ },
+ {
+  "key": "19.self_attn.v_proj",
+  "block": 19,
+  "name": "self_attn.v_proj",
+  "rank": 960,
+  "level": 2.3591861308124185,
+  "score": 0.004509965945212273
+ },
+ {
+  "key": "22.self_attn.v_proj",
+  "block": 22,
+  "name": "self_attn.v_proj",
+  "rank": 992,
+  "level": 3.1967237979015994,
+  "score": 0.004349874687952579
+ },
+ {
+  "key": "20.self_attn.q_proj",
+  "block": 20,
+  "name": "self_attn.q_proj",
+  "rank": 608,
+  "level": 1.2455686042856924,
+  "score": 0.004232597092454878
+ },
+ {
+  "key": "21.self_attn.q_proj",
+  "block": 21,
+  "name": "self_attn.q_proj",
+  "rank": 576,
+  "level": 1.2255961265541881,
+  "score": 0.004195670692918305
+ },
+ {
+  "key": "22.self_attn.q_proj",
+  "block": 22,
+  "name": "self_attn.q_proj",
+  "rank": 544,
+  "level": 0.8683443625942602,
+  "score": 0.004059772138072997
+ },
+ {
+  "key": "22.self_attn.o_proj",
+  "block": 22,
+  "name": "self_attn.o_proj",
+  "rank": 544,
+  "level": 0.9017078311834179,
+  "score": 0.003855058998968285
+ },
+ {
+  "key": "27.self_attn.k_proj",
+  "block": 27,
+  "name": "self_attn.k_proj",
+  "rank": 672,
+  "level": 0.5084670325839715,
+  "score": 0.003835698196439299
+ },
+ {
+  "key": "25.self_attn.o_proj",
+  "block": 25,
+  "name": "self_attn.o_proj",
+  "rank": 544,
+  "level": 0.9910708676685299,
+  "score": 0.003728612496048496
+ },
+ {
+  "key": "19.self_attn.o_proj",
+  "block": 19,
+  "name": "self_attn.o_proj",
+  "rank": 544,
+  "level": 1.0583283782063597,
+  "score": 0.0036889708345441133
+ },
+ {
+  "key": "23.self_attn.o_proj",
+  "block": 23,
+  "name": "self_attn.o_proj",
+  "rank": 480,
+  "level": 0.666291527106973,
+  "score": 0.0036011809710017675
+ },
+ {
+  "key": "19.self_attn.q_proj",
+  "block": 19,
+  "name": "self_attn.q_proj",
+  "rank": 512,
+  "level": 0.9760102703176446,
+  "score": 0.0035560674067184514
+ },
+ {
+  "key": "24.self_attn.o_proj",
+  "block": 24,
+  "name": "self_attn.o_proj",
+  "rank": 512,
+  "level": 0.8508756624981085,
+  "score": 0.003531561637674496
+ },
+ {
+  "key": "20.self_attn.o_proj",
+  "block": 20,
+  "name": "self_attn.o_proj",
+  "rank": 512,
+  "level": 0.8239692507143842,
+  "score": 0.00349676023680682
+ },
+ {
+  "key": "27.self_attn.q_proj",
+  "block": 27,
+  "name": "self_attn.q_proj",
+  "rank": 416,
+  "level": 0.3921449326404946,
+  "score": 0.0034902924346321387
+ },
+ {
+  "key": "21.self_attn.o_proj",
+  "block": 21,
+  "name": "self_attn.o_proj",
+  "rank": 480,
+  "level": 0.979597001313308,
+  "score": 0.0034830006614509504
+ },
+ {
+  "key": "25.self_attn.q_proj",
+  "block": 25,
+  "name": "self_attn.q_proj",
+  "rank": 480,
+  "level": 0.6680246891887833,
+  "score": 0.003478968492663802
+ },
+ {
+  "key": "20.self_attn.k_proj",
+  "block": 20,
+  "name": "self_attn.k_proj",
+  "rank": 672,
+  "level": 0.7265619712595673,
+  "score": 0.003477005783162074
+ },
+ {
+  "key": "23.self_attn.q_proj",
+  "block": 23,
+  "name": "self_attn.q_proj",
+  "rank": 448,
+  "level": 0.4717128450806651,
+  "score": 0.0033559351681870225
+ },
+ {
+  "key": "23.self_attn.k_proj",
+  "block": 23,
+  "name": "self_attn.k_proj",
+  "rank": 576,
+  "level": 0.5509330093226471,
+  "score": 0.0031279099233705566
+ },
+ {
+  "key": "21.self_attn.k_proj",
+  "block": 21,
+  "name": "self_attn.k_proj",
+  "rank": 608,
+  "level": 0.7197217401974256,
+  "score": 0.0030698775649005377
+ },
+ {
+  "key": "22.self_attn.k_proj",
+  "block": 22,
+  "name": "self_attn.k_proj",
+  "rank": 608,
+  "level": 0.5659356673774865,
+  "score": 0.003046317805537012
+ },
+ {
+  "key": "26.self_attn.k_proj",
+  "block": 26,
+  "name": "self_attn.k_proj",
+  "rank": 576,
+  "level": 0.6566386643628573,
+  "score": 0.0029862509561940686
+ },
+ {
+  "key": "24.self_attn.q_proj",
+  "block": 24,
+  "name": "self_attn.q_proj",
+  "rank": 352,
+  "level": 0.3534671422432676,
+  "score": 0.002813247553124527
+ },
+ {
+  "key": "24.self_attn.k_proj",
+  "block": 24,
+  "name": "self_attn.k_proj",
+  "rank": 480,
+  "level": 0.38074596552900836,
+  "score": 0.002450826280769504
+ },
+ {
+  "key": "25.self_attn.k_proj",
+  "block": 25,
+  "name": "self_attn.k_proj",
+  "rank": 448,
+  "level": 0.374493375555168,
+  "score": 0.0022685150565865168
+ }
+]

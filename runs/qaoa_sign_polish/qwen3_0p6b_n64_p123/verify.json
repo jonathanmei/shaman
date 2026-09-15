@@ -1,0 +1,11 @@
+{
+ "layer": "27.mlp.down_proj",
+ "rank": 1024,
+ "n": 64,
+ "p": 1,
+ "error_before": 0.04606743901968002,
+ "error_after": 0.04606017470359802,
+ "delta_measured": 7.264316082000732e-06,
+ "delta_predicted": 7.271580502760111e-06,
+ "relative_change": -0.00015768873279231813
+}
