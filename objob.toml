@@ -4,7 +4,7 @@
 
 [remote]
 host = "ob"          # ssh alias for the cluster login node (~/.ssh/config)
-base_dir = "~/code"  # remote parent dir; project checks out to base_dir/<repo>
+base_dir = "~/code/qaoa"  # separate checkout for this branch (cache symlinked to ~/code/shaman/cache); revert before merging
 
 [slurm]
 # Command the job runs, from the project root on the cluster.
