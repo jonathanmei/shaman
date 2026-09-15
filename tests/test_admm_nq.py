@@ -319,3 +319,76 @@ def test_factorize_with_eig_cache_shares_the_input_factor(monkeypatch):
     # 2 output factors + 1 shared input factor + the per-iteration k x k eigh of both runs (30 iters x 2 updates)
     assert calls["n"] == 3 + 2 * 30 * 2
     assert len(cache) == 1
+
+
+# --------------------------------------------------------------------------------------
+# Low-rank-plus-identity fast path for projected spectra
+# --------------------------------------------------------------------------------------
+def _projected_factor(n, seed, spec, spread=1e3):
+    """Unit-diagonal-ish SPD factor whose spectrum is exactly in the two-sided spike-plus-flat family."""
+    g = torch.Generator().manual_seed(seed)
+    Q, _ = torch.linalg.qr(torch.randn(n, n, generator=g))
+    lam = spec.apply(torch.logspace(0, torch.log10(torch.tensor(spread)).item(), n))
+    return (Q * lam) @ Q.mT, lam, Q
+
+
+def test_structured_sylvester_matches_dense_and_solves_the_equation():
+    torch.manual_seed(5)
+    n, k = 40, 6
+    spec = SpectrumSpec(spike_rank=3, dip_rank=2, flat_mean="gm")
+    Sigma, lam, Q = _projected_factor(n, 7, spec)
+    fac = admm_nq.CurvatureFactor(Sigma, lam, Q, spec)
+    assert fac.structured and fac.U.shape == (n, 5)
+    B = torch.randn(k, n)
+    M = B @ B.mT
+    C = torch.randn(n, k)
+    rho, reg = 0.7, 3e-2
+    F_dense = admm_nq._sylvester_solve_step(Q, lam, M, C, rho, reg, 1e-12, torch.float64)
+    F_fast = fac.sylvester(M, C, rho, reg, 1e-12, torch.float64)
+    assert (F_fast - F_dense).norm() / F_dense.norm() < 1e-4
+    sigma = admm_nq._sylvester_stabilizer(lam, M, rho, reg)
+    residual = Sigma @ F_fast @ M + sigma * F_fast - C
+    assert residual.norm() / C.norm() < 1e-4
+    # products
+    X = torch.randn(n, k)
+    assert (fac.left(X) - Sigma @ X).norm() / (Sigma @ X).norm() < 1e-5
+    assert (fac.right(X.mT) - X.mT @ Sigma).norm() / (X.mT @ Sigma).norm() < 1e-5
+
+
+def test_curvature_factor_stays_dense_without_a_flat_block():
+    n = 12
+    Sigma, lam, Q = _projected_factor(n, 8, SpectrumSpec(power=0.5))
+    fac = admm_nq.CurvatureFactor(Sigma, lam, Q, SpectrumSpec(power=0.5))
+    assert not fac.structured
+    X = torch.randn(n, 3)
+    assert torch.equal(fac.left(X), Sigma @ X)
+    # ranks covering the whole spectrum: nothing to flatten, dense path
+    full = SpectrumSpec(spike_rank=6, dip_rank=6)
+    assert not admm_nq.CurvatureFactor(Sigma, lam, Q, full).structured
+    # opt-out
+    spec = SpectrumSpec(spike_rank=2, dip_rank=1)
+    Sigma2, lam2, Q2 = _projected_factor(n, 9, spec)
+    assert not admm_nq.CurvatureFactor(Sigma2, lam2, Q2, spec, structured=False).structured
+
+
+def test_factorize_structured_path_matches_dense_path():
+    torch.manual_seed(21)
+    n_out, n_in = 24, 16
+    spec = SpectrumSpec(spike_rank=2, dip_rank=2, flat_mean="gm")
+    o_norm, i_norm = torch.rand(n_out) + 0.5, torch.rand(n_in) + 0.5
+    o_cov = _scaled_cov(_spd(n_out, 0.3), o_norm)
+    i_cov = _scaled_cov(_spd(n_in, 0.3), i_norm)
+    W = torch.randn(n_out, n_in)
+    outs = []
+    for structured in (True, False):
+        torch.manual_seed(3)
+        outs.append(admm_nq.factorize_admm_nanoquant(W, i_norm, o_norm, mid_rank=RANK, outer_iters=3,
+                                                     rho_scheduler="linear", i_cov=i_cov, o_cov=o_cov,
+                                                     spectrum=spec, structured=structured))
+    for key in ("W_final", "A_latent", "B_latent"):
+        assert torch.allclose(outs[0][key], outs[1][key], atol=1e-3, rtol=1e-3), key
+    # transposed layer threads the flag too
+    torch.manual_seed(3)
+    t = admm_nq.factorize_admm_nanoquant(W.mT, o_norm, i_norm, mid_rank=RANK, outer_iters=3, rho_scheduler="linear",
+                                         is_transpose=True, i_cov=o_cov, o_cov=i_cov, spectrum=spec)
+    assert t["W_final"].shape == W.mT.shape

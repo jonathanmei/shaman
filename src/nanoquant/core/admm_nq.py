@@ -124,8 +124,14 @@ def _sylvester_stabilizer(lam: torch.Tensor, M: torch.Tensor, rho: float, reg: f
     eps : float
         Lower clamp.
     """
+    return _stabilizer_from_mean(lam.mean(), M, rho, reg, eps)
+
+
+def _stabilizer_from_mean(lam_mean: torch.Tensor, M: torch.Tensor, rho: float, reg: float,
+                          eps: float = 1e-12) -> torch.Tensor:
+    """:func:`_sylvester_stabilizer` given the mean eigenvalue of ``Sigma`` directly."""
     diag_mean = M.diagonal().mean().abs()
-    return torch.clamp(rho + reg * lam.mean() * diag_mean, min=eps)
+    return torch.clamp(rho + reg * lam_mean * diag_mean, min=eps)
 
 
 @torch.no_grad()
@@ -170,6 +176,102 @@ def _sylvester_solve_step(Q: torch.Tensor, lam: torch.Tensor, M: torch.Tensor, C
     C_hat = Q.mT @ C @ Q_M
     F_hat = C_hat / (lam.unsqueeze(1) * mu.unsqueeze(0) + sigma)
     return (Q @ F_hat @ Q_M.mT).to(orig_dtype)
+
+
+@torch.no_grad()
+def _sylvester_solve_structured(U: torch.Tensor, lam_U: torch.Tensor, mu: torch.Tensor, M: torch.Tensor,
+                                C: torch.Tensor, rho: float, reg: float, eps: float = 1e-12,
+                                eigh_dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    """:func:`_sylvester_solve_step` for ``Sigma = mu I + U diag(lam_U - mu) U^T`` in ``O(n r k + n k^2)``.
+
+    ``Sigma`` is block diagonal in the split ``span(U)`` / its complement, so after rotating the right-hand side
+    into the eigenbasis of ``M`` the equation is diagonal on both parts: ``(lam_U mu_M^T + sigma)`` on the ``r``
+    kept directions and the scalar ``(mu mu_M + sigma)`` per column on the complement. No ``n x n`` rotation.
+
+    Parameters
+    ----------
+    U : torch.Tensor
+        Orthonormal kept eigenvectors ``(n, r)``.
+    lam_U : torch.Tensor
+        Their eigenvalues ``(r,)``.
+    mu : torch.Tensor
+        The shared eigenvalue of the complement (0-d).
+    M, C, rho, reg, eps, eigh_dtype
+        As in :func:`_sylvester_solve_step`.
+    """
+    orig_dtype = C.dtype
+    U, lam_U, mu, M, C = (t.to(torch.float32) for t in (U, lam_U, mu, M, C))
+    M = 0.5 * (M + M.mT)
+    mu_M, Q_M = torch.linalg.eigh(M.to(eigh_dtype))
+    mu_M = mu_M.to(torch.float32).clamp(min=0.0)
+    Q_M = Q_M.to(torch.float32)
+    n, r = U.shape
+    lam_mean = (lam_U.sum() + mu * (n - r)) / n
+    sigma = _stabilizer_from_mean(lam_mean, M, rho, reg, eps)
+    C_hat = C @ Q_M  # (n, k)
+    C_U = U.mT @ C_hat  # (r, k)
+    C_perp = C_hat - U @ C_U
+    F_U = C_U / (lam_U.unsqueeze(1) * mu_M.unsqueeze(0) + sigma)
+    F_perp = C_perp / (mu * mu_M.unsqueeze(0) + sigma)
+    return ((F_perp + U @ F_U) @ Q_M.mT).to(orig_dtype)
+
+
+class CurvatureFactor:
+    """Unit-diagonal curvature factor of the Mahalanobis data term, with a low-rank-plus-identity fast path.
+
+    Holds the dense ``Sigma`` and its eigenpairs. When the spectrum has a flat block (a projected
+    :class:`SpectrumSpec` with ``0 < spike_rank + dip_rank < n``) and ``structured`` is set,
+    ``Sigma = mu I + U diag(lam_U - mu) U^T`` with ``U`` the ``r`` kept eigenvectors, and every product with
+    ``Sigma`` as well as the Sylvester X-update costs ``O(n r k)`` instead of ``O(n^2 k)``. Results are identical
+    to the dense path up to floating-point error.
+
+    Parameters
+    ----------
+    Sigma, lam, Q : torch.Tensor
+        Output of :func:`_normalized_curvature` (fp32).
+    spectrum : SpectrumSpec
+        The conditioning that produced ``lam`` (tells which eigenvalues are exact and which form the flat block).
+    structured : bool
+        Use the fast path when the spectrum allows it.
+    """
+
+    def __init__(self, Sigma: torch.Tensor, lam: torch.Tensor, Q: torch.Tensor, spectrum: SpectrumSpec,
+                 structured: bool = True) -> None:
+        self.Sigma, self.lam, self.Q = Sigma, lam, Q
+        self.U: torch.Tensor | None = None
+        n, r = lam.numel(), spectrum.spike_rank + spectrum.dip_rank
+        if structured and 0 < r < n:
+            order = torch.argsort(lam, descending=True)
+            keep = torch.cat([order[:spectrum.spike_rank], order[n - spectrum.dip_rank:]])
+            middle = order[spectrum.spike_rank:n - spectrum.dip_rank]
+            self.mu = lam[middle].mean()
+            self.U = Q[:, keep].contiguous()
+            self.lam_U = lam[keep]
+            self._delta = (self.lam_U - self.mu).unsqueeze(1)  # (r, 1)
+
+    @property
+    def structured(self) -> bool:
+        """True when the fast path is active."""
+        return self.U is not None
+
+    def left(self, X: torch.Tensor) -> torch.Tensor:
+        """``Sigma @ X``."""
+        if self.U is None:
+            return self.Sigma @ X
+        return self.mu * X + self.U @ (self._delta * (self.U.mT @ X))
+
+    def right(self, X: torch.Tensor) -> torch.Tensor:
+        """``X @ Sigma``."""
+        if self.U is None:
+            return X @ self.Sigma
+        return self.mu * X + ((X @ self.U) * self._delta.mT) @ self.U.mT
+
+    def sylvester(self, M: torch.Tensor, C: torch.Tensor, rho: float, reg: float, eps: float,
+                  eigh_dtype: torch.dtype) -> torch.Tensor:
+        """Solve ``Sigma F M + sigma F = C`` (:func:`_sylvester_solve_step`)."""
+        if self.U is None:
+            return _sylvester_solve_step(self.Q, self.lam, M, C, rho, reg, eps, eigh_dtype)
+        return _sylvester_solve_structured(self.U, self.lam_U, self.mu, M, C, rho, reg, eps, eigh_dtype)
 
 
 class EigCache:
@@ -281,6 +383,7 @@ def factorize_admm_nanoquant(
     spectrum: SpectrumSpec = IDENTITY_SPECTRUM,
     eig_cache: EigCache | None = None,
     diagnostics: dict | None = None,
+    structured: bool = True,
 ):
     """
     Decomposes the weight matrix W into two binary matrices A and B using ADMM.
@@ -318,12 +421,16 @@ def factorize_admm_nanoquant(
                (see :class:`EigCache`); factors not registered there are never cached.
         diagnostics: Optional dict filled with the projection gaps of the raw ``L`` and ``R`` spectra
                (``core.curvature.projection_gaps``), keyed ``"L"`` / ``"R"`` in the orientation of ``W``.
+        structured: With a projected ``spectrum``, run the Mahalanobis X-updates through the low-rank-plus-identity
+               form of the factors (:class:`CurvatureFactor`, ``O(n r k)`` per product instead of ``O(n^2 k)``);
+               ``False`` forces the dense path (same result up to floating-point error).
     """
     if is_transpose:
         results = factorize_admm_nanoquant(W.mT, o_norm, i_norm, mid_rank, outer_iters, inner_iters, reg, False, eps,
                                            rho_scheduler, print_admm_steps, i_cov=o_cov, o_cov=i_cov,
                                            eigh_dtype=eigh_dtype, mid_scale=mid_scale,
-                                           spectrum=spectrum, eig_cache=eig_cache, diagnostics=diagnostics)
+                                           spectrum=spectrum, eig_cache=eig_cache, diagnostics=diagnostics,
+                                           structured=structured)
         if diagnostics is not None and {"L", "R"} <= set(diagnostics):
             diagnostics["L"], diagnostics["R"] = diagnostics["R"], diagnostics["L"]
         swapped = {
@@ -357,15 +464,23 @@ def factorize_admm_nanoquant(
                                                eig_cache=eig_cache, diagnostics=diag_R)  # (in, in)
         if diagnostics is not None:
             diagnostics["L"], diagnostics["R"] = diag_L, diag_R
+        Lf = CurvatureFactor(Lt, lam_L, Q_L, spectrum, structured)
+        Rf = CurvatureFactor(Rt, lam_R, Q_R, spectrum, structured)
         W_norm32 = W_norm.to(torch.float32)
-        P = Lt @ W_norm32 @ Rt  # curvature-weighted target, (out, in)
+        P = Lf.left(Rf.right(W_norm32))  # curvature-weighted target L W R, (out, in)
+
+        def maha_loss(E: torch.Tensor) -> torch.Tensor:
+            """``tr(L E R E^T)`` through the factors' products."""
+            return (Lf.left(Rf.right(E)) * E).sum()
+
         if print_admm_steps:
             for name, S, lam, Q in (("L", Lt, lam_L, Q_L), ("R", Rt, lam_R, Q_R)):
                 rec = (Q * lam) @ Q.mT
                 err = ((rec - S).norm() / S.norm().clamp(eps)).item()
                 print(f"\t\t[eigh check] {name}: relative reconstruction error {err:.3e} "
                       f"(min/max eig {lam.min().item():.3e}/{lam.max().item():.3e})")
-            maha_ref = torch.trace(Lt @ W_norm32 @ Rt @ W_norm32.mT).clamp(eps)
+            print(f"\t\t[curvature] structured fast path: L {Lf.structured} | R {Rf.structured}")
+            maha_ref = maha_loss(W_norm32).clamp(eps)
 
     # we remove SVD-based init, since random init is (1) faster (2) shows on-par or better performance
     A_ls = torch.randn((out_features, mid_rank), device=device, dtype=W.dtype)
@@ -393,9 +508,9 @@ def factorize_admm_nanoquant(
         B_bar = B_z / mid_norm_b.unsqueeze(1)  # (mid, in), unit-norm rows
         if use_maha:
             B_bar32 = B_bar.to(torch.float32)
-            M = B_bar32 @ Rt @ B_bar32.mT  # (mid, mid)
+            M = B_bar32 @ Rf.left(B_bar32.mT)  # B R B^T, (mid, mid)
             C = P @ B_bar32.mT + rho * (A_z - A_u).to(torch.float32)  # (out, mid)
-            A_ls = _sylvester_solve_step(Q_L, lam_L, M, C, rho, reg, eps, eigh_dtype).to(W.dtype)
+            A_ls = Lf.sylvester(M, C, rho, reg, eps, eigh_dtype).to(W.dtype)
         else:
             # W_norm.T uses view; keep it
             A_ls = _admm_solve_step(B_bar.mT, W_norm.mT, A_z.mT, A_u.mT, rho, reg, eps).mT
@@ -404,9 +519,9 @@ def factorize_admm_nanoquant(
         A_bar = A_z / mid_norm_a  # (out, mid), unit-norm columns
         if use_maha:
             A_bar32 = A_bar.to(torch.float32)
-            N = A_bar32.mT @ Lt @ A_bar32  # (mid, mid)
+            N = A_bar32.mT @ Lf.left(A_bar32)  # A^T L A, (mid, mid)
             C = (A_bar32.mT @ P + rho * (B_z - B_u).to(torch.float32)).mT  # (in, mid)
-            B_ls = _sylvester_solve_step(Q_R, lam_R, N, C, rho, reg, eps, eigh_dtype).mT.to(W.dtype)
+            B_ls = Rf.sylvester(N, C, rho, reg, eps, eigh_dtype).mT.to(W.dtype)
         else:
             B_ls = _admm_solve_step(A_bar, W_norm, B_z, B_u, rho, reg, eps)
 
@@ -440,10 +555,10 @@ def factorize_admm_nanoquant(
                        f"Primal(r): {primal_res:.5e} | Dual(s): {dual_res:.5e} | Rho: {rho:.4f}")
                 if use_maha:
                     E = (W_norm - pred).to(torch.float32)
-                    maha = (torch.trace(Lt @ E @ Rt @ E.mT) / maha_ref).item()
+                    maha = (maha_loss(E) / maha_ref).item()
                     # the same loss for the un-projected X-variables (A_bar @ B_ls)
                     E_x = (W_norm - F.linear(A_bar, B_ls.mT)).to(torch.float32)
-                    maha_x = (torch.trace(Lt @ E_x @ Rt @ E_x.mT) / maha_ref).item()
+                    maha_x = (maha_loss(E_x) / maha_ref).item()
                     msg += f" | Mahalanobis(Z): {maha:.5e} | Mahalanobis(X): {maha_x:.5e}"
                 print(msg)
 

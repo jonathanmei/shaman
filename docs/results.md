@@ -533,7 +533,15 @@ ranks 448–2560. Jobs 5617467 (timed out at block 35/36; its checkpoints were t
 |---|---|---|---|---|---|
 | uniform ranks (2026-09-09) | 0.9864 | 15.77 (diag) / – | 2.186 | 14.11 | 0.463 |
 | **ramp 0.6 + type weights, parity** | 0.9864 | 13.82 | 2.163 | **13.55** | 0.450 |
+| measured × ramp 0.6, parity (`qwen3_4b_best.json`; 2026-09-14, jobs 5663775 → 5666862) | 0.9864 | – | – | 13.80 | 0.463 |
 | paper (Table 2) | | | | 14.29 | |
+
+- **Measured sensitivity × ramp 0.6 at 4B: 13.80 / 0.463** (job 5663775 timed out at block 27, resumed as 5666862
+  from the pinned checkout `ob:~/code/shaman-4b` at 26d8fd4, 88 min incl. KD and evaluation). +0.25 PPL against the
+  hand table while the zero-shot mean returns to the uniform-rank level (0.463 vs 0.450). At 0.6B the measured
+  allocator beat the hand table (22.96 vs 23.25); at 4B it does not: the depth prior alone does not reproduce what
+  the type weights (down/up/gate over q/k/v) bought there. Single runs both; the seed-1 twin
+  `configs/qwen3_4b_best_seed1.json` is the next 4B run.
 
 - **−0.56 PPL (−4.0 %) at identical bits**, 5.2 % below the paper and 8.8 % below the paper-faithful diag baseline
   (14.86). The pre-KD perplexity (13.82) is already below the previous *post*-KD result. Zero-shot mean 0.450 vs
@@ -545,7 +553,8 @@ ranks 448–2560. Jobs 5617467 (timed out at block 35/36; its checkpoints were t
   checkout).
 
 Summary across sizes (WikiText-2 PPL, best arm per size, 1.0 bpw target): 0.6B **22.96** (measured × ramp),
-1.7B 16.72 (not yet rerun with rank allocation), 4B **13.55** (hand-table ranks). The ADMM fast path
+1.7B 16.72 (not yet rerun with rank allocation), 4B **13.55** (hand-table ranks, code at 26d8fd4; the `_best.json`
+recipe with measured × ramp ranks gives 13.80). The ADMM fast path
 (branch `admm-fast-sylvester`, inexact Sylvester solve with early stopping) reproduces the 1.7B recipe at 16.67
 vs 16.72 (job 5627825), i.e. lossless, and is the natural way to buy back the time the larger late ranks cost.
 

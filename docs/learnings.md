@@ -16,7 +16,7 @@ is derived in `rank_allocation_note.html`.
 |---|---|---|---|---|---|
 | Qwen3-0.6B-Base | `configs/qwen3_0p6b_best.json` | KL factors, ADMM p = ½, fresh input factor, refresh/7, **measured ranks × ramp 0.6, parity** | 0.9728 | **22.96** | 27.56 |
 | Qwen3-1.7B-Base | `configs/qwen3_1p7b_best.json` | same recipe with measured × ramp ranks (not yet run; 16.72 with uniform ranks) | 0.9863 | – | 19.21 |
-| Qwen3-4B-Base | `configs/qwen3_4b_best.json` | same recipe, refresh/9, measured × ramp 0.6 ranks (probe 0.6/1.0/1.4; running as job 5663775 from `26d8fd4`) | 0.9864 | pending | 14.29 |
+| Qwen3-4B-Base | `configs/qwen3_4b_best.json` | same recipe, refresh/9, measured × ramp 0.6 ranks (probe 0.6/1.0/1.4; jobs 5663775 → 5666862 from `26d8fd4`); zero-shot mean 0.463 | 0.9864 | 13.80 | 14.29 |
 | Qwen3-4B-Base | commit `26d8fd4`, `configs/qwen3_4b_kl_ra_both.json` | KL factors, p = ½, fresh R, refresh/9, **hand-table ranks (ramp 0.6 + type weights), parity**; recorded best, code removed | 0.9864 | **13.55** | 14.29 |
 
 Every recipe keeps the paper's protocol: 128 × 2048 WikiText-2 calibration samples, seed 0, 2 scales, 8/8/8 epochs,
@@ -44,7 +44,9 @@ within-block ranking of layers well (Spearman 0.8–0.96 against the logged bloc
 its own it under-values the last blocks, because a Fisher-weighted weight error does not see how little downstream
 capacity is left to absorb late errors: measured alone 23.75, hand table 23.25, **measured × ramp 0.6 = 22.96**.
 Local curvature proxies rank layers of the same depth well and trade off across depth poorly; the depth dimension
-needs an end-to-end signal or a prior.
+needs an end-to-end signal or a prior. At 4B the order flips: measured × ramp 0.6 gives 13.80 against the hand
+table's 13.55 (zero-shot mean 0.463 vs 0.450), so the depth prior alone does not recover what the hand table's type
+weights (down/up/gate over q/k/v) bought at that width; both are single runs (seed-1 twins pending).
 
 ### 3. Beyond that, single runs are noise: spend runs on seeds, not knobs
 
