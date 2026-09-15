@@ -171,6 +171,9 @@ class TuneArguments:
         default=0, metadata={"help": ">0: every N blocks re-estimate the curvature of the remaining layers on the "
                                      "quantised prefix (curvature=kron)"})
     curvature_refresh_iters: int = field(default=1, metadata={"help": "Calibration passes per curvature refresh"})
+    block_ppl_every: int = field(
+        default=0, metadata={"help": ">0: evaluate WikiText-2 perplexity every N blocks and after the last one "
+                                     "(0 = only with --block_diagnostics)"})
     block_diagnostics: bool = field(
         default=False,
         metadata={"help": "Log input-factor drift, Mahalanobis weight errors (stale vs fresh factor) and the "
@@ -303,6 +306,7 @@ def main():
         curvature_refresh_every=tune_args.curvature_refresh_every,
         curvature_refresh_iters=tune_args.curvature_refresh_iters,
         block_diagnostics=tune_args.block_diagnostics,
+        block_ppl_every=tune_args.block_ppl_every,
         tune_fact=tune_args.tune_fact,
         fact_binary_lr=tune_args.fact_binary_lr,
         fact_scale_lr=tune_args.fact_scale_lr,

@@ -94,6 +94,7 @@ class NanoQuantConfigDataclass:
     curvature_refresh_every: int = 0
     curvature_refresh_iters: int = 1
     block_diagnostics: bool = False
+    block_ppl_every: int = 0
     # tune_fact
     tune_fact: bool = True
     fact_binary_lr: float = 1e-5

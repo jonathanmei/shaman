@@ -46,6 +46,28 @@ from .teacher import TeacherLogits
 KD_KIND = "kd"
 
 
+def eval_block_ppl(quant_config: dict, i: int, stop: int) -> bool:
+    """Whether to evaluate the held-out perplexity after block ``i`` (``stop`` = index one past the last block).
+
+    Always with ``block_diagnostics`` (the screens read the per-block trajectory); otherwise every
+    ``block_ppl_every`` blocks and after the last one; never when that knob is 0 (default). The evaluation costs a
+    full WikiText-2 pass of the model (20-30 s per block at 4B) and is logging only.
+
+    Parameters
+    ----------
+    quant_config : dict
+        Quantisation configuration.
+    i : int
+        Block index just finished.
+    stop : int
+        Number of blocks the loop processes.
+    """
+    if quant_config.get("block_diagnostics", False):
+        return True
+    every = int(quant_config.get("block_ppl_every", 0) or 0)
+    return every > 0 and ((i + 1) % every == 0 or i == stop - 1)
+
+
 def refresh_block_curvature(model, dataloader, dev: str, quant_config: dict) -> int:
     """Re-estimate the Kronecker curvature of every not-yet-factorised layer on the *current* model.
 
@@ -172,13 +194,12 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
         # move qblock and fp_block to gpu
         q_block = q_blocks[i].to(dev)
         fp_block = fp_blocks[i].to(dev)
-        # Calculate target outputs in batches to minimize CPU-GPU transfers
+        # Target outputs of the full-precision block, computed and kept on the compute device
         with torch.no_grad():
-            target_outputs = torch.zeros_like(original_inputs)
+            target_outputs = torch.empty_like(original_inputs, device=dev)
             for j in range(quant_config['num_calib_samples']):
                 batch_input = original_inputs[j:j + 1].to(dev)
-                batch_output = fp_block(batch_input, **kwargs)[0]
-                target_outputs[j:j + 1] = batch_output.cpu().detach()
+                target_outputs[j:j + 1] = fp_block(batch_input, **kwargs)[0].detach()
         # get qblock inputs
         tuning_inputs = compressed_inputs.clone().detach()
         # get all linear layers
@@ -187,7 +208,6 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
         importance = block_importance(sublayers, model.config.hidden_size, dev)
         # move data to GPU
         tuning_inputs = tuning_inputs.to(dev)
-        target_outputs = target_outputs.to(dev)
         # layers reading the same activation (q/k/v, gate/up) share one fresh input factor and its eigendecomposition
         fresh_cache: dict = {}
         eig_cache = EigCache() if fresh_input else None
@@ -200,7 +220,8 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             # 1/3) tune non-factorized, full-precision weights to absorb quant error
             if quant_config['tune_nonfact']:
                 print(f"\t(1/3) Block {i+1}/{n_blocks}, {name} | Tuning Non-Factorized Weights...")
-                tune_nonfact(q_block, tuning_inputs, target_outputs, importance, kwargs, quant_config)
+                tune_nonfact(q_block, tuning_inputs, target_outputs, importance, kwargs, quant_config,
+                             target_name=name)
                 cleanup_memory()
             # 2/3) ADMM to factorize/initialize low-rank binary matrices and scales
             print(f"\t(2/3) Block {i+1}/{n_blocks}, {name} | Initialization via ADMM...")
@@ -239,7 +260,8 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             # 3/3) tune low-rank binary and scales
             if quant_config['tune_fact']:
                 print(f"\t(3/3) Block {i+1}/{n_blocks}, {name} | Tuning Factorized Weights...")
-                tune_fact(q_block, nano_linear, tuning_inputs, target_outputs, importance, kwargs, quant_config)
+                tune_fact(q_block, nano_linear, tuning_inputs, target_outputs, importance, kwargs, quant_config,
+                          target_name=name)
                 cleanup_memory()
             cleanup_memory()
         fresh_cache.clear()
@@ -276,8 +298,9 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
             print(f"\t\tBlock {i}: {time.time() - t_block:.0f}s, peak CUDA memory "
                   f"{torch.cuda.max_memory_allocated() / 2**30:.1f} GiB allocated / "
                   f"{torch.cuda.max_memory_reserved() / 2**30:.1f} GiB reserved")
-        test_ppl = evaluate_ppl_after_block(model, model_name=quant_config['model_id'], dev=dev)
-        print(f"\t\tBlock {i}: Test Data PPL        = {test_ppl:.3f}")
+        if eval_block_ppl(quant_config, i, stop):
+            test_ppl = evaluate_ppl_after_block(model, model_name=quant_config['model_id'], dev=dev)
+            print(f"\t\tBlock {i}: Test Data PPL        = {test_ppl:.3f}")
 
     return model
 

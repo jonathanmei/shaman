@@ -156,6 +156,20 @@ def _dbf_hook(module, inputs, outputs, layer_name, stats_dict, stats_device, is_
 # Kronecker-factored curvature: nearest Kronecker product of the per-token empirical Fisher
 # -----------------------------------------------------------------------------
 @torch.no_grad()
+def _quadratic_form(v: torch.Tensor, M: torch.Tensor | None) -> torch.Tensor:
+    """Per-row ``v_t^T M v_t`` (``||v_t||^2`` for ``M = None``), evaluated in ``M``'s dtype and returned in fp32.
+
+    The ALS token weights tolerate bf16 previous-pass factors (a few 1e-3 relative error on near-uniform weights),
+    which is how the grouped GPU calibration halves the memory of the previous-pass copies.
+    """
+    if M is None:
+        return v.square().sum(dim=1)
+    M = M.to(v.device)
+    vm = v.to(M.dtype)
+    return ((vm @ M) * vm).sum(dim=1).float()
+
+
+@torch.no_grad()
 def nkp_update(
     x: torch.Tensor,
     delta: torch.Tensor,
@@ -191,14 +205,8 @@ def nkp_update(
     """
     x = x.float()
     delta = delta.float()
-    if R_prev is None:
-        w_L = x.square().sum(dim=1)
-    else:
-        w_L = ((x @ R_prev.to(x.device, torch.float32)) * x).sum(dim=1)
-    if L_prev is None:
-        w_R = delta.square().sum(dim=1)
-    else:
-        w_R = ((delta @ L_prev.to(delta.device, torch.float32)) * delta).sum(dim=1)
+    w_L = _quadratic_form(x, R_prev)
+    w_R = _quadratic_form(delta, L_prev)
 
     L = delta.mT @ (delta * w_L.unsqueeze(1))
     R = x.mT @ (x * w_R.unsqueeze(1))
@@ -234,20 +242,25 @@ def _damped_inverse(M: torch.Tensor, rel: float = 1e-3) -> torch.Tensor:
     return torch.cholesky_inverse(chol).to(M.dtype)
 
 
-def _als_weights(prev: dict, fit: str, device=None) -> dict:
+def _als_weights(prev: dict, fit: str, device=None, dtype: torch.dtype | None = None) -> dict:
     """Matrices handed to :func:`nkp_update` as ``L_prev``/``R_prev`` for the next ALS pass.
 
     The Frobenius fit weights token ``t`` by ``x_t^T R x_t``; the KL fit by ``x_t^T R^{-1} x_t`` (and symmetrically
     for the output side), so for ``fit == "kl"`` the previous factors are (damped) inverted here, on ``device``
-    (the eigendecompositions of the larger layers are far too slow on the CPU).
+    (the eigendecompositions of the larger layers are far too slow on the CPU). ``dtype`` (e.g. bf16) is the storage
+    precision of the returned weights; the inversion itself stays fp64.
     """
     if fit == "frobenius":
-        return prev if device is None else {key: {n: M.to(device) for n, M in prev[key].items()}
-                                            for key in ("i_cov", "o_cov")}
-    if fit == "kl":
-        return {key: {n: _damped_inverse(M if device is None else M.to(device)) for n, M in prev[key].items()}
-                for key in ("i_cov", "o_cov")}
-    raise ValueError(f"Unknown kron fit '{fit}'. Choose from {KRON_FITS}.")
+        out = prev if device is None else {key: {n: M.to(device) for n, M in prev[key].items()}
+                                           for key in ("i_cov", "o_cov")}
+    elif fit == "kl":
+        out = {key: {n: _damped_inverse(M if device is None else M.to(device)) for n, M in prev[key].items()}
+               for key in ("i_cov", "o_cov")}
+    else:
+        raise ValueError(f"Unknown kron fit '{fit}'. Choose from {KRON_FITS}.")
+    if dtype is not None:
+        out = {key: {n: M.to(dtype) for n, M in out[key].items()} for key in ("i_cov", "o_cov")}
+    return out
 
 
 @torch.no_grad()
@@ -287,9 +300,15 @@ def nkp_fit(x: torch.Tensor, delta: torch.Tensor, num_iters: int = 3,
     return L_prev, R_prev
 
 
+PREV_WEIGHTS_DTYPE = torch.bfloat16
+"""Storage dtype of the previous-pass ALS weights on the GPU accumulation device (fp32 accumulators stay fp32)."""
+
+
 def _factor_bytes(m: nn.Linear) -> int:
-    """fp32 bytes of one layer's Kronecker factors for the accumulator *and* the previous-pass copy."""
-    return 4 * 2 * (m.in_features**2 + m.out_features**2)
+    """Bytes of one layer's Kronecker factors on the accumulation device: fp32 accumulator plus the previous-pass
+    copy in :data:`PREV_WEIGHTS_DTYPE`."""
+    per_element = 4 + torch.finfo(PREV_WEIGHTS_DTYPE).bits // 8
+    return per_element * (m.in_features**2 + m.out_features**2)
 
 
 def _partition_layers(linear_layers: dict[str, nn.Linear], budget_bytes: int) -> list[list[str]]:
@@ -380,9 +399,10 @@ def _kron_backward_hook(module, grad_input, grad_output, layer_name, run_states,
     acc_R = acc["i_cov"][layer_name]
     acc_L.add_(L.to(acc_L.device))
     acc_R.add_(R.to(acc_R.device))
-    # running mean-square statistics used to put the factors on the legacy i_norm / o_norm scale
-    sq_sums[layer_name]["i"] += x.square().mean().item()
-    sq_sums[layer_name]["o"] += delta.square().mean().item() / GRAD_SCALE_FACTOR
+    # running mean-square statistics used to put the factors on the legacy i_norm / o_norm scale (kept as 0-d
+    # device tensors: no GPU->CPU sync inside the backward pass; read once at the end of the calibration)
+    sq_sums[layer_name]["i"] = sq_sums[layer_name]["i"] + x.square().mean()
+    sq_sums[layer_name]["o"] = sq_sums[layer_name]["o"] + delta.square().mean() / GRAD_SCALE_FACTOR
     sq_sums[layer_name]["n"] += 1
 
 
@@ -458,9 +478,11 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
                 },
             }
             # ALS weights of this pass for this group: the previous factors (Frobenius fit) or their damped
-            # inverses (KL fit), computed on the accumulation device
+            # inverses (KL fit), computed on the accumulation device; stored in bf16 there when it is a GPU (the
+            # memory-bound case; the CPU path keeps fp32 so that it reproduces the single-pass fit exactly)
+            weights_dtype = PREV_WEIGHTS_DTYPE if torch.device(acc_device).type == "cuda" else None
             prev_group = _als_weights({key: {n: prev[key][n] for n in names if n in prev[key]}
-                                       for key in ("i_cov", "o_cov")}, fit, device=acc_device)
+                                       for key in ("i_cov", "o_cov")}, fit, device=acc_device, dtype=weights_dtype)
             run_states = defaultdict(dict)
             handles = []
             for n in names:
@@ -499,7 +521,7 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
         for key, side in (("i_cov", "i"), ("o_cov", "o")):
             M = prev[key][n]
             mean_diag = M.diagonal().mean()
-            target = stats[side] / stats["n"]
+            target = float(stats[side]) / stats["n"]
             if mean_diag > 0 and target > 0:
                 M.mul_(target / mean_diag)
     return prev

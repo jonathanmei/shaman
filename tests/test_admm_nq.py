@@ -346,6 +346,12 @@ def test_structured_sylvester_matches_dense_and_solves_the_equation():
     F_dense = admm_nq._sylvester_solve_step(Q, lam, M, C, rho, reg, 1e-12, torch.float64)
     F_fast = fac.sylvester(M, C, rho, reg, 1e-12, torch.float64)
     assert (F_fast - F_dense).norm() / F_dense.norm() < 1e-4
+    # the default k x k eigh precision is fp32 and is lossless for the X-update
+    assert admm_nq.SYLVESTER_EIGH_DTYPE == torch.float32
+    F32 = fac.sylvester(M, C, rho, reg, 1e-12)
+    F32_dense = admm_nq._sylvester_solve_step(Q, lam, M, C, rho, reg, 1e-12)
+    assert (F32 - F_dense).norm() / F_dense.norm() < 1e-4
+    assert (F32_dense - F_dense).norm() / F_dense.norm() < 1e-4
     sigma = admm_nq._sylvester_stabilizer(lam, M, rho, reg)
     residual = Sigma @ F_fast @ M + sigma * F_fast - C
     assert residual.norm() / C.norm() < 1e-4

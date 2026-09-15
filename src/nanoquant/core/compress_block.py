@@ -345,12 +345,67 @@ def get_param_group_config(target_module, binary_lr=1e-5, scale_lr=1e-5, bias_lr
     return configs
 
 
+def mlp_only_forward(block, block_inputs, kwargs, target_name: str | None):
+    """Forward of only the MLP half of an HF decoder layer, for tuning an ``mlp.*`` layer whose attention is frozen.
+
+    Blocks of the Llama / Qwen family compute ``h = x + self_attn(input_layernorm(x))`` and
+    ``out = h + mlp(post_attention_layernorm(h))``. Layers are binarised in the order q, v, o, k, gate, up, down, so
+    when an ``mlp.*`` layer is tuned every attention linear is already a frozen :class:`NanoQuantLinear` and ``h`` is
+    fixed: it is captured once for all samples (a forward pre-hook on ``post_attention_layernorm``) and the tuning
+    forward runs the MLP path only.
+
+    Parameters
+    ----------
+    block : nn.Module
+        Decoder layer.
+    block_inputs : torch.Tensor
+        ``(samples, seq, hidden)`` block inputs.
+    kwargs : dict
+        Block forward keyword arguments (attention mask, position embeddings).
+    target_name : str or None
+        Name of the layer being tuned (``find_layers`` key).
+
+    Returns
+    -------
+    callable or None
+        ``forward_fn(idx) -> (1, seq, hidden)`` for sample ``idx``; ``None`` when the shortcut does not apply (an
+        attention layer, a block without the HF attribute names such as OPT, or a still-trainable attention).
+    """
+    if not (target_name or "").startswith("mlp."):
+        return None
+    attn = getattr(block, "self_attn", None)
+    mlp = getattr(block, "mlp", None)
+    norm = getattr(block, "post_attention_layernorm", None)
+    if attn is None or mlp is None or norm is None:
+        return None
+    if any(isinstance(m, nn.Linear) for m in attn.modules()) or any(p.requires_grad for p in attn.parameters()):
+        return None
+    captured: list[torch.Tensor] = []
+    handle = norm.register_forward_pre_hook(lambda module, inp: captured.append(inp[0].detach()))
+    h = torch.empty_like(block_inputs)
+    try:
+        with torch.no_grad():
+            for j in range(block_inputs.shape[0]):
+                captured.clear()
+                block(block_inputs[j:j + 1], **kwargs)
+                h[j:j + 1] = captured[0]
+    finally:
+        handle.remove()
+
+    def forward_fn(idx: int) -> torch.Tensor:
+        hj = h[idx:idx + 1]
+        return hj + mlp(norm(hj))
+
+    return forward_fn
+
+
 def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs,
-               batch_size: int, epochs: int, num_samples: int) -> None:
+               batch_size: int, epochs: int, num_samples: int, forward_fn=None) -> None:
     """Shared epoch loop of :func:`tune_nonfact` and :func:`tune_fact`.
 
     Minimises the weighted block reconstruction loss with gradient accumulation over ``batch_size`` samples and
-    logs the per-element loss every epoch.
+    logs the per-element loss every epoch. ``forward_fn(idx)`` replaces the full block forward when given
+    (:func:`mlp_only_forward`).
     """
     device = block_target_outputs.device
     numel = block_target_outputs.numel()
@@ -360,7 +415,7 @@ def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, 
         epoch_loss = torch.zeros(1, device=device)
         for i in range(num_samples):
             idx = data_idx[i].item()
-            y = block(block_inputs[idx:idx + 1], **kwargs)[0]
+            y = forward_fn(idx) if forward_fn is not None else block(block_inputs[idx:idx + 1], **kwargs)[0]
             loss = fused_weighted_mse(y, block_target_outputs[idx:idx + 1], importance)
             epoch_loss += loss.detach()
             (loss / batch_size).backward()
@@ -368,7 +423,6 @@ def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, 
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-        cleanup_memory()
         msg = f"\t\t(Epoch {epoch+1:02d}/{epochs:02d}) Block Loss: {(epoch_loss / numel).item():.4e}"
         if epoch == epochs - 1:
             msg += f" | {time.time() - t0:.0f}s"
@@ -376,14 +430,19 @@ def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, 
 
 
 @torch.enable_grad()
-def tune_nonfact(block, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs, quant_config):
-    """Tune the still full-precision linear layers of ``block`` to absorb the quantisation error so far."""
+def tune_nonfact(block, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs, quant_config,
+                 target_name: str | None = None):
+    """Tune the still full-precision linear layers of ``block`` to absorb the quantisation error so far.
+
+    ``target_name`` (the layer about to be binarised) enables the MLP-only forward of :func:`mlp_only_forward`.
+    """
     set_seed(quant_config['seed'])
     batch_size = quant_config['nonfact_batch_size']
     epochs = quant_config['nonfact_epochs']
     num_samples = quant_config['num_calib_samples']
     total_steps = math.ceil(num_samples / batch_size) * epochs
     lr = quant_config['nonfact_lr']
+    forward_fn = mlp_only_forward(block, block_inputs, kwargs, target_name)
     params = []
     for module in block.modules():
         if isinstance(module, nn.Linear):
@@ -393,7 +452,8 @@ def tune_nonfact(block, block_inputs, block_target_outputs, importance: torch.Te
     optimizer = AdamW(params, lr=lr, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-4 * lr)
     _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, importance, kwargs, batch_size, epochs,
-               num_samples)
+               num_samples, forward_fn=forward_fn)
+    del forward_fn
     for p in params:
         p.requires_grad = False
     block.zero_grad(set_to_none=True)
@@ -427,13 +487,13 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
     """
     set_seed(quant_config['seed'])
     lx_orig = find_layers(layer)[name]
-    original_weight = lx_orig.weight.data.clone()
-    weight_for_factorization = original_weight.clone()
     new_module = lx_orig
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- 1. Iterative Factorization and Module Conversion ---
-    W_res = weight_for_factorization.clone()
+    # one read-only copy of the weight serves the factoriser, the memo key and the error report
+    W_res = lx_orig.weight.data.clone()
+    weight_for_factorization = W_res
 
     admm_time = time.time()
     # Select factorization function based on type
@@ -521,7 +581,8 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
     if not do_tuning and new_module.bias is not None and hasattr(lx_orig, 'bias') and lx_orig.bias is not None:
         new_module.bias.data.copy_(lx_orig.bias.data)
 
-    recon_error_raw = (factor_results["W_final"].cpu() - weight_for_factorization.cpu()).square().sum().item()
+    W_final = factor_results["W_final"]
+    recon_error_raw = (W_final - weight_for_factorization.to(W_final.device, W_final.dtype)).square().sum().item()
     original_norm_sq = weight_for_factorization.square().sum().item()
     per_el_error = recon_error_raw / W_res.numel()
     if original_norm_sq > 0:
@@ -531,7 +592,7 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
             f"\t\tADMM weight recon error: raw={recon_error_raw:.4f}, norm={normalized_error:.4f}, per_el={per_el_error:.4e}, ADMM time={admm_time:.2f}s{tag}"
         )
 
-    del original_weight, W_res, lx_orig
+    del W_res, weight_for_factorization, lx_orig
     cleanup_memory()
 
     return new_module, final_factor_results
@@ -544,12 +605,14 @@ def _hard_sign(x: torch.Tensor) -> torch.Tensor:
 
 @torch.enable_grad()
 def tune_fact(block, target_linear, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs,
-              quant_config):
+              quant_config, target_name: str | None = None):
     """Tune the latent binary factors and scales of ``target_linear`` (STE forward), then harden it.
 
-    The number of sign flips relative to the ADMM initialisation is logged as a diagnostic.
+    The number of sign flips relative to the ADMM initialisation is logged as a diagnostic. ``target_name`` enables
+    the MLP-only forward of :func:`mlp_only_forward`.
     """
     set_seed(quant_config['seed'])
+    forward_fn = mlp_only_forward(block, block_inputs, kwargs, target_name)
     batch_size = quant_config['fact_batch_size']
     epochs = quant_config['fact_epochs']
     num_samples = quant_config['num_calib_samples']
@@ -563,7 +626,8 @@ def tune_fact(block, target_linear, block_inputs, block_target_outputs, importan
     with torch.no_grad():
         init_signs = {n: _hard_sign(p.detach()) for n, p in target_linear.named_parameters() if "latent" in n}
     _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, importance, kwargs, batch_size, epochs,
-               num_samples)
+               num_samples, forward_fn=forward_fn)
+    del forward_fn
     with torch.no_grad():
         flips = sum(int((_hard_sign(getattr(target_linear, n).detach()) != s).sum().item())
                     for n, s in init_signs.items())

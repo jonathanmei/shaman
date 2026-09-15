@@ -60,6 +60,39 @@ def _total_bits(shapes, ranks, num_scales=2):
     return sum(U.layer_bits(a, b, ranks[k], num_scales) for k, (a, b) in shapes.items())
 
 
+def test_probe_layer_decomposes_each_dense_factor_once(monkeypatch):
+    """The three candidate ranks share the layer's factors: two n x n eigendecompositions, not six."""
+    torch.manual_seed(7)
+    n_in, n_out = 24, 16
+    lx = nn.Linear(n_in, n_out, bias=False)
+
+    def spd(n, seed):
+        g = torch.Generator().manual_seed(seed)
+        Q, _ = torch.linalg.qr(torch.randn(n, n, generator=g))
+        return (Q * torch.logspace(0, 1.5, n)) @ Q.mT
+
+    i_cov, o_cov = spd(n_in, 1), spd(n_out, 2)
+    lx.register_buffer("i_cov", i_cov, persistent=False)
+    lx.register_buffer("o_cov", o_cov, persistent=False)
+    lx.register_buffer("i_norm", i_cov.diagonal().clone(), persistent=False)
+    lx.register_buffer("o_norm", o_cov.diagonal().clone(), persistent=False)
+    big = {"n": 0}
+    real = torch.linalg.eigh
+
+    def counting(A, *args, **kwargs):
+        if A.shape[-1] in (n_in, n_out):
+            big["n"] += 1
+        return real(A, *args, **kwargs)
+
+    monkeypatch.setattr(torch.linalg, "eigh", counting)
+    cfg = _cfg(rank_sensitivity="admm", rank_probe_iters=4, admm_inner_iters=5, admm_reg=3e-2,
+               admm_penalty_scheduler="linear")
+    out = rank_probe.probe_layer(lx, [4, 8, 12], cfg, "cpu")
+    assert big["n"] == 2
+    assert set(out) == {4, 8, 12} and all(v > 0 for v in out.values())
+    assert out[4] >= out[12] * 0.5  # sanity: the probe still returns a decreasing-ish curve
+
+
 def _flat_curves(shapes, log_a=0.0, beta=1.0):
     return {k: (log_a, beta) for k in shapes}
 

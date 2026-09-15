@@ -206,11 +206,33 @@ def test_collect_stats_kron_matches_offline_fit(monkeypatch):
 def test_partition_layers_respects_budget_and_order():
     model = _TinyMLP()
     layers = {n: m for n, m in model.named_modules() if isinstance(m, nn.Linear)}
-    # layer "0": 8*(36+25)=488 B, layer "2": 8*(25+9)=272 B
+    # fp32 accumulator + bf16 previous-pass copy = 6 B per element: layer "0": 6*(36+25)=366 B, "2": 6*(25+9)=204 B
+    assert imp._factor_bytes(layers["0"]) == 366 and imp._factor_bytes(layers["2"]) == 204
     assert imp._partition_layers(layers, 10**9) == [["0", "2"]]
-    assert imp._partition_layers(layers, 600) == [["0"], ["2"]]
+    assert imp._partition_layers(layers, 500) == [["0"], ["2"]]
     assert imp._partition_layers(layers, 100) == [["0"], ["2"]]  # oversized layers get their own group
-    assert imp._partition_layers(layers, 760) == [["0", "2"]]
+    assert imp._partition_layers(layers, 570) == [["0", "2"]]
+
+
+def test_quadratic_form_bf16_weights_close_to_fp32():
+    g = torch.Generator().manual_seed(3)
+    Q, _ = torch.linalg.qr(torch.randn(48, 48, generator=g))
+    R = (Q * torch.logspace(0, 2, 48)) @ Q.mT
+    x = torch.randn(500, 48, generator=g)
+    w32 = imp._quadratic_form(x, R)
+    w16 = imp._quadratic_form(x, R.to(torch.bfloat16))
+    assert w16.dtype == torch.float32
+    assert ((w16 - w32).abs() / w32).max() < 1e-2
+    assert torch.allclose(imp._quadratic_form(x, None), x.square().sum(1))
+    # nkp_update accepts bf16 previous factors and still returns fp32 factors
+    delta = torch.randn(500, 6, generator=g)
+    L16, R16 = imp.nkp_update(x, delta, L_prev=None, R_prev=R.to(torch.bfloat16))
+    L32, R32 = imp.nkp_update(x, delta, L_prev=None, R_prev=R)
+    assert L16.dtype == torch.float32
+    assert (L16 - L32).norm() / L32.norm() < 1e-2 and (R16 - R32).norm() / R32.norm() < 1e-2
+    # _als_weights honours the storage dtype
+    w = imp._als_weights({"i_cov": {"a": R}, "o_cov": {}}, "kl", dtype=torch.bfloat16)
+    assert w["i_cov"]["a"].dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize("strategy", ["online", "dbf"])
@@ -233,7 +255,7 @@ def test_grouped_device_accumulation_matches_streaming(monkeypatch, strategy):
     torch.manual_seed(7)
     model_b = _TinyMLP()
     got = imp.collect_stats(model_b, dataloader, "cpu", strategy=strategy, curvature="kron", nkp_iters=2,
-                            gpu_budget_gb=600e-9)  # forces two layer groups
+                            gpu_budget_gb=500e-9)  # forces two layer groups (366 B + 204 B > 500 B)
     assert calls["n"] == 2 + 2 * 2  # nkp_iters x groups
     for key in ("i_cov", "o_cov", "i_norm", "o_norm"):
         assert set(got[key]) == set(ref[key])

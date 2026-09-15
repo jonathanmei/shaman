@@ -12,7 +12,7 @@
   "kron_fit": "kl",
   "kron_nkp_iters": 3,
   "kron_stats_device": "cpu",
-  "kron_eigh_dtype": "float64",
+  "kron_eigh_dtype": "float32",
   "kron_gpu_budget_gb": 48,
   "cache_dir": "cache",
   "checkpoint_every_blocks": 1,

@@ -16,6 +16,11 @@ if torch.cuda.is_available():
 # Local registry for rho schedulers
 RHO_SCHEDULER_REGISTRY = {}
 
+# Precision of the k x k eigendecomposition inside every Sylvester X-update (800 per layer). Its eigenvalues are
+# clamped and the solution feeds a sign projection, so fp32 is lossless here (the rank probe already runs entirely in
+# fp32); the once-per-layer n x n decomposition keeps the configurable ``kron_eigh_dtype``.
+SYLVESTER_EIGH_DTYPE = torch.float32
+
 
 @torch.no_grad()
 def power_iteration(A, num_iters=5):
@@ -136,7 +141,7 @@ def _stabilizer_from_mean(lam_mean: torch.Tensor, M: torch.Tensor, rho: float, r
 
 @torch.no_grad()
 def _sylvester_solve_step(Q: torch.Tensor, lam: torch.Tensor, M: torch.Tensor, C: torch.Tensor, rho: float, reg: float,
-                          eps: float = 1e-12, eigh_dtype: torch.dtype = torch.float64) -> torch.Tensor:
+                          eps: float = 1e-12, eigh_dtype: torch.dtype = SYLVESTER_EIGH_DTYPE) -> torch.Tensor:
     """Solve ``Sigma F M + sigma F = C`` for ``F`` with ``Sigma = Q diag(lam) Q^T``.
 
     This is the X-update of the Mahalanobis ADMM: ``Sigma`` is the (fixed, eigendecomposed once per
@@ -158,7 +163,7 @@ def _sylvester_solve_step(Q: torch.Tensor, lam: torch.Tensor, M: torch.Tensor, C
     eps : float
         Lower clamp for stabiliser / eigenvalues.
     eigh_dtype : torch.dtype
-        Precision of the ``k x k`` eigendecomposition (default fp64).
+        Precision of the ``k x k`` eigendecomposition (default :data:`SYLVESTER_EIGH_DTYPE`, fp32).
 
     Returns
     -------
@@ -181,7 +186,7 @@ def _sylvester_solve_step(Q: torch.Tensor, lam: torch.Tensor, M: torch.Tensor, C
 @torch.no_grad()
 def _sylvester_solve_structured(U: torch.Tensor, lam_U: torch.Tensor, mu: torch.Tensor, M: torch.Tensor,
                                 C: torch.Tensor, rho: float, reg: float, eps: float = 1e-12,
-                                eigh_dtype: torch.dtype = torch.float64) -> torch.Tensor:
+                                eigh_dtype: torch.dtype = SYLVESTER_EIGH_DTYPE) -> torch.Tensor:
     """:func:`_sylvester_solve_step` for ``Sigma = mu I + U diag(lam_U - mu) U^T`` in ``O(n r k + n k^2)``.
 
     ``Sigma`` is block diagonal in the split ``span(U)`` / its complement, so after rotating the right-hand side
@@ -267,8 +272,9 @@ class CurvatureFactor:
         return self.mu * X + ((X @ self.U) * self._delta.mT) @ self.U.mT
 
     def sylvester(self, M: torch.Tensor, C: torch.Tensor, rho: float, reg: float, eps: float,
-                  eigh_dtype: torch.dtype) -> torch.Tensor:
-        """Solve ``Sigma F M + sigma F = C`` (:func:`_sylvester_solve_step`)."""
+                  eigh_dtype: torch.dtype = SYLVESTER_EIGH_DTYPE) -> torch.Tensor:
+        """Solve ``Sigma F M + sigma F = C`` (:func:`_sylvester_solve_step`); the ``k x k`` eigh runs in
+        ``eigh_dtype`` (fp32 by default, see :data:`SYLVESTER_EIGH_DTYPE`)."""
         if self.U is None:
             return _sylvester_solve_step(self.Q, self.lam, M, C, rho, reg, eps, eigh_dtype)
         return _sylvester_solve_structured(self.U, self.lam_U, self.mu, M, C, rho, reg, eps, eigh_dtype)
@@ -412,7 +418,8 @@ def factorize_admm_nanoquant(
                When both are given, the data term becomes the Mahalanobis distance
                tr(L (W_n - AB) R (W_n - AB)^T) with the unit-diagonal normalised factors L, R, while the
                rho penalty and the SVID projection stay Euclidean.
-        eigh_dtype: Precision of the eigendecompositions used by the Mahalanobis solver.
+        eigh_dtype: Precision of the once-per-layer ``n x n`` eigendecomposition of each curvature factor (the
+               per-iteration ``k x k`` one is always fp32, :data:`SYLVESTER_EIGH_DTYPE`).
         mid_scale: Export an explicit per-rank ``scale_mid`` (see above).
         spectrum: Spectral conditioning of the unit-diagonal factors L, R (tempering power and two-sided
                spike-plus-flat projection, trace preserved; ``core.curvature.SpectrumSpec``); the default leaves
@@ -510,7 +517,7 @@ def factorize_admm_nanoquant(
             B_bar32 = B_bar.to(torch.float32)
             M = B_bar32 @ Rf.left(B_bar32.mT)  # B R B^T, (mid, mid)
             C = P @ B_bar32.mT + rho * (A_z - A_u).to(torch.float32)  # (out, mid)
-            A_ls = Lf.sylvester(M, C, rho, reg, eps, eigh_dtype).to(W.dtype)
+            A_ls = Lf.sylvester(M, C, rho, reg, eps).to(W.dtype)
         else:
             # W_norm.T uses view; keep it
             A_ls = _admm_solve_step(B_bar.mT, W_norm.mT, A_z.mT, A_u.mT, rho, reg, eps).mT
@@ -521,7 +528,7 @@ def factorize_admm_nanoquant(
             A_bar32 = A_bar.to(torch.float32)
             N = A_bar32.mT @ Lf.left(A_bar32)  # A^T L A, (mid, mid)
             C = (A_bar32.mT @ P + rho * (B_z - B_u).to(torch.float32)).mT  # (in, mid)
-            B_ls = Rf.sylvester(N, C, rho, reg, eps, eigh_dtype).mT.to(W.dtype)
+            B_ls = Rf.sylvester(N, C, rho, reg, eps).mT.to(W.dtype)
         else:
             B_ls = _admm_solve_step(A_bar, W_norm, B_z, B_u, rho, reg, eps)
 

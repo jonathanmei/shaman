@@ -51,10 +51,18 @@ def get_calib_loader(dataset_path, tokenizer, n_samples=128, seed=0, seqlen=2048
     return dataloader
 
 
+_TEST_ENC_CACHE: dict = {}
+"""Tokenised evaluation sets keyed by ``(name, model_name, seqlen)``: the per-block evaluation would otherwise
+reload the tokenizer and re-tokenise the whole test split every time."""
+
+
 def get_test_loaders(name, seqlen=2048, model_name=''):
     """
-    Loads standard evaluation datasets like Wikitext2 and C4.
+    Loads standard evaluation datasets like Wikitext2 and C4 (tokenised once per process, see ``_TEST_ENC_CACHE``).
     """
+    key = (name, model_name, seqlen)
+    if key in _TEST_ENC_CACHE:
+        return None, _TEST_ENC_CACHE[key]
     tokenizer = load_tokenizer(model_name)
 
     if 'wikitext2' in name:
@@ -71,6 +79,7 @@ def get_test_loaders(name, seqlen=2048, model_name=''):
     else:
         raise ValueError("Unsupported dataset")
 
+    _TEST_ENC_CACHE[key] = testenc
     return None, testenc
 
 

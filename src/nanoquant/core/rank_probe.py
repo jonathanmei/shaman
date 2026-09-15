@@ -34,7 +34,7 @@ from ..utils.utils import (
     set_seed,
     uniform_rank,
 )
-from .admm_nq import factorize_admm_nanoquant
+from .admm_nq import EigCache, factorize_admm_nanoquant
 from .compress_block import mahalanobis_weight_error
 from .curvature import SpectrumSpec
 
@@ -156,6 +156,12 @@ def probe_layer(lx: nn.Linear, ranks: list[int], quant_config: dict, dev: str) -
     if method != "admm":
         raise ValueError(f"Unknown rank_sensitivity: {method}")
     is_transpose = W.shape[0] < W.shape[1]
+    # the factors (and their normalisation, i_norm/o_norm = their diagonals) are the same at every candidate rank:
+    # decompose each once and share the eigenpairs across the rank loop
+    eig_cache = EigCache()
+    if dense:
+        eig_cache.register(i_cov)
+        eig_cache.register(o_cov)
     for r in ranks:
         set_seed(quant_config["seed"])
         res = factorize_admm_nanoquant(
@@ -165,10 +171,11 @@ def probe_layer(lx: nn.Linear, ranks: list[int], quant_config: dict, dev: str) -
             is_transpose=is_transpose, rho_scheduler=quant_config.get("admm_penalty_scheduler", "linear"),
             print_admm_steps=False, i_cov=i_cov, o_cov=o_cov, eigh_dtype=PROBE_EIGH_DTYPE,
             mid_scale=has_mid_scale(quant_config),
-            spectrum=SpectrumSpec.from_config(quant_config))
+            spectrum=SpectrumSpec.from_config(quant_config), eig_cache=eig_cache)
         W_hat = deployed_matrix(res)
         out[r] = max(mahalanobis_weight_error(W, W_hat, L, R), 1e-30)
         del res, W_hat
+    eig_cache.clear()
     del W, i_norm, o_norm, i_cov, o_cov, L, R
     return out
 

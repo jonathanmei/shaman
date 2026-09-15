@@ -70,6 +70,8 @@ def NanoQuantConfig(
     curvature_refresh_iters: int = 1,
     # log input-factor drift, Mahalanobis weight errors and the block-loss change of every ADMM solution
     block_diagnostics: bool = False,
+    # >0: evaluate WikiText-2 perplexity every N blocks (and after the last); 0 = only when block_diagnostics is on
+    block_ppl_every: int = 0,
     # tune_fact
     tune_fact: bool = True,
     fact_binary_lr: float = 1e-5,
@@ -138,6 +140,7 @@ def NanoQuantConfig(
         "curvature_refresh_every": curvature_refresh_every,
         "curvature_refresh_iters": curvature_refresh_iters,
         "block_diagnostics": block_diagnostics,
+        "block_ppl_every": block_ppl_every,
         # tune_fact
         "tune_fact": tune_fact,
         "fact_binary_lr": fact_binary_lr,

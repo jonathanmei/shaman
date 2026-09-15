@@ -97,7 +97,7 @@ def hash_tensors(*tensors: torch.Tensor | None) -> str:
             continue
         t = t.detach().to("cpu").contiguous()
         h.update(f"{tuple(t.shape)}|{t.dtype}".encode())
-        h.update(t.reshape(-1).view(torch.uint8).numpy().tobytes())
+        h.update(t.reshape(-1).view(torch.uint8).numpy())  # buffer protocol: no second host copy
     return h.hexdigest()
 
 

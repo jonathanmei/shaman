@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from nanoquant.core import admm_nq, pipeline
+from nanoquant.core import admm_nq, compress_model, pipeline
 from nanoquant.core import curvature as cv
 from nanoquant.core import importance as imp
 from nanoquant.modules.quant_config import NanoQuantConfig
@@ -230,7 +230,7 @@ def test_collect_stats_kl_matches_offline_fit(monkeypatch):
     # grouped accumulation reproduces the KL fit too
     torch.manual_seed(14)
     got = imp.collect_stats(_TinyMLP(), dataloader, "cpu", strategy="dbf", curvature="kron", nkp_iters=2, fit="kl",
-                            gpu_budget_gb=600e-9)
+                            gpu_budget_gb=500e-9)  # two layer groups
     torch.manual_seed(14)
     ref = imp.collect_stats(_TinyMLP(), dataloader, "cpu", strategy="dbf", curvature="kron", nkp_iters=2, fit="kl")
     for key in ("i_cov", "o_cov"):
@@ -268,3 +268,14 @@ def test_grid_config_keys():
                 {"admm_curvature_flat_mean": "banana"}):
         with pytest.raises(ValueError):
             pipeline.validate_config(cfg(**bad))
+    # the per-block perplexity evaluation is logging only: no key depends on it
+    assert C.chain_keys(base, 2) == C.chain_keys(cfg(block_ppl_every=3), 2)
+    assert "block_ppl_every" in base and base["block_ppl_every"] == 0
+
+
+def test_eval_block_ppl_gating():
+    f = compress_model.eval_block_ppl
+    assert not any(f({}, i, 6) for i in range(6))  # default: never
+    assert all(f({"block_diagnostics": True}, i, 6) for i in range(6))  # screens: every block
+    assert [f({"block_ppl_every": 3}, i, 8) for i in range(8)] == [False, False, True, False, False, True, False, True]
+    assert [f({"block_ppl_every": 1}, i, 2) for i in range(2)] == [True, True]
