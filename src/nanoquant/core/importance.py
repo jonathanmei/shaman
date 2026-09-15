@@ -250,17 +250,17 @@ def _als_weights(prev: dict, fit: str, device=None, dtype: torch.dtype | None = 
     (the eigendecompositions of the larger layers are far too slow on the CPU). ``dtype`` (e.g. bf16) is the storage
     precision of the returned weights; the inversion itself stays fp64.
     """
-    if fit == "frobenius":
-        out = prev if device is None else {key: {n: M.to(device) for n, M in prev[key].items()}
-                                           for key in ("i_cov", "o_cov")}
-    elif fit == "kl":
-        out = {key: {n: _damped_inverse(M if device is None else M.to(device)) for n, M in prev[key].items()}
-               for key in ("i_cov", "o_cov")}
-    else:
+    if fit not in KRON_FITS:
         raise ValueError(f"Unknown kron fit '{fit}'. Choose from {KRON_FITS}.")
-    if dtype is not None:
-        out = {key: {n: M.to(dtype) for n, M in out[key].items()} for key in ("i_cov", "o_cov")}
-    return out
+
+    def one(M: torch.Tensor) -> torch.Tensor:
+        # one layer at a time: the fp32 copy and the fp64 inversion of a 9728-wide factor are transient (1.1 GB),
+        # only the storage-dtype result stays resident for the whole group
+        M_dev = M if device is None else M.to(device)
+        W = M_dev if fit == "frobenius" else _damped_inverse(M_dev)
+        return W if dtype is None else W.to(dtype)
+
+    return {key: {n: one(M) for n, M in prev[key].items()} for key in ("i_cov", "o_cov")}
 
 
 @torch.no_grad()
