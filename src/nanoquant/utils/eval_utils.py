@@ -3,9 +3,10 @@
 
 import json
 
-import torch.nn as nn
 import torch
 from lm_eval.evaluator import simple_evaluate
+from lm_eval.models.huggingface import HFLM
+from torch import nn
 from tqdm import tqdm
 
 
@@ -142,12 +143,12 @@ def evaluate_model(
         if task_names:
             print(f"[INFO] Starting zero-shot evaluation for tasks: {', '.join(task_names)}")
 
+            # Wrap the model ourselves. A ``model_args`` dict is folded into every task's metadata and deep-copied
+            # per task when results are collected (``Task.dump_config``), which clones the whole model on the GPU
+            # once per task: the 14B model OOMed on six copies (jobs 5723553, 5733174).
+            lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size, device=str(device))
             harness_results = simple_evaluate(
-                model="hf",
-                model_args={
-                    "pretrained": model,
-                    "tokenizer": tokenizer,
-                },
+                model=lm,
                 tasks=task_names,
                 num_fewshot=num_fewshot,
                 batch_size=batch_size,

@@ -707,12 +707,28 @@ First 8B run. `configs/qwen3_8b_best.json` = the 4B best config with `tune_epoch
 blocks, 2 scales, no KD middle scale. Job **5721334**: one h200 on partition `lgpus` (no 4 h limit; 3-day request,
 400G), from the pinned checkout `ob:~/code/shaman-8b` with `cache/` and `checkpoints/` symlinked to the shared
 checkout, log `.objob/logs/nq-8b-best-5721334.out`. Everything (stats, probe, blocks, KD) is computed from scratch.
-Readout pending: WikiText-2 PPL, bpw, zero-shot mean, wall time per stage (calibration, probe, per block, KD) for
-comparison with the 4B fixes run 5713834 and the paper's 8B point.
+**Readout (COMPLETED 2026-09-16 01:42, 4 h 35 wall, one job):** WikiText-2 PPL **12.38** at 0.9944 bpw (factorized
+layers; whole model 3.275 bpw incl. embeddings/head), zero-shot mean **0.474** (boolq 0.620, piqa 0.612, hellaswag
+0.350, winogrande 0.574, arc_easy 0.466, arc_challenge 0.221; 4B best: 13.80 / 0.463). Stages: calibration + probe
+~1 h 20, 36 blocks 3 h 10 (~317 s/block on the h200 with `tune_epoch_weights: type`; the 4B fixes run 5713834 took
+~300-330 s/block on an a100 without it), KD 8 × 53 s, eval ~10 min. Peak host RSS 329 GB (stats file 87 GB), so the
+"RSS ≈ 3.2-3.8 × stats" rule holds. Checkpoint `checkpoints/qwen3_8b_best.pt` (3.2 GB).
 
 Qwen3-14B-Base, same recipe, launched concurrently on a second h200 (job **5723553**, `lgpus`, 5-day request, 800G,
 pinned checkout `ob:~/code/shaman-14b` @ af857a1, log `.objob/logs/nq-14b-best-5723553.out`).
 `configs/qwen3_14b_best.json` differs from the 8B config only in `curvature_refresh_every: 10` (40 blocks) and
 `kron_gpu_budget_gb: 80` (28 GB bf16 model on the 141 GB card). Sizing: Kronecker stats scale as the per-block
 sum of in² + out² (8B 606 M elements × 36 blocks = 87 GB fp32, matching the cache file; 14B 1147 M × 40 ≈ 184 GB),
-peak RSS was ~3.2× the stats file at 4B, hence 800G. Readout pending as for 8B.
+peak RSS was ~3.2× the stats file at 4B, hence 800G (measured peak 666 GB).
+
+**Readout (2026-09-16):** all quantization stages finished in 8 h 45 (40 blocks 6 h 08, ~551 s/block; model saved
+07:57 to `checkpoints/qwen3_14b_best.pt`, 4.5 GB): WikiText-2 PPL **11.13** at 0.9979 bpw (factorized layers; whole
+model 2.579 bpw). The zero-shot harness then failed with a CUDA OOM in an lm-eval model deepcopy *after* all 67106
+loglikelihood requests had run, with 137 GB allocated on the 141 GB card. An eval-only rerun with `batch_size: "16"`
+(job 5733174, 8 min: `from_pretrained_quantize` loads the saved checkpoint and skips straight to evaluation) failed
+identically, so the batch size was not the cause. Root cause (traceback: `evaluator_utils._collect_results` →
+`Task.dump_config` → `dataclasses.asdict` → `Parameter.__deepcopy__`): lm-eval 0.4.13 folds a `model_args` dict into
+every task's metadata and deep-copies each task config when it collects results, so passing
+`model_args={"pretrained": model, ...}` clones the whole model on the GPU once per task. Six tasks × 8B fit in
+141 GB; six × 14B do not. Fix in `utils/eval_utils.py`: wrap the model in `HFLM(...)` ourselves and pass it as
+`model=` (no `model_args`), regression test `tests/test_eval_model_args.py`. Zero-shot numbers below from the rerun.
