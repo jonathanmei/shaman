@@ -681,7 +681,11 @@ q/k 0.25, v/o 0.5, gate 0.75, up/down 1; or `measured` from the probe's predicte
 
 - The fixes are lossless: the reference reproduces the dense control's block-3 PPL (14.15 vs 14.149, job 5666720)
   at 145-150 s per block against 146-169 s (~5 % at 0.6B, where the screen keeps the fp64 eigh and the per-block
-  evaluation; the 4B saving is measured by job 5713834).
+  evaluation).
+- **4B, fixes only (`qwen3_4b_best.json` with fp32 eigh, no type weights; jobs 5713834 → TIMEOUT at 35/36 blocks →
+  resume 5733175, 30 min): PPL 13.8001 at 0.9863 bpw, zero-shot mean 0.464** vs the dense run's 13.80 / 0.463
+  (5663775 → 5666862): lossless. Blocks ran at 260-330 s each on the a100 against 340-510 s for the dense run
+  (per-block eval now gated), calibration + probe ~1 h 05 against ~1 h 40; the whole run still needs one resume.
 - **Type-weighted epochs: −28 % block time at +0.01 block-3 PPL** (block 0 is worse by 0.6 and the gap closes by
   block 1: the first block's q/k/v/o get 2-4 epochs and the later blocks absorb it). Adopted into the recipes.
 - Plateau stop: −20 % at +0.08, within noise but dominated by `type`; not adopted (can be combined later).
@@ -731,4 +735,12 @@ identically, so the batch size was not the cause. Root cause (traceback: `evalua
 every task's metadata and deep-copies each task config when it collects results, so passing
 `model_args={"pretrained": model, ...}` clones the whole model on the GPU once per task. Six tasks × 8B fit in
 141 GB; six × 14B do not. Fix in `utils/eval_utils.py`: wrap the model in `HFLM(...)` ourselves and pass it as
-`model=` (no `model_args`), regression test `tests/test_eval_model_args.py`. Zero-shot numbers below from the rerun.
+`model=` (no `model_args`), regression test `tests/test_eval_model_args.py` (commit 821dc80). Eval-only rerun
+5733176 (~8 min): zero-shot mean **0.491** (boolq 0.626, piqa 0.625, hellaswag 0.367, winogrande 0.634, arc_easy
+0.434, arc_challenge 0.259).
+
+| model | PPL | factorized bpw | zero-shot mean | wall (one h200) |
+|---|---|---|---|---|
+| Qwen3-4B-Base (a100, best 13.80) | 13.80 | 0.9864 | 0.463 | 2-3 × 4 h jobs |
+| Qwen3-8B-Base | **12.38** | 0.9944 | 0.474 | 4 h 35 |
+| Qwen3-14B-Base | **11.13** | 0.9979 | 0.491 | 8 h 45 + eval |
