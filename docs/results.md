@@ -809,14 +809,19 @@ Code (branch = `spectral-projection-screen` 597de00 + merge of `multi-gpu-admm-p
 Arms (each = the size's best config + `admm_parallel_sides` + `parallel_devices: 4`; GPU factor budget 80 on h200,
 48 on 80 GB cards; scripts in `scripts/scale_sweep/`):
 
-| arm | `num_stats_samples` | `rank_type_weights` | hardware (lgpus) | reuses |
-|---|---|---|---|---|
-| `qwen3_8b_best_stats512` | 512 | – | 4 × a100 | – |
-| `qwen3_8b_best_typeprior` | – | 4B table | 4 × h100 | 8B stats + probe |
-| `qwen3_8b_best_stats512_typeprior` | 512 | 4B table | 4 × a100 | – |
-| `qwen3_14b_best_stats512` | 512 | – | 4 × h200 | – |
-| `qwen3_14b_best_typeprior` | – | 4B table | 4 × h100 | 14B stats + probe |
-| `qwen3_14b_best_stats512_typeprior` | 512 | 4B table | 4 × h200 | – |
+| arm | `num_stats_samples` | `rank_type_weights` | hardware (lgpus) | reuses | job (2026-09-16) |
+|---|---|---|---|---|---|
+| `qwen3_8b_best_stats512` | 512 | – | 4 × a100 | – | 5733280 |
+| `qwen3_8b_best_typeprior` | – | 4B table | 4 × h100 | 8B stats + probe | 5733283 (5733278 failed on the alias check) |
+| `qwen3_8b_best_stats512_typeprior` | 512 | 4B table | 4 × a100 | – | 5733281 |
+| `qwen3_14b_best_stats512` | 512 | – | 4 × h200 | – | 5733276 |
+| `qwen3_14b_best_typeprior` | – | 4B table | 4 × h100 | 14B stats + probe | 5733284 (5733279 failed on the alias check) |
+| `qwen3_14b_best_stats512_typeprior` | 512 | 4B table | 4 × h200 | – | 5733277 |
+
+Smoke of the new paths: job 5733275 (`qwen3_0p6b_smoke_sweep.json`, 4 blocks, stats 32 vs 16, refresh at block
+2, type table, two-device ADMM) completed in 4 min 49 with the expected log lines. Code as run: 78f0d84 (512-sample
+arms) and d6c8677 (type-prior arms; adds the `ArtifactCache.load` symlink-alias acceptance after the first
+submissions 5733278/5733279 hit the stored-key check).
 
 Cache note: the multi-GPU merge changed `core/importance.py` and `core/rank_probe.py`, so the baseline statistics
 (7bed6335…, 59e272a5…) and probes (e116d3d9…, 731b3ad2…) were re-keyed; since those changes are documented as
