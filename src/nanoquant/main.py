@@ -72,8 +72,14 @@ class QuantArguments:
     rank_depth_ramp: float = field(
         default=0.0, metadata={"help": "Depth prior on the measured curves: log-ratio of the last block's multiplier "
                                        "to the first block's (0 = flat)"})
+    rank_type_weights: str = field(
+        default="", metadata={"help": "Per-layer-type prior on the measured curves, e.g. "
+                                      "'q_proj:0.85,down_proj:1.15' (multiplies the depth ramp; '' = none)"})
     seed: int = field(default=0, metadata={"help": "Random seed"})
     num_calib_samples: int = field(default=128, metadata={"help": "Number of calibration samples"})
+    num_stats_samples: int = field(
+        default=0, metadata={"help": "Calibration samples for the curvature statistics and refreshes only "
+                                     "(0 = num_calib_samples); block reconstruction and KD keep num_calib_samples"})
     calib_dataset: str = field(default="wikitext2", metadata={"help": "Calibration dataset"})
     calib_shrinkage: float = field(default=0.4, metadata={"help": "Calibration shrinkage factor"})
     calib_strategy: str = field(
@@ -295,6 +301,8 @@ def main():
         rank_probe_ranks=quant_args.rank_probe_ranks,
         rank_probe_iters=quant_args.rank_probe_iters,
         rank_depth_ramp=quant_args.rank_depth_ramp,
+        rank_type_weights=quant_args.rank_type_weights,
+        num_stats_samples=quant_args.num_stats_samples,
         seed=quant_args.seed,
         num_calib_samples=quant_args.num_calib_samples,
         calib_dataset=quant_args.calib_dataset,

@@ -16,9 +16,29 @@ from ..utils.load_utils import load_tokenizer
 from ..utils.utils import set_seed
 
 
-def get_calib_loader(dataset_path, tokenizer, n_samples=128, seed=0, seqlen=2048):
-    """
-    Creates a dataloader for calibration.
+def get_calib_loader(dataset_path, tokenizer, n_samples=128, seed=0, seqlen=2048, replace=True):
+    """Create the ``(n_samples, seqlen)`` token-id tensor of calibration sequences.
+
+    Parameters
+    ----------
+    dataset_path : str or sequence of dict
+        Saved Hugging Face dataset directory, or the in-memory samples (``{"input_ids": ...}`` each).
+    tokenizer : PreTrainedTokenizer
+        Provides the padding id.
+    n_samples : int
+        Number of sequences to draw.
+    seed : int
+        Seed of the draw.
+    seqlen : int
+        Sequences are truncated or right-padded to this length.
+    replace : bool
+        ``True`` (legacy): draw indices with replacement. ``False``: a seeded permutation of the pool, every
+        sequence at most once (``n_samples`` must not exceed the pool size); used for the statistics loader.
+
+    Returns
+    -------
+    torch.LongTensor
+        Shape ``(n_samples, seqlen)``.
     """
     if type(dataset_path) == "str":
         print(f"Loading dataset from disk: {dataset_path}")
@@ -27,7 +47,12 @@ def get_calib_loader(dataset_path, tokenizer, n_samples=128, seed=0, seqlen=2048
         ds = dataset_path
 
     set_seed(seed)
-    inds = np.random.randint(0, len(ds), size=(n_samples, ))
+    if replace:
+        inds = np.random.randint(0, len(ds), size=(n_samples, ))
+    else:
+        if n_samples > len(ds):
+            raise ValueError(f"cannot draw {n_samples} distinct sequences from a pool of {len(ds)}")
+        inds = np.random.permutation(len(ds))[:n_samples]
 
     input_ids = [ds[int(i)]["input_ids"] for i in inds]
 

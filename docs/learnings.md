@@ -98,3 +98,13 @@ settles.
   exchange is negligible. Results are bitwise those of the serial path on identical GPUs (CPU tests
   `test_split_sides_match_serial`, `test_measure_sensitivity_sharded_matches_serial`,
   `test_sharded_group_accumulation_matches_serial`).
+- **Statistics-only sample count (`num_stats_samples`, branch `scale-sweep-calib-typeprior`).** Raises the
+  calibration set of the curvature statistics and of the periodic refreshes only; block reconstruction and KD keep
+  `num_calib_samples` (their cost is linear in samples × epochs and their activations sit on the GPU, whereas the
+  statistics loop streams token ids). The block/KD loader is byte-identical to a run without the knob; the stats
+  key changes only when the knob is set. Sibling knob `rank_type_weights` restores the 26d8fd4 hand table as a
+  multiplicative prior on the measured curves (in `BLOCK_FIELDS`, not in `PROBE_FIELDS`).
+- **Source fingerprints re-key artifacts even for math-preserving edits.** The multi-GPU merge touched
+  `core/importance.py` and `core/rank_probe.py`, so the 8B/14B statistics (87 / 184 GB) and probes changed keys;
+  they were symlinked under the new keys in `cache/stats` and `cache/rank_probe` (2026-09-16) rather than
+  recomputed. Check `[cache] hit stats` in the first log lines of any run that is supposed to reuse them.

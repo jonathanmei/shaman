@@ -17,9 +17,13 @@ def NanoQuantConfig(
     rank_probe_iters: int = 50,
     # depth prior on the measured curves: log-ratio of the last block's multiplier to the first block's (0 = flat)
     rank_depth_ramp: float = 0.0,
+    # per-layer-type prior on the measured curves ("q_proj:0.85,down_proj:1.15"; multiplies the ramp; "" = none)
+    rank_type_weights: str = "",
     # calib
     seed: int = 0,
     num_calib_samples: int = 128,
+    # calibration samples for the curvature statistics and refreshes only (0 = num_calib_samples)
+    num_stats_samples: int = 0,
     calib_dataset: str = "wikitext2",
     calib_shrinkage: float = 0.4,
     calib_strategy: str = "online",
@@ -115,9 +119,11 @@ def NanoQuantConfig(
         "rank_probe_ranks": rank_probe_ranks,
         "rank_probe_iters": rank_probe_iters,
         "rank_depth_ramp": rank_depth_ramp,
+        "rank_type_weights": rank_type_weights,
         # calibration
         "seed": seed,
         "num_calib_samples": num_calib_samples,
+        "num_stats_samples": num_stats_samples,
         "calib_dataset": calib_dataset,
         "calib_shrinkage": calib_shrinkage,
         "calib_strategy": calib_strategy,

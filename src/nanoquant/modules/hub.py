@@ -50,9 +50,12 @@ class NanoQuantConfigDataclass:
     rank_probe_ranks: str = "0.5,1.0,1.5"
     rank_probe_iters: int = 50
     rank_depth_ramp: float = 0.0
+    rank_type_weights: str = ""
     # calib
     seed: int = 0
     num_calib_samples: int = 128
+    # calibration samples for the curvature statistics and refreshes only (0 = num_calib_samples)
+    num_stats_samples: int = 0
     calib_dataset: str = "wikitext2"
     calib_shrinkage: float = 0.4
     calib_strategy: str = "online"

@@ -390,6 +390,77 @@ def depth_multipliers(shapes: dict[str, tuple[int, int]], n_blocks: int, depth_r
     return mult
 
 
+def parse_type_weights(spec: str) -> dict[str, float]:
+    """Parse ``rank_type_weights`` (``"name:weight,..."``) into a ``{name: weight}`` table.
+
+    Parameters
+    ----------
+    spec : str
+        Comma-separated ``name:weight`` entries; ``name`` is a sub-layer name (``down_proj``) or a full
+        ``self_attn.q_proj`` path. Empty string = no table.
+
+    Returns
+    -------
+    dict
+        Positive multipliers per name.
+
+    Raises
+    ------
+    ValueError
+        On a malformed entry or a non-positive weight.
+    """
+    weights: dict[str, float] = {}
+    for item in (spec or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"rank_type_weights entry '{item}' must be 'name:weight'")
+        name, value = item.rsplit(":", 1)
+        try:
+            w = float(value)
+        except ValueError as e:
+            raise ValueError(f"rank_type_weights entry '{item}': weight is not a number") from e
+        if w <= 0:
+            raise ValueError(f"rank_type_weights entry '{item}': weight must be > 0")
+        weights[name.strip()] = w
+    return weights
+
+
+def _type_weight(name: str, weights: dict[str, float]) -> float:
+    """Multiplier of sub-layer ``name`` (full path wins over the bare last component; 1 when absent)."""
+    if name in weights:
+        return weights[name]
+    return weights.get(name.rsplit(".", 1)[-1], 1.0)
+
+
+def type_multipliers(shapes: dict[str, tuple[int, int]], type_weights: dict[str, float]) -> dict[str, float]:
+    """Per-layer-type prior ``w_type(l)`` per layer key (the hand table of the 4B best run, 2026-09-10).
+
+    Parameters
+    ----------
+    shapes : dict
+        ``"<block>.<name>" -> (in_features, out_features)``.
+    type_weights : dict
+        Output of :func:`parse_type_weights`.
+
+    Returns
+    -------
+    dict
+        ``"<block>.<name>" -> multiplier``.
+
+    Raises
+    ------
+    ValueError
+        If the table names a layer type the model does not have (a typo would otherwise be a silent no-op).
+    """
+    known = {k.split(".", 1)[1] for k in shapes} | {k.split(".", 1)[1].rsplit(".", 1)[-1] for k in shapes}
+    unknown = [t for t in type_weights if t not in known]
+    if unknown:
+        raise ValueError(f"rank_type_weights refer to layer types not in the model: {unknown}")
+    return {key: _type_weight(key.split(".", 1)[1], type_weights) for key in shapes}
+
+
 def _step_bits(in_features: int, out_features: int, num_scales: int) -> int:
     """Bits added by one 32-rank step of a layer."""
     return RANK_STEP * (in_features + out_features) + (SCALE_BITS * RANK_STEP if num_scales == 3 else 0)
@@ -521,14 +592,17 @@ def calculate_ranks(model, layers_to_analyze, quant_config, sensitivity: dict | 
     if measured not in RANK_SENSITIVITIES:
         raise ValueError(f"Unknown rank_sensitivity: {measured}")
     ramp = float(quant_config.get('rank_depth_ramp', 0.0) or 0.0)
-    if budget == 'uniform' and (ramp or measured != 'none'):
-        raise ValueError("rank_depth_ramp / rank_sensitivity require rank_budget='parity' or 'full'")
+    type_weights = parse_type_weights(quant_config.get('rank_type_weights', '') or '')
+    if budget == 'uniform' and (ramp or type_weights or measured != 'none'):
+        raise ValueError("rank_depth_ramp / rank_type_weights / rank_sensitivity require rank_budget='parity' or "
+                         "'full'")
     if budget != 'uniform' and measured == 'none':
         raise ValueError("rank_budget='parity' / 'full' requires a measured rank_sensitivity ('admm' or 'svd')")
 
     print(f"Rank calculation: Bits = ({bits:.2f}), Scales: {num_scales}, budget: {budget}"
           + (f", measured sensitivity ({measured})" if measured != 'none' else "")
-          + (f", depth ramp {ramp:g}" if ramp else ""))
+          + (f", depth ramp {ramp:g}" if ramp else "")
+          + (f", type weights {type_weights}" if type_weights else ""))
     blocks = get_decoder_layers(model)
     shapes: dict[str, tuple[int, int]] = {}
     for i, layer in enumerate(blocks):
@@ -544,7 +618,11 @@ def calculate_ranks(model, layers_to_analyze, quant_config, sensitivity: dict | 
               "showing the uniform rule")
         return legacy
     curves = sensitivity["curves"]
+    # multiplicative priors on the measured curves: depth ramp × per-type table (either may be absent)
     mult = depth_multipliers(shapes, len(blocks), ramp) if ramp else None
+    if type_weights:
+        types = type_multipliers(shapes, type_weights)
+        mult = {k: (mult[k] if mult else 1.0) * types[k] for k in shapes}
     ranks = allocate_ranks_measured(shapes, curves, bits, num_scales, budget, legacy, mult=mult)
     print(_format_measured_summary(shapes, ranks, legacy, curves, num_scales))
     changed = sum(ranks[k] != legacy[k] for k in ranks)

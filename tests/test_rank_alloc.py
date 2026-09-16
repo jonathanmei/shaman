@@ -88,7 +88,8 @@ def test_config_plumbing_and_cache_keys():
     cfg = NanoQuantConfig(model_id="t")
     assert cfg["rank_budget"] == "uniform" and cfg["rank_sensitivity"] == "none" and cfg["rank_depth_ramp"] == 0.0
     assert cfg["rank_probe_ranks"] == "0.5,1.0,1.5" and cfg["rank_probe_iters"] == 50
-    for gone in ("rank_type_weights", "rank_max_ratio", "block_loss", "tail_logit_blocks", "retain_latent",
+    assert cfg["rank_type_weights"] == ""
+    for gone in ("rank_max_ratio", "block_loss", "tail_logit_blocks", "retain_latent",
                  "model_kd_mode", "model_kd_feature_weight", "admm_curvature_cond_max"):
         assert gone not in cfg
     base = NanoQuantConfig(model_id="tiny/model", num_calib_samples=4, seqlen=16)
@@ -99,11 +100,69 @@ def test_config_plumbing_and_cache_keys():
         return c
 
     for field, value in (("rank_budget", "full"), ("rank_depth_ramp", 0.5), ("rank_sensitivity", "admm"),
-                         ("rank_probe_ranks", "0.75,1.25"), ("rank_probe_iters", 10)):
+                         ("rank_probe_ranks", "0.75,1.25"), ("rank_probe_iters", 10),
+                         ("rank_type_weights", "down_proj:1.15")):
         assert C.chain_keys(base, 2)[0] != C.chain_keys(over(**{field: value}), 2)[0], field
+    # the type table is applied to the fitted curves after the probe: the probe artifact stays reusable
+    assert C.probe_key(base) == C.probe_key(over(rank_type_weights="down_proj:1.15"))
     pipeline.validate_config(over(rank_budget="parity", rank_sensitivity="admm", rank_depth_ramp=0.6))
     pipeline.validate_config(over(rank_budget="full", rank_sensitivity="svd"))
+    pipeline.validate_config(over(rank_budget="parity", rank_sensitivity="admm", rank_type_weights="v_proj:1.1"))
     for bad in ({"rank_budget": "banana"}, {"rank_depth_ramp": 0.5}, {"rank_budget": "parity"},
-                {"rank_sensitivity": "admm"}, {"rank_budget": "parity", "rank_sensitivity": "banana"}):
+                {"rank_sensitivity": "admm"}, {"rank_budget": "parity", "rank_sensitivity": "banana"},
+                {"rank_type_weights": "v_proj:1.1"},  # a prior alone does not define an allocation
+                {"rank_budget": "parity", "rank_sensitivity": "admm", "rank_type_weights": "v_proj"}):
         with pytest.raises(ValueError):
             pipeline.validate_config(over(**bad))
+
+
+def test_parse_type_weights():
+    assert U.parse_type_weights("") == {}
+    assert U.parse_type_weights("v_proj:1.2, down_proj:1.15,q_proj:0.9") == {"v_proj": 1.2, "down_proj": 1.15,
+                                                                            "q_proj": 0.9}
+    for bad in ("v_proj", "v_proj:x", "v_proj:0", "v_proj:-1"):
+        with pytest.raises(ValueError):
+            U.parse_type_weights(bad)
+
+
+def _flat_curves(model, beta=1.0):
+    """Identical sensitivity curves for every layer, so only the priors and shapes decide the allocation."""
+    curves = {}
+    for i, _ in enumerate(model.model.layers):
+        for name in NAMES:
+            curves[f"{i}.{name}"] = (0.0, beta)
+    return {"curves": curves}
+
+
+def test_type_weights_shift_measured_allocation_between_layer_types():
+    model = _model(2)
+    sens = _flat_curves(model)
+    base = _cfg(rank_budget="parity", rank_sensitivity="admm")
+    plain = U.calculate_ranks(model, NAMES, base, sensitivity=sens)
+    same = U.calculate_ranks(model, NAMES, dict(base, rank_type_weights=""), sensitivity=sens)
+    assert same == plain
+    tilted = U.calculate_ranks(model, NAMES, dict(base, rank_type_weights="down_proj:1.3,q_proj:0.7"),
+                               sensitivity=sens)
+    p, t = _by_block(plain), _by_block(tilted)
+    assert all(t[b]["mlp.down_proj"] >= p[b]["mlp.down_proj"] for b in p)
+    assert all(t[b]["self_attn.q_proj"] <= p[b]["self_attn.q_proj"] for b in p)
+    assert sum(t[b]["mlp.down_proj"] for b in t) > sum(p[b]["mlp.down_proj"] for b in p)
+    assert sum(t[b]["self_attn.q_proj"] for b in t) < sum(p[b]["self_attn.q_proj"] for b in p)
+    # same bit target (parity): the totals agree up to one 32-step of the largest layer
+    bits_p = sum(U.layer_bits(*QWEN3_SHAPES[k.split('.', 1)[1]], r, 2) for k, r in plain.items())
+    bits_t = sum(U.layer_bits(*QWEN3_SHAPES[k.split('.', 1)[1]], r, 2) for k, r in tilted.items())
+    assert abs(bits_p - bits_t) <= 32 * (3072 + 1024)
+    assert all(r % 32 == 0 for r in tilted.values())
+    # the depth ramp and the type table compose multiplicatively
+    both = U.calculate_ranks(model, NAMES, dict(base, rank_depth_ramp=0.6, rank_type_weights="down_proj:1.3"),
+                             sensitivity=sens)
+    ramp_only = U.calculate_ranks(model, NAMES, dict(base, rank_depth_ramp=0.6), sensitivity=sens)
+    assert sum(_by_block(both)[b]["mlp.down_proj"] for b in (0, 1)) > \
+        sum(_by_block(ramp_only)[b]["mlp.down_proj"] for b in (0, 1))
+    with pytest.raises(ValueError):  # unknown layer type is an error, not a silent no-op
+        U.calculate_ranks(model, NAMES, dict(base, rank_type_weights="banana_proj:1.3"), sensitivity=sens)
+
+
+QWEN3_SHAPES = {"self_attn.q_proj": (1024, 2048), "self_attn.k_proj": (1024, 1024), "self_attn.v_proj": (1024, 1024),
+                "self_attn.o_proj": (2048, 1024), "mlp.gate_proj": (1024, 3072), "mlp.up_proj": (1024, 3072),
+                "mlp.down_proj": (3072, 1024)}

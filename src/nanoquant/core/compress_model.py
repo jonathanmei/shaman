@@ -118,9 +118,12 @@ def refresh_block_curvature(model, dataloader, dev: str, quant_config: dict) -> 
 
 @torch.no_grad()
 def compress_block_recon(model, fp_model, dataloader, quant_config, cache: ArtifactCache | None = None,
-                         sensitivity: dict | None = None):
+                         sensitivity: dict | None = None, stats_dataloader=None):
     """
     Compresses a model using a functional, sequential tune-then-factorize approach.
+
+    ``stats_dataloader`` (default: ``dataloader``) is the calibration set of the periodic curvature refreshes
+    (``num_stats_samples``); the block tuning itself always runs on ``dataloader``.
 
     ``sensitivity`` is the calibration-time rank-probe artifact (``core.rank_probe.measure_sensitivity``) that the
     measured rank allocation consumes; ``None`` with ``rank_sensitivity != "none"`` falls back to the uniform rule.
@@ -188,7 +191,8 @@ def compress_block_recon(model, fp_model, dataloader, quant_config, cache: Artif
         if refresh_every > 0 and i > 0 and (i % refresh_every == 0 or i == start):
             # periodic refresh (also right after a resume, whose prefix may have skipped one)
             t_ref = time.time()
-            n_ref = refresh_block_curvature(model, dataloader, dev, quant_config)
+            n_ref = refresh_block_curvature(model, stats_dataloader if stats_dataloader is not None else dataloader,
+                                            dev, quant_config)
             print(f"\t\t[refresh] block {i}: re-estimated curvature of {n_ref} remaining layers on the quantised "
                   f"prefix ({time.time() - t_ref:.0f}s)")
         if torch.cuda.is_available():

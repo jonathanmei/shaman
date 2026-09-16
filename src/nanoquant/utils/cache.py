@@ -45,7 +45,7 @@ ADMM_FIELDS: tuple[str, ...] = ("admm_type", "admm_outer_iters", "admm_inner_ite
 # ``max_blocks`` and ``block_diagnostics`` are deliberately absent: a truncated screening run and a run with extra
 # logging share their per-block checkpoints with the plain full chain.
 BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits", "rank_budget", "rank_depth_ramp", "rank_sensitivity",
-                                 "rank_probe_ranks", "rank_probe_iters") + ADMM_FIELDS + (
+                                 "rank_probe_ranks", "rank_probe_iters", "rank_type_weights") + ADMM_FIELDS + (
     "admm_input_factor", "curvature_refresh_every", "curvature_refresh_iters",
     "tune_nonfact", "nonfact_lr", "nonfact_batch_size", "nonfact_epochs", "nonfact_per_group",
     "tune_epoch_weights", "tune_epoch_min_frac", "tune_plateau_tol", "tune_fact", "fact_binary_lr",
@@ -113,8 +113,16 @@ def fingerprint_sources(group: str) -> str:
 
 
 def stats_key(cfg: dict) -> str:
-    """Key of the raw calibration statistics (shrinkage is applied at load time and is *not* part of it)."""
-    return hash_json({"fields": _subset(cfg, STATS_FIELDS), "code": fingerprint_sources("stats")})
+    """Key of the raw calibration statistics (shrinkage is applied at load time and is *not* part of it).
+
+    ``num_stats_samples`` enters the key only when it raises the sample count above ``num_calib_samples``, so
+    configurations written before the knob existed keep their (expensive) statistics.
+    """
+    fields = _subset(cfg, STATS_FIELDS)
+    n_stats = int(cfg.get("num_stats_samples", 0) or 0)
+    if n_stats > int(cfg.get("num_calib_samples", 0) or 0):
+        fields["num_stats_samples"] = n_stats
+    return hash_json({"fields": fields, "code": fingerprint_sources("stats")})
 
 
 def chain_root(cfg: dict) -> str:

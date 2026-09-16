@@ -25,6 +25,7 @@ from ..utils.utils import (
     get_layers_to_factorize,
     has_mid_scale,
     parse_probe_ranks,
+    parse_type_weights,
     stage_devices,
 )
 from .compress_block import TUNE_EPOCH_WEIGHT_MODES
@@ -43,6 +44,60 @@ from .resume import compressed_state_dict
 
 PRE_KD_KIND = "model"
 ADMM_INPUT_FACTORS = ("calib", "fresh")
+
+
+def stats_sample_count(quant_config: dict) -> int:
+    """Number of calibration sequences the curvature statistics (and refreshes) are collected on.
+
+    ``num_stats_samples`` (0 or absent = same as ``num_calib_samples``) may raise the statistics' sample count
+    without touching the block-reconstruction and KD stages, whose cost is linear in samples × epochs and whose
+    activations live on the GPU. It is never lower than ``num_calib_samples``.
+
+    Parameters
+    ----------
+    quant_config : dict
+        Quantisation configuration.
+
+    Returns
+    -------
+    int
+        Sample count of the statistics loader.
+    """
+    n_calib = int(quant_config["num_calib_samples"])
+    n_stats = int(quant_config.get("num_stats_samples", 0) or 0)
+    return max(n_calib, n_stats)
+
+
+def build_stats_loader(model_id: str, tokenizer, quant_config: dict, dataloader: torch.Tensor) -> torch.Tensor:
+    """Calibration loader for the curvature statistics.
+
+    Returns ``dataloader`` itself unless ``num_stats_samples`` exceeds ``num_calib_samples``; then a separate pool
+    of that many sequences is generated (same seed and dataset) and every sequence is used exactly once. The
+    block/KD loader is left untouched, so those stages see the same tokens as a run without the knob.
+
+    Parameters
+    ----------
+    model_id : str
+        Model id (tokenizer of the dataset preparation).
+    tokenizer : PreTrainedTokenizer
+        Tokenizer (padding id).
+    quant_config : dict
+        Quantisation configuration.
+    dataloader : torch.Tensor
+        The ``(num_calib_samples, seqlen)`` loader of the block and KD stages.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(n, seqlen)`` token ids with ``n = stats_sample_count(quant_config)``.
+    """
+    n_stats = stats_sample_count(quant_config)
+    if n_stats == len(dataloader):
+        return dataloader
+    cfg = dict(quant_config)
+    cfg["num_calib_samples"] = n_stats
+    pool = prepare_dataset(model_id, cfg)
+    return get_calib_loader(pool, tokenizer, n_stats, quant_config["seed"], quant_config["seqlen"], replace=False)
 
 
 def validate_config(quant_config: dict) -> None:
@@ -69,8 +124,12 @@ def validate_config(quant_config: dict) -> None:
     if sensitivity not in RANK_SENSITIVITIES:
         raise ValueError(f"Unknown rank_sensitivity: {sensitivity}")
     ramp = float(quant_config.get("rank_depth_ramp", 0.0) or 0.0)
-    if budget == "uniform" and (ramp or sensitivity != "none"):
-        raise ValueError("rank_depth_ramp / rank_sensitivity require rank_budget='parity' or 'full'")
+    type_weights = parse_type_weights(quant_config.get("rank_type_weights", "") or "")  # raises when malformed
+    if budget == "uniform" and (ramp or type_weights or sensitivity != "none"):
+        raise ValueError("rank_depth_ramp / rank_type_weights / rank_sensitivity require rank_budget='parity' or "
+                         "'full'")
+    if int(quant_config.get("num_stats_samples", 0) or 0) < 0:
+        raise ValueError("num_stats_samples must be >= 0")
     if budget != "uniform" and sensitivity == "none":
         raise ValueError("rank_budget='parity' / 'full' requires a measured rank_sensitivity ('admm' or 'svd')")
     if sensitivity != "none":
@@ -167,6 +226,7 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
     tokenizer = load_tokenizer(model_id)
     dataloader = get_calib_loader(data, tokenizer, quant_config['num_calib_samples'], quant_config['seed'],
                                   quant_config['seqlen'])
+    stats_loader = build_stats_loader(model_id, tokenizer, quant_config, dataloader)
     n_blocks = len(get_decoder_layers(fp_model))
     layers = get_layers_to_factorize(fp_model.config.model_type)
     print(format_accounting(static_accounting(fp_model, layers, quant_config), title="bpw budget"))
@@ -191,9 +251,10 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
         model = load_model(model_id, quant_config['seqlen'], device_map=device_map)
 
         # 1) calibration statistics (diagonal or Kronecker-factored curvature)
+        print(f"stats: {len(stats_loader)} calibration samples (block reconstruction / KD: {len(dataloader)})")
         raw_stats = cache.load_or_compute(
             "stats", stats_key(quant_config),
-            lambda: collect_stats(model, dataloader, dev, devices=stage_devices(quant_config, dev),
+            lambda: collect_stats(model, stats_loader, dev, devices=stage_devices(quant_config, dev),
                                   **collect_stats_kwargs(quant_config)))
         shrunk_stats = get_shrunk_stats(raw_stats, shrinkage=quant_config['calib_shrinkage'])
         model = register_stats(model, shrunk_stats)
@@ -211,7 +272,8 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
                                     title="bpw budget, measured"))
 
         # 2) block-wise reconstruction (resumable)
-        model = compress_block_recon(model, fp_model, dataloader, quant_config, cache=cache, sensitivity=sensitivity)
+        model = compress_block_recon(model, fp_model, dataloader, quant_config, cache=cache, sensitivity=sensitivity,
+                                     stats_dataloader=stats_loader)
         if truncated:
             print(f"[screen] reconstructed the first {max_blocks}/{n_blocks} blocks only: "
                   f"pre-KD model not cached, KD skipped")

@@ -783,3 +783,44 @@ Triton cross-entropy / checkpoint recompute of a cuda:1 replica launched on cuda
   negligible against 60-150 ms iterations.
 - Next: a 4B best run with both knobs on four GPUs (expected to fit one 4 h job again: chain ~2 h 35 → ~1 h 45,
   probe 41 → ~10 min, calibration 17 → ~9 min).
+
+## Scale sweep: 512 calibration samples × type-weight prior at 8B / 14B (2026-09-16, branch `scale-sweep-calib-typeprior`)
+
+Motivation: the recipe's margin over the paper shrinks with size (0.6B −16.7 %, 1.7B −13 %, 4B −5.2 %, 8B −0.7 %,
+14B +1.9 %). Two hypotheses are tested in a 2 × 2 without the control (the baselines above are the control):
+(1) the KL Kronecker factors are sample-starved at large width (262k calibration tokens for factors up to
+17408²; the paper's diagonal needs far fewer samples, which would erase exactly our advantage); (2) the measured ×
+ramp allocator loses what the hand table's per-type weights bought (4B: hand table 13.55 vs measured × ramp 13.80;
+at 8B/14B the allocator saturates 54/72 and 61/80 k/v layers at the rank cap).
+
+Code (branch = `spectral-projection-screen` 597de00 + merge of `multi-gpu-admm-probe` 11292af):
+- `num_stats_samples` (0 = `num_calib_samples`): the curvature statistics **and the periodic refreshes** are
+  collected on a separate pool of that many distinct sequences (`get_calib_loader(..., replace=False)`); block
+  reconstruction and KD keep the legacy 128-sample loader byte-for-byte (their cost is linear in samples × epochs
+  and their activations live on the GPU: 512 everywhere would be 4× block time and 20-30 GiB of GPU activations at
+  14B, while the statistics loop streams token ids only). Enters the stats key only when set, so legacy
+  statistics keep their keys.
+- `rank_type_weights` (`"q_proj:0.85,...,down_proj:1.15"`): the 26d8fd4 hand table restored as a multiplicative
+  prior on the measured curves (`level += log(ramp × type)` in `allocate_ranks_measured`); unknown types raise. In
+  `BLOCK_FIELDS`, not in `PROBE_FIELDS` (the probe artifact is reusable).
+- Tests: `tests/test_stats_samples.py`, `tests/test_rank_alloc.py` (parser, tilt between types, composition with
+  the ramp, cache keys).
+
+Arms (each = the size's best config + `admm_parallel_sides` + `parallel_devices: 4`; GPU factor budget 80 on h200,
+48 on 80 GB cards; scripts in `scripts/scale_sweep/`):
+
+| arm | `num_stats_samples` | `rank_type_weights` | hardware (lgpus) | reuses |
+|---|---|---|---|---|
+| `qwen3_8b_best_stats512` | 512 | – | 4 × a100 | – |
+| `qwen3_8b_best_typeprior` | – | 4B table | 4 × h100 | 8B stats + probe |
+| `qwen3_8b_best_stats512_typeprior` | 512 | 4B table | 4 × a100 | – |
+| `qwen3_14b_best_stats512` | 512 | – | 4 × h200 | – |
+| `qwen3_14b_best_typeprior` | – | 4B table | 4 × h100 | 14B stats + probe |
+| `qwen3_14b_best_stats512_typeprior` | 512 | 4B table | 4 × h200 | – |
+
+Cache note: the multi-GPU merge changed `core/importance.py` and `core/rank_probe.py`, so the baseline statistics
+(7bed6335…, 59e272a5…) and probes (e116d3d9…, 731b3ad2…) were re-keyed; since those changes are documented as
+math-preserving, the artifacts were symlinked under the new keys (9741904819bd / b2cc74a47943 stats,
+5b40be19066a / 5bb370a62b12 probes) so the type-prior arms are a clean A/B against the baselines. Wall times are
+not comparable across card types; perplexities are. Read-out: PPL / bpw / zero-shot per arm against 12.38 / 0.474
+(8B) and 11.13 / 0.491 (14B); adopt whichever knob helps at both sizes.
