@@ -398,3 +398,84 @@ def test_factorize_structured_path_matches_dense_path():
     t = admm_nq.factorize_admm_nanoquant(W.mT, o_norm, i_norm, mid_rank=RANK, outer_iters=3, rho_scheduler="linear",
                                          is_transpose=True, i_cov=o_cov, o_cov=i_cov, spectrum=spec)
     assert t["W_final"].shape == W.mT.shape
+
+
+# --------------------------------------------------------------------------------------
+# Two-device ADMM: the A- and B-updates of one iteration are independent (Jacobi) and may run on separate devices
+# --------------------------------------------------------------------------------------
+def test_rank1_approx_accepts_start_vector():
+    W = torch.randn(12, 7)
+    torch.manual_seed(0)
+    ref = admm_nq.rank1_approx(W)
+    torch.manual_seed(0)
+    v = torch.randn(W.shape[1])
+    got = admm_nq.rank1_approx(W, v0=v)
+    assert torch.equal(ref, got)
+    # with a start vector the result does not depend on the global RNG
+    torch.manual_seed(123)
+    assert torch.equal(admm_nq.rank1_approx(W, v0=v), got)
+
+
+def _split_case(case):
+    torch.manual_seed(11)
+    W = torch.randn(24, 16)
+    i_norm = torch.rand(16) + 0.5
+    o_norm = torch.rand(24) + 0.5
+    kw = {}
+    if case in ("maha", "transpose", "mid_scale", "tempered"):
+        kw["i_cov"] = _scaled_cov(_spd(16, 0.3), i_norm)
+        kw["o_cov"] = _scaled_cov(_spd(24, 0.2), o_norm)
+    if case == "transpose":
+        W, i_norm, o_norm = W.mT.contiguous(), o_norm, i_norm
+        kw["i_cov"], kw["o_cov"] = kw["o_cov"], kw["i_cov"]
+        kw["is_transpose"] = True
+    if case == "mid_scale":
+        kw["mid_scale"] = True
+    if case == "tempered":
+        kw["spectrum"] = SpectrumSpec(power=0.5)
+    return W, i_norm, o_norm, kw
+
+
+@pytest.mark.parametrize("case", ["euclid", "maha", "transpose", "mid_scale", "tempered"])
+def test_split_sides_match_serial(case):
+    """Running the B side on ``side_device`` reproduces the serial result bit for bit (same op order per side, same
+    RNG consumption)."""
+    W, i_norm, o_norm, kw = _split_case(case)
+    ref = _run(W, i_norm, o_norm, seed=5, **kw)
+    got = _run(W, i_norm, o_norm, seed=5, side_device="cpu", **kw)
+    assert set(ref) == set(got)
+    for k in ref:
+        assert torch.equal(ref[k], got[k]), k
+        assert got[k].device == ref[k].device
+
+
+def test_split_sides_with_print_steps_runs(capsys):
+    W, i_norm, o_norm, kw = _split_case("maha")
+    torch.manual_seed(5)
+    out = admm_nq.factorize_admm_nanoquant(W, i_norm, o_norm, mid_rank=RANK, outer_iters=30, print_admm_steps=True,
+                                           rho_scheduler="linear", side_device="cpu", **kw)
+    assert out["W_final"].shape == W.shape
+    assert "[ADMM Step" in capsys.readouterr().out
+
+
+def test_generator_reproduces_set_seed_stream():
+    """A fresh ``torch.Generator`` seeded like the global RNG yields the same factorisation as ``manual_seed``."""
+    W, i_norm, o_norm, kw = _split_case("maha")
+    ref = _run(W, i_norm, o_norm, seed=3, **kw)
+    torch.manual_seed(999)  # the generator path must ignore the global state
+    got = admm_nq.factorize_admm_nanoquant(W, i_norm, o_norm, mid_rank=RANK, outer_iters=30, print_admm_steps=False,
+                                           rho_scheduler="linear", generator=torch.Generator().manual_seed(3), **kw)
+    for k in ref:
+        assert torch.equal(ref[k], got[k]), k
+
+
+def test_curvature_factor_to_device_copies_everything():
+    lam = torch.linspace(1.0, 4.0, 6)
+    Q, _ = torch.linalg.qr(torch.randn(6, 6))
+    Sigma = (Q * lam) @ Q.mT
+    f = admm_nq.CurvatureFactor(Sigma, lam, Q, SpectrumSpec(spike_rank=1, dip_rank=1, flat_mean="gm"))
+    g = f.to("cpu")
+    assert g is not f and g.structured == f.structured
+    X = torch.randn(6, 3)
+    assert torch.equal(f.left(X), g.left(X)) and torch.equal(f.right(X.mT), g.right(X.mT))
+    assert torch.equal(f.lam, g.lam) and f.lam.data_ptr() != g.lam.data_ptr()

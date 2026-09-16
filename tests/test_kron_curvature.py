@@ -281,3 +281,49 @@ def test_register_stats_attaches_dense_non_persistent_buffers():
 def test_collect_stats_rejects_unknown_curvature():
     with pytest.raises(ValueError):
         imp.collect_stats(_TinyMLP(), [], "cpu", curvature="banana")
+
+
+@pytest.mark.parametrize("strategy", ["online", "dbf"])
+def test_sharded_group_accumulation_matches_serial(monkeypatch, strategy):
+    """Layer groups accumulated concurrently on separate devices (model replicas) equal the serial grouped pass."""
+    torch.manual_seed(6)
+    dataloader = [torch.randn(2, 7, 6) for _ in range(3)]
+    calls = {"n": 0, "models": set()}
+
+    def counting_loop(dataloader_, model_, dev_, *a, **k):
+        calls["n"] += 1
+        calls["models"].add(id(model_))
+        _fake_loop(dataloader_, model_, dev_, *a, **k)
+
+    monkeypatch.setattr(imp, "_run_calibration_loop", counting_loop)
+
+    torch.manual_seed(7)
+    model_a = _TinyMLP()
+    ref = imp.collect_stats(model_a, dataloader, "cpu", strategy=strategy, curvature="kron", nkp_iters=2,
+                            gpu_budget_gb=500e-9)
+    assert calls["n"] == 4 and calls["models"] == {id(model_a)}
+    calls["n"], calls["models"] = 0, set()
+    torch.manual_seed(7)
+    model_b = _TinyMLP()
+    weights_before = [p.detach().clone() for p in model_b.parameters()]
+    got = imp.collect_stats(model_b, dataloader, "cpu", strategy=strategy, curvature="kron", nkp_iters=2,
+                            gpu_budget_gb=500e-9, devices=["cpu", "cpu"])
+    # one loop per group per pass; the groups of a pass run on distinct model replicas (the first device keeps the
+    # model itself)
+    assert calls["n"] == 4 and len(calls["models"]) == 2
+    for key in ("i_cov", "o_cov", "i_norm", "o_norm"):
+        assert set(got[key]) == set(ref[key])
+        for name in ref[key]:
+            assert torch.allclose(got[key][name], ref[key][name], atol=1e-6, rtol=1e-6), (key, name)
+    for p, before in zip(model_b.parameters(), weights_before):
+        assert torch.equal(p, before)
+
+
+def test_sharded_accumulation_without_groups_falls_back_to_serial(monkeypatch):
+    torch.manual_seed(6)
+    dataloader = [torch.randn(2, 7, 6) for _ in range(2)]
+    seen = []
+    monkeypatch.setattr(imp, "_run_calibration_loop", lambda d, m, dev, *a, **k: (seen.append(id(m)), _fake_loop(d, m, dev, *a, **k)))
+    model = _TinyMLP()
+    imp.collect_stats(model, dataloader, "cpu", strategy="dbf", curvature="kron", nkp_iters=1, devices=["cpu", "cpu"])
+    assert seen == [id(model)]  # a single group (no GPU budget) runs on the model itself

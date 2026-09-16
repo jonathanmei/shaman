@@ -14,7 +14,7 @@ import torch.nn as nn
 from ..modules.linear import NanoQuantLinear
 from ..optimi import AdamW
 from ..utils.cache import ArtifactCache, admm_key
-from ..utils.utils import cleanup_memory, find_layers, predicted_loss, set_seed
+from ..utils.utils import admm_side_device, cleanup_memory, find_layers, predicted_loss, set_seed
 from .admm_dbf import factorize_admm_dbf
 from .admm_nq import EigCache, factorize_admm_nanoquant
 from .curvature import SpectrumSpec
@@ -632,7 +632,8 @@ def factorize_and_replace(layer, name, rank, quant_config, cache: ArtifactCache 
                 i_cov=None if i_cov is None else i_cov.to(device),
                 o_cov=None if o_cov is None else o_cov.to(device),
                 eigh_dtype=eigh_dtype, mid_scale=bool(quant_config.get('admm_mid_scale', False)),
-                spectrum=spectrum, eig_cache=eig_cache, diagnostics=spectrum_diag)
+                spectrum=spectrum, eig_cache=eig_cache, diagnostics=spectrum_diag,
+                side_device=admm_side_device(quant_config, device))
         else:
             raise ValueError(f"Unknown admm_type: {quant_config['admm_type']}")
         if memo_key is not None:

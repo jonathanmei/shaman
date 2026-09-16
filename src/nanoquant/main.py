@@ -111,6 +111,14 @@ class QuantArguments:
         default=0.0,
         metadata={"help": ">0: accumulate the dense Kronecker factors on the GPU for groups of layers fitting this "
                           "budget, one calibration pass per group (0 = stream every contribution to kron_stats_device)"})
+    parallel_devices: int = field(
+        default=0,
+        metadata={"help": "GPUs for the layer-sharded stages (rank probe, calibration layer groups): 0 = every "
+                          "visible device, 1 = serial"})
+    admm_parallel_sides: bool = field(
+        default=False,
+        metadata={"help": "Run the B half of every ADMM iteration on a second GPU (same result as the serial "
+                          "path; ignored with fewer than 2 visible GPUs)"})
     cache_dir: str = field(
         default="cache",
         metadata={"help": "Stage-level artifact cache / resume directory ('' disables)"},
@@ -298,6 +306,8 @@ def main():
         kron_stats_device=quant_args.kron_stats_device,
         kron_eigh_dtype=quant_args.kron_eigh_dtype,
         kron_gpu_budget_gb=quant_args.kron_gpu_budget_gb,
+        parallel_devices=quant_args.parallel_devices,
+        admm_parallel_sides=quant_args.admm_parallel_sides,
         seqlen=model_args.seqlen,
         device_map=model_args.device_map,
         cache_dir=quant_args.cache_dir,

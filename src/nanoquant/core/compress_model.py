@@ -34,6 +34,7 @@ from ..utils.utils import (
     get_decoder_layers,
     get_layers_to_factorize,
     set_seed,
+    stage_devices,
 )
 from .admm_nq import EigCache
 from .importance import (
@@ -103,7 +104,7 @@ def refresh_block_curvature(model, dataloader, dev: str, quant_config: dict) -> 
                             nkp_iters=int(quant_config.get('curvature_refresh_iters', 1) or 1),
                             stats_device=quant_config.get('kron_stats_device', 'cpu'),
                             gpu_budget_gb=float(quant_config.get('kron_gpu_budget_gb', 0.0) or 0.0),
-                            init_factors=init)
+                            init_factors=init, devices=stage_devices(quant_config, dev))
     register_stats(model, get_shrunk_stats(raw, shrinkage=quant_config['calib_shrinkage']))
     del raw, init
     # collect_stats leaves the model on the device in train mode with gradient checkpointing: undo that

@@ -89,3 +89,12 @@ settles.
   to three jobs.
 - The ADMM fast path (branch `admm-fast-sylvester`, inexact Sylvester solve) reproduced the 1.7B recipe losslessly
   (16.67 vs 16.72) and is the natural way to buy back the time the larger late ranks cost.
+- **Multi-GPU (branch `multi-gpu-admm-probe`).** Two exact-preserving knobs, both off by default and absent from
+  every cache key: `admm_parallel_sides` runs the B half of each ADMM iteration on a second GPU (the A- and
+  B-updates of one iteration are independent; only `A_z`/`B_z` cross over), which halves the ADMM share of the
+  block chain (60–85 % after the efficiency fixes) and of the rank probe; `parallel_devices` (0 = all visible GPUs)
+  shards the rank probe by layer and runs the calibration layer groups concurrently on model replicas. Submit with
+  `--gres gpu:a100:2` (sides) or `gpu:a100:4` (both); the A100 nodes are NVLink-connected (NV12), so the per-iteration
+  exchange is negligible. Results are bitwise those of the serial path on identical GPUs (CPU tests
+  `test_split_sides_match_serial`, `test_measure_sensitivity_sharded_matches_serial`,
+  `test_sharded_group_accumulation_matches_serial`).

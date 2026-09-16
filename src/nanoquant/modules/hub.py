@@ -65,6 +65,9 @@ class NanoQuantConfigDataclass:
     kron_eigh_dtype: str = "float64"
     # >0: accumulate the dense factors on the GPU for groups of layers fitting this budget (one pass per group)
     kron_gpu_budget_gb: float = 0.0
+    # GPUs for the layer-sharded stages (0 = all visible); B half of every ADMM iteration on a second GPU
+    parallel_devices: int = 0
+    admm_parallel_sides: bool = False
     seqlen: int = 2048
     device_map: str = "cpu"
     # stage-level artifact cache / resume ("" disables)

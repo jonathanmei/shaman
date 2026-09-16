@@ -11,6 +11,8 @@ base_dir = "~/code"  # remote parent dir; project checks out to base_dir/<repo>
 # Default: Qwen3-0.6B smoke test with Kronecker curvature + middle scale (fits the 30-min `short` partition).
 # Override per submission with `objob submit -- uv run nanoquant configs/<experiment>.json`.
 # Full 0.6B runs: `--partition gpus --time 04:00:00 --mem 128G` (online KD teacher; 200G with model_kd_teacher=ram).
+# Multi-GPU: `--gres gpu:a100:2` with `admm_parallel_sides: true` (two-device ADMM), `--gres gpu:a100:4` with
+# `parallel_devices: 4` as well (layer-sharded probe and calibration); see docs/learnings.md, operational notes.
 command = "uv run nanoquant configs/qwen3_0p6b_smoke_kron.json"
 partition = "short"   # short (30 min) | cpus / gpus / cgpus (4 h) | notebooks
 time = "00:30:00"     # walltime; must fit the partition limit

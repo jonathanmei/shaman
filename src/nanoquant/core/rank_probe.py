@@ -17,13 +17,17 @@ The probe never mutates the modules: the weights, statistics buffers and module 
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from torch import nn
 
 from ..utils.utils import (
     RANK_STEP,
+    admm_side_device,
     cleanup_memory,
     find_layers,
     fit_power_law,
@@ -31,7 +35,7 @@ from ..utils.utils import (
     has_mid_scale,
     parse_probe_ranks,
     rank_ceiling,
-    set_seed,
+    stage_devices,
     uniform_rank,
 )
 from .admm_nq import EigCache, factorize_admm_nanoquant
@@ -112,8 +116,11 @@ def _sqrt_factor(F: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def probe_layer(lx: nn.Linear, ranks: list[int], quant_config: dict, dev: str) -> dict[int, float]:
+def probe_layer(lx: nn.Linear, ranks: list[int], quant_config: dict, dev: str,
+                side_device: str | None = None) -> dict[int, float]:
     """Curvature-weighted weight error of ``lx`` at each candidate rank.
+
+    Thread-safe: the global RNG is neither read nor reset (a private generator seeded with ``seed`` is used).
 
     Parameters
     ----------
@@ -125,6 +132,8 @@ def probe_layer(lx: nn.Linear, ranks: list[int], quant_config: dict, dev: str) -
         Quantisation configuration (ADMM settings, ``rank_sensitivity``, ``rank_probe_iters``, ``seed``).
     dev : str
         Compute device.
+    side_device : str, optional
+        Second device for the B half of the ADMM iterations (see :func:`factorize_admm_nanoquant`).
 
     Returns
     -------
@@ -163,7 +172,9 @@ def probe_layer(lx: nn.Linear, ranks: list[int], quant_config: dict, dev: str) -
         eig_cache.register(i_cov)
         eig_cache.register(o_cov)
     for r in ranks:
-        set_seed(quant_config["seed"])
+        # a private generator seeded like ``set_seed`` gives the same draws without touching the global RNG, so
+        # several layers may be probed concurrently
+        generator = torch.Generator(device=W.device).manual_seed(int(quant_config["seed"]))
         res = factorize_admm_nanoquant(
             W, i_norm, o_norm, mid_rank=r,
             outer_iters=int(quant_config.get("rank_probe_iters", 50) or 50),
@@ -171,7 +182,8 @@ def probe_layer(lx: nn.Linear, ranks: list[int], quant_config: dict, dev: str) -
             is_transpose=is_transpose, rho_scheduler=quant_config.get("admm_penalty_scheduler", "linear"),
             print_admm_steps=False, i_cov=i_cov, o_cov=o_cov, eigh_dtype=PROBE_EIGH_DTYPE,
             mid_scale=has_mid_scale(quant_config),
-            spectrum=SpectrumSpec.from_config(quant_config), eig_cache=eig_cache)
+            spectrum=SpectrumSpec.from_config(quant_config), eig_cache=eig_cache,
+            side_device=side_device, generator=generator)
         W_hat = deployed_matrix(res)
         out[r] = max(mahalanobis_weight_error(W, W_hat, L, R), 1e-30)
         del res, W_hat
@@ -183,6 +195,9 @@ def probe_layer(lx: nn.Linear, ranks: list[int], quant_config: dict, dev: str) -
 @torch.no_grad()
 def measure_sensitivity(model, layers_to_factorize, quant_config: dict, dev: str = "cuda") -> dict:
     """Probe every layer to be factorised and fit its sensitivity curve.
+
+    With ``parallel_devices`` (see :func:`nanoquant.utils.utils.stage_devices`) the layers are spread over several
+    devices by worker threads; the artifact is the same whatever the sharding.
 
     Parameters
     ----------
@@ -206,30 +221,69 @@ def measure_sensitivity(model, layers_to_factorize, quant_config: dict, dev: str
     multipliers = parse_probe_ranks(quant_config.get("rank_probe_ranks", "0.5,1.0,1.5") or "0.5,1.0,1.5")
     num_scales = 3 if has_mid_scale(quant_config) else 2
     bits = quant_config["bits"]
+    devices = stage_devices(quant_config, dev)
+    # the two-device ADMM only when the layers are not already spread over the devices
+    side = admm_side_device(quant_config, dev) if len(devices) == 1 else None
     probes: dict[str, dict[int, float]] = {}
     curves: dict[str, tuple[float, float]] = {}
     t0 = time.time()
-    blocks = get_decoder_layers(model)
-    for i, block in enumerate(blocks):
+    # every layer to probe, in block / layer order: (block, key, module, candidate ranks)
+    by_block: dict[int, list[tuple[str, nn.Linear, list[int]]]] = {}
+    for i, block in enumerate(get_decoder_layers(model)):
         subset = find_layers(block)
-        t_blk = time.time()
-        n = 0
         for name in layers_to_factorize:
             if name not in subset:
                 continue
             lx = subset[name]
             a, b = lx.in_features, lx.out_features
             ranks = candidate_ranks(uniform_rank(a, b, bits, num_scales), a, b, multipliers)
-            key = f"{i}.{name}"
-            probes[key] = probe_layer(lx, ranks, quant_config, dev)
-            curves[key] = fit_power_law(probes[key])
-            n += 1
-        betas = " ".join(f"{curves[f'{i}.{nm}'][1]:.2f}" for nm in layers_to_factorize if nm in subset)
-        print(f"\t[rank probe] block {i}: {n} layers in {time.time() - t_blk:.0f}s; beta {betas}")
+            by_block.setdefault(i, []).append((f"{i}.{name}", lx, ranks))
+
+    def summary(i: int, keys: list[str], seconds: float | None = None) -> None:
+        betas = " ".join(f"{curves[k][1]:.2f}" for k in keys)
+        took = f" in {seconds:.0f}s" if seconds is not None else ""
+        print(f"\t[rank probe] block {i}: {len(keys)} layers{took}; beta {betas}")
+
+    if len(devices) == 1:
+        for i, items in by_block.items():
+            t_blk = time.time()
+            for key, lx, ranks in items:
+                probes[key] = probe_layer(lx, ranks, quant_config, devices[0], side_device=side)
+                curves[key] = fit_power_law(probes[key])
+            summary(i, [key for key, _, _ in items], time.time() - t_blk)
+            cleanup_memory()
+    else:
+        # layers are independent: worker threads (one per device) pull from a shared queue, which balances the
+        # 3-4x wider MLP layers against the attention ones; the result does not depend on the sharding
+        todo: queue.SimpleQueue = queue.SimpleQueue()
+        for items in by_block.values():
+            for task in items:
+                todo.put(task)
+        results: dict[str, dict[int, float]] = {}
+        lock = threading.Lock()
+
+        def worker(device: str) -> None:
+            while True:
+                try:
+                    key, lx, ranks = todo.get_nowait()
+                except queue.Empty:
+                    return
+                out = probe_layer(lx, ranks, quant_config, device)
+                with lock:
+                    results[key] = out
+
+        with ThreadPoolExecutor(max_workers=len(devices)) as pool:
+            for future in [pool.submit(worker, d) for d in devices]:
+                future.result()
+        for i, items in by_block.items():
+            for key, _, _ in items:
+                probes[key] = results[key]
+                curves[key] = fit_power_law(probes[key])
+            summary(i, [key for key, _, _ in items])
         cleanup_memory()
     meta = {"method": method, "multipliers": multipliers,
             "iters": int(quant_config.get("rank_probe_iters", 50) or 50), "n_layers": len(probes),
-            "seconds": time.time() - t0}
+            "seconds": time.time() - t0, "devices": len(devices)}
     print(f"[rank probe] {meta['n_layers']} layers probed with '{method}' at multiples {multipliers} of the "
-          f"uniform rank in {meta['seconds']:.0f}s")
+          f"uniform rank in {meta['seconds']:.0f}s on {len(devices)} device(s)")
     return {"probes": probes, "curves": curves, "meta": meta}

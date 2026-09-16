@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import copy
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import torch
@@ -409,8 +411,12 @@ def _kron_backward_hook(module, grad_input, grad_output, layer_name, run_states,
 def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Linear], strategy: str, nkp_iters: int,
                         stats_device: str, use_truefisher: bool, model_offload: bool,
                         gpu_budget_gb: float = 0.0,
-                        init_factors: dict | None = None, fit: str = "frobenius") -> dict:
+                        init_factors: dict | None = None, fit: str = "frobenius",
+                        devices: list[str] | None = None) -> dict:
     """Multi-pass streaming Kronecker fit of the per-token empirical Fisher.
+
+    ``devices`` (several, with a positive ``gpu_budget_gb`` and more than one layer group) runs the groups of every
+    pass concurrently on model replicas, one per device; see the sharding note in the body.
 
     ``fit="frobenius"`` is the nearest Kronecker product (ALS token weights ``x^T R x`` / ``delta^T L delta``);
     ``fit="kl"`` is the KL-Shampoo / matrix-normal MLE fixed point, whose ALS weights are the *inverse* factors
@@ -453,6 +459,62 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
         groups = [list(linear_layers)]
         acc_device = stats_device
 
+    # Layer sharding: with several devices and several groups, the groups of one pass run concurrently, one per
+    # device, each on its own model replica (the first device keeps the model itself). Groups are disjoint and the
+    # previous-pass factors are fixed within a pass, so the factors equal the serial grouped computation.
+    devices = [str(dev)] if not devices else [str(d) for d in devices]
+    shard = len(devices) > 1 and len(groups) > 1 and gpu_budget_gb > 0
+    replicas: list = [model]
+    if shard:
+        for d in devices[1:]:
+            replicas.append(copy.deepcopy(model).to(d))
+
+    def run_group(it: int, g: int, names: list[str], model_g, dev_g: str, acc_dev: str, new: dict, sq_sums) -> None:
+        """One calibration pass over ``dataloader`` accumulating the factors of ``names`` on ``model_g``."""
+        modules = linear_layers if model_g is model else dict(model_g.named_modules())
+        group_bytes = sum(_factor_bytes(linear_layers[n]) for n in names)
+        print(f">>> Kronecker curvature: NKP pass {it + 1}/{nkp_iters}, layer group {g + 1}/{len(groups)} "
+              f"({len(names)} layers, {group_bytes / 2**30:.1f} GiB on {acc_dev})")
+        acc = {
+            "i_cov": {
+                n: torch.zeros(linear_layers[n].in_features, linear_layers[n].in_features, dtype=torch.float32,
+                               device=acc_dev)
+                for n in names
+            },
+            "o_cov": {
+                n: torch.zeros(linear_layers[n].out_features, linear_layers[n].out_features,
+                               dtype=torch.float32, device=acc_dev)
+                for n in names
+            },
+        }
+        # ALS weights of this pass for this group: the previous factors (Frobenius fit) or their damped
+        # inverses (KL fit), computed on the accumulation device; stored in bf16 there when it is a GPU (the
+        # memory-bound case; the CPU path keeps fp32 so that it reproduces the single-pass fit exactly)
+        weights_dtype = PREV_WEIGHTS_DTYPE if torch.device(acc_dev).type == "cuda" else None
+        prev_group = _als_weights({key: {n: prev[key][n] for n in names if n in prev[key]}
+                                   for key in ("i_cov", "o_cov")}, fit, device=acc_dev, dtype=weights_dtype)
+        run_states = defaultdict(dict)
+        handles = []
+        for n in names:
+            m = modules[n]
+            handles.append(
+                m.register_forward_hook(
+                    partial(_kron_forward_hook, layer_name=n, run_states=run_states, clip_state=clip_state,
+                            acc=acc)))
+            handles.append(
+                m.register_full_backward_hook(
+                    partial(_kron_backward_hook, layer_name=n, run_states=run_states, clip_state=clip_state,
+                            acc=acc, prev=prev_group, sq_sums=sq_sums)))
+
+        _run_calibration_loop(dataloader, model_g, dev_g, model_offload, use_truefisher)
+
+        for h in handles:
+            h.remove()
+        for key in ("i_cov", "o_cov"):
+            for n in names:
+                new[key][n] = _frobenius_normalize(acc[key][n]).to(stats_device)
+        del acc, prev_group
+
     prev = {"i_cov": {}, "o_cov": {}}
     if init_factors is not None:
         prev = {key: {n: _frobenius_normalize(M.float()) for n, M in init_factors.get(key, {}).items()}
@@ -461,57 +523,31 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
     for it in range(nkp_iters):
         sq_sums = defaultdict(lambda: {"i": 0.0, "o": 0.0, "n": 0})
         new = {"i_cov": {}, "o_cov": {}}
-        for g, names in enumerate(groups):
-            group_bytes = sum(_factor_bytes(linear_layers[n]) for n in names)
-            print(f">>> Kronecker curvature: NKP pass {it + 1}/{nkp_iters}, layer group {g + 1}/{len(groups)} "
-                  f"({len(names)} layers, {group_bytes / 2**30:.1f} GiB on {acc_device})")
-            acc = {
-                "i_cov": {
-                    n: torch.zeros(linear_layers[n].in_features, linear_layers[n].in_features, dtype=torch.float32,
-                                   device=acc_device)
-                    for n in names
-                },
-                "o_cov": {
-                    n: torch.zeros(linear_layers[n].out_features, linear_layers[n].out_features,
-                                   dtype=torch.float32, device=acc_device)
-                    for n in names
-                },
-            }
-            # ALS weights of this pass for this group: the previous factors (Frobenius fit) or their damped
-            # inverses (KL fit), computed on the accumulation device; stored in bf16 there when it is a GPU (the
-            # memory-bound case; the CPU path keeps fp32 so that it reproduces the single-pass fit exactly)
-            weights_dtype = PREV_WEIGHTS_DTYPE if torch.device(acc_device).type == "cuda" else None
-            prev_group = _als_weights({key: {n: prev[key][n] for n in names if n in prev[key]}
-                                       for key in ("i_cov", "o_cov")}, fit, device=acc_device, dtype=weights_dtype)
-            run_states = defaultdict(dict)
-            handles = []
-            for n in names:
-                m = linear_layers[n]
-                handles.append(
-                    m.register_forward_hook(
-                        partial(_kron_forward_hook, layer_name=n, run_states=run_states, clip_state=clip_state,
-                                acc=acc)))
-                handles.append(
-                    m.register_full_backward_hook(
-                        partial(_kron_backward_hook, layer_name=n, run_states=run_states, clip_state=clip_state,
-                                acc=acc, prev=prev_group, sq_sums=sq_sums)))
-
-            _run_calibration_loop(dataloader, model, dev, model_offload, use_truefisher)
-
-            for h in handles:
-                h.remove()
-            for key in ("i_cov", "o_cov"):
-                for n in names:
-                    new[key][n] = _frobenius_normalize(acc[key][n]).to(stats_device)
-            del acc, prev_group
-            if torch.cuda.is_available():
-                cleanup_memory()
+        if not shard:
+            for g, names in enumerate(groups):
+                run_group(it, g, names, model, dev, acc_device, new, sq_sums)
+                if torch.cuda.is_available():
+                    cleanup_memory()
+        else:
+            for start in range(0, len(groups), len(devices)):
+                wave = list(enumerate(groups))[start:start + len(devices)]
+                with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+                    futures = [pool.submit(run_group, it, g, names, replicas[j], devices[j], devices[j], new, sq_sums)
+                               for j, (g, names) in enumerate(wave)]
+                    for f in futures:
+                        f.result()
+                if torch.cuda.is_available():
+                    cleanup_memory()
 
         if clip_state is not None:
             for states in clip_state.values():
                 states["i"]["frozen"] = True
                 states["o"]["frozen"] = True
         prev = new
+    if shard:
+        del replicas
+        if torch.cuda.is_available():
+            cleanup_memory()
 
     # Put the final (unit-norm) factors on the legacy scale: mean diag(R) = E_t[x^2], mean diag(L) = E_t[delta^2]
     for n in linear_layers:
@@ -710,7 +746,7 @@ def register_stats(model, stats: dict):
 # -----------------------------------------------------------------------------
 def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=False, vram_limit_gb=50, save_plots=False,
                   strategy='online', curvature='diag', nkp_iters=3, stats_device=None, gpu_budget_gb=0.0,
-                  init_factors=None, fit='frobenius'):
+                  init_factors=None, fit='frobenius', devices=None):
     """
     Main entry point for NanoQuant calibration statistics collection.
     Collects raw calibration statistics without applying shrinkage.
@@ -736,6 +772,9 @@ def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=Fa
         For ``curvature="kron"``: previous factors that warm-start the ALS (see ``_collect_kron_stats``).
     fit : {"frobenius", "kl"}
         For ``curvature="kron"``: nearest-Kronecker-product or KL-Shampoo (matrix-normal MLE) fit.
+    devices : list of str, optional
+        For ``curvature="kron"`` with ``gpu_budget_gb > 0``: run the layer groups of every pass concurrently on
+        these devices (model replicas); ``None`` = ``[dev]``. The factors do not depend on the sharding.
     """
     if curvature not in CURVATURE_TYPES:
         raise ValueError(f"Unknown curvature '{curvature}'. Choose from {CURVATURE_TYPES}.")
@@ -776,7 +815,7 @@ def collect_stats(model, dataloader, dev, use_truefisher=False, model_offload=Fa
             raise ValueError(f"Unknown strategy: {strategy}")
         factors = _collect_kron_stats(model, dataloader, dev, linear_layers, strategy, nkp_iters, stats_device,
                                       use_truefisher, model_offload, gpu_budget_gb=gpu_budget_gb,
-                                      init_factors=init_factors, fit=fit)
+                                      init_factors=init_factors, fit=fit, devices=devices)
         raw_stats = {
             'i_norm': {n: factors['i_cov'][n].diagonal().clone() for n in linear_layers},
             'o_norm': {n: factors['o_cov'][n].diagonal().clone() for n in linear_layers},

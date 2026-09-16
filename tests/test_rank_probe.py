@@ -337,3 +337,76 @@ def test_config_plumbing_and_cache_keys():
                 {"rank_sensitivity": "admm", "rank_budget": "parity", "rank_probe_iters": 0}):
         with pytest.raises(ValueError):
             pipeline.validate_config(over(**bad))
+
+
+# --------------------------------------------------------------------------------------
+# layer-sharded probe across devices
+# --------------------------------------------------------------------------------------
+def _probe_cfg(**over):
+    return _cfg(rank_budget="parity", rank_sensitivity="admm", rank_probe_ranks="0.5,1.0,1.5", rank_probe_iters=10,
+                admm_outer_iters=400, admm_inner_iters=5, admm_reg=3e-2, admm_penalty_scheduler="linear",
+                admm_print_steps=False, curvature="kron", kron_eigh_dtype="float64", admm_curvature_power=1.0,
+                **over)
+
+
+def test_measure_sensitivity_sharded_matches_serial(monkeypatch, capsys):
+    torch.manual_seed(0)
+    model = _model(2, TINY)
+    _attach_stats(model, dense=True)
+    cfg = _probe_cfg()
+    ref = rank_probe.measure_sensitivity(model, NAMES, cfg, dev="cpu")
+    assert ref["meta"]["devices"] == 1
+    monkeypatch.setattr(rank_probe, "stage_devices", lambda quant_config, dev: ["cpu", "cpu"])
+    got = rank_probe.measure_sensitivity(model, NAMES, cfg, dev="cpu")
+    assert got["meta"]["devices"] == 2
+    assert list(got["probes"]) == list(ref["probes"])  # original key order is kept
+    assert got["probes"] == ref["probes"]
+    assert got["curves"] == ref["curves"]
+    out = capsys.readouterr().out
+    assert "[rank probe] block 0:" in out and "[rank probe] block 1:" in out
+
+
+def test_probe_layer_does_not_touch_global_rng():
+    torch.manual_seed(0)
+    model = _model(1, TINY)
+    _attach_stats(model, dense=True)
+    lx = U.find_layers(model.model.layers[0])["self_attn.q_proj"]
+    cfg = _probe_cfg()
+    torch.manual_seed(1)
+    expected = torch.rand(3)
+    torch.manual_seed(1)
+    a = rank_probe.probe_layer(lx, [32, 64], cfg, dev="cpu")
+    assert torch.equal(torch.rand(3), expected)
+    # and it is deterministic on its own
+    torch.manual_seed(77)
+    assert rank_probe.probe_layer(lx, [32, 64], cfg, dev="cpu") == a
+
+
+def test_stage_devices(monkeypatch):
+    assert U.stage_devices({"parallel_devices": 0}, "cpu") == ["cpu"]
+    assert U.stage_devices({}, "cpu") == ["cpu"]
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    assert U.stage_devices({"parallel_devices": 0}, "cuda") == ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
+    assert U.stage_devices({"parallel_devices": 2}, "cuda") == ["cuda:0", "cuda:1"]
+    assert U.stage_devices({"parallel_devices": 1}, "cuda") == ["cuda"]
+    assert U.stage_devices({"parallel_devices": 8}, "cuda") == ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    assert U.stage_devices({"parallel_devices": 0}, "cuda") == ["cuda"]
+
+
+def test_admm_side_device(monkeypatch):
+    assert U.admm_side_device({"admm_parallel_sides": True}, "cpu") is None
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    assert U.admm_side_device({"admm_parallel_sides": False}, "cuda") is None
+    assert U.admm_side_device({"admm_parallel_sides": True}, "cuda") == "cuda:1"
+    assert U.admm_side_device({"admm_parallel_sides": True}, "cuda:1") == "cuda:0"
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    assert U.admm_side_device({"admm_parallel_sides": True}, "cuda") is None
+
+
+def test_new_knobs_are_not_cache_fields():
+    base = NanoQuantConfig(model_id="tiny/model", num_calib_samples=4, seqlen=16)
+    on = dict(base)
+    on.update(admm_parallel_sides=True, parallel_devices=4)
+    assert C.chain_keys(base, 2) == C.chain_keys(on, 2)
+    assert C.probe_key(base) == C.probe_key(on) and C.stats_key(base) == C.stats_key(on)
