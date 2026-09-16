@@ -46,5 +46,6 @@
   "model_kd_epochs": 8,
   "model_kd_teacher": "online",
   "ppl_task": "wikitext2",
-  "zeroshot_task": "boolq,piqa,hellaswag,winogrande,arc_easy,arc_challenge"
+  "zeroshot_task": "boolq,piqa,hellaswag,winogrande,arc_easy,arc_challenge",
+  "batch_size": "16"
 }
