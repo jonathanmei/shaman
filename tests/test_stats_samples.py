@@ -81,3 +81,24 @@ def test_stats_key_tracks_num_stats_samples_only_when_set():
     assert C.stats_key(base) != C.stats_key(_cfg(num_stats_samples=16))
     assert C.chain_keys(base, 2)[0] != C.chain_keys(_cfg(num_stats_samples=16), 2)[0]
     assert C.probe_key(base) != C.probe_key(_cfg(num_stats_samples=16))
+
+
+def test_cache_accepts_a_symlink_alias_but_not_a_mismatched_copy(tmp_path):
+    """A re-keyed artifact may be reused through ``<new>.pt -> <old>.pt``; a copied file with the wrong key raises."""
+    import shutil
+
+    import pytest
+
+    cache = C.ArtifactCache(str(tmp_path))
+    old, new, other = "a" * 64, "b" * 64, "c" * 64
+    cache.save("stats", old, {"x": torch.ones(2)})
+    (tmp_path / "stats" / f"{new}.pt").symlink_to(f"{old}.pt")
+    assert torch.equal(cache.load("stats", new)["x"], torch.ones(2))
+    shutil.copy(tmp_path / "stats" / f"{old}.pt", tmp_path / "stats" / f"{other}.pt")
+    with pytest.raises(ValueError):
+        cache.load("stats", other)
+    # an alias must point at the artifact whose key it carries
+    (tmp_path / "rank_probe").mkdir()
+    (tmp_path / "rank_probe" / f"{new}.pt").symlink_to(tmp_path / "stats" / f"{old}.pt")
+    with pytest.raises(ValueError):
+        cache.load("rank_probe", new)

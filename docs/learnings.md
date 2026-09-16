@@ -107,4 +107,5 @@ settles.
 - **Source fingerprints re-key artifacts even for math-preserving edits.** The multi-GPU merge touched
   `core/importance.py` and `core/rank_probe.py`, so the 8B/14B statistics (87 / 184 GB) and probes changed keys;
   they were symlinked under the new keys in `cache/stats` and `cache/rank_probe` (2026-09-16) rather than
-  recomputed. Check `[cache] hit stats` in the first log lines of any run that is supposed to reuse them.
+  recomputed; `ArtifactCache.load` accepts such a symlink alias (the payload carries the old key) and logs
+  `[cache] alias`. Check `[cache] hit`/`alias stats` in the first log lines of any run that is supposed to reuse them.

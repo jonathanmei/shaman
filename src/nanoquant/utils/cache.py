@@ -242,13 +242,23 @@ class ArtifactCache:
         return p
 
     def load(self, kind: str, key: str, map_location: str = "cpu") -> Any | None:
-        """Return the stored object or ``None`` on a miss. A stored key mismatch raises ``ValueError``."""
+        """Return the stored object or ``None`` on a miss.
+
+        A stored key mismatch raises ``ValueError``, except for a deliberate alias: a symlink
+        ``<kind>/<key>.pt -> <old key>.pt`` whose target carries ``(kind, old key)`` is accepted, so an artifact
+        re-keyed by a math-preserving source change can be reused without rewriting hundreds of GB.
+        """
         if not self.exists(kind, key):
             return None
-        payload = torch.load(self.path(kind, key), map_location=map_location, weights_only=True)
-        if payload.get("kind") != kind or payload.get("key") != key:
-            raise ValueError(f"cache file {self.path(kind, key)} belongs to ({payload.get('kind')}, "
-                             f"{str(payload.get('key'))[:12]}...), expected ({kind}, {key[:12]}...)")
+        p = self.path(kind, key)
+        payload = torch.load(p, map_location=map_location, weights_only=True)
+        stored_kind, stored_key = payload.get("kind"), payload.get("key")
+        if stored_kind == kind and stored_key != key and p.is_symlink() and p.resolve().stem == stored_key:
+            print(f"[cache] alias {kind} {key[:12]} -> {str(stored_key)[:12]}")
+            return payload["obj"]
+        if stored_kind != kind or stored_key != key:
+            raise ValueError(f"cache file {p} belongs to ({stored_kind}, {str(stored_key)[:12]}...), "
+                             f"expected ({kind}, {key[:12]}...)")
         return payload["obj"]
 
     def load_or_compute(self, kind: str, key: str, fn: Callable[[], Any]) -> Any:
