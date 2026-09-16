@@ -25,6 +25,7 @@ from ..utils.utils import (
     get_layers_to_factorize,
     has_mid_scale,
     parse_probe_ranks,
+    stage_devices,
 )
 from .compress_block import TUNE_EPOCH_WEIGHT_MODES
 from .compress_model import compress_block_recon, compress_model_recon
@@ -192,7 +193,8 @@ def run_quantization_pipeline(model_id: str, quant_config: dict, dev: str = "cud
         # 1) calibration statistics (diagonal or Kronecker-factored curvature)
         raw_stats = cache.load_or_compute(
             "stats", stats_key(quant_config),
-            lambda: collect_stats(model, dataloader, dev, **collect_stats_kwargs(quant_config)))
+            lambda: collect_stats(model, dataloader, dev, devices=stage_devices(quant_config, dev),
+                                  **collect_stats_kwargs(quant_config)))
         shrunk_stats = get_shrunk_stats(raw_stats, shrinkage=quant_config['calib_shrinkage'])
         model = register_stats(model, shrunk_stats)
         del raw_stats, shrunk_stats

@@ -184,3 +184,31 @@ def test_cache_keys_track_new_fields():
         assert keys[0] != C.chain_keys(cfg(**{field: value}), 2)[0], field
     assert keys == C.chain_keys(cfg(pre_kd_checkpoint="x.pt", model_kd_eval_every_epoch=True), 2)
     assert C.kd_key(base, 2) != C.kd_key(cfg(pre_kd_checkpoint="x.pt"), 2)
+
+
+def test_refresh_block_curvature_sharded_matches_single(monkeypatch):
+    monkeypatch.setattr(imp, "_run_calibration_loop", _fake_loop)
+    dataloader = [torch.randn(1, 4, 6) for _ in range(2)]
+
+    def build():
+        torch.manual_seed(9)
+        model = _TinyModel()
+        for m in model.modules():
+            if isinstance(m, nn.Linear):
+                m.register_buffer("i_cov", torch.eye(m.in_features), persistent=False)
+                m.register_buffer("o_cov", torch.eye(m.out_features), persistent=False)
+                m.register_buffer("i_norm", torch.ones(m.in_features), persistent=False)
+                m.register_buffer("o_norm", torch.ones(m.out_features), persistent=False)
+        return model
+
+    cfg = NanoQuantConfig(model_id="t", curvature="kron", calib_strategy="dbf", calib_shrinkage=0.2,
+                          curvature_refresh_iters=1, kron_gpu_budget_gb=500e-9)
+    single = build()
+    assert compress_model.refresh_block_curvature(single, dataloader, "cpu", cfg) == 4
+    monkeypatch.setattr(compress_model, "stage_devices", lambda quant_config, dev: ["cpu", "cpu"])
+    sharded = build()
+    assert compress_model.refresh_block_curvature(sharded, dataloader, "cpu", cfg) == 4
+    for a, b in zip(single.modules(), sharded.modules()):
+        if isinstance(a, nn.Linear):
+            for key in ("i_cov", "o_cov", "i_norm", "o_norm"):
+                assert torch.allclose(getattr(a, key), getattr(b, key), atol=1e-6), key

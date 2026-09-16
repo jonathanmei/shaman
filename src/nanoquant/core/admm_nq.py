@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+from ..utils.utils import device_context
 from .curvature import IDENTITY_SPECTRUM, SpectrumSpec
 
 if torch.cuda.is_available():
@@ -23,12 +26,16 @@ SYLVESTER_EIGH_DTYPE = torch.float32
 
 
 @torch.no_grad()
-def power_iteration(A, num_iters=5):
+def power_iteration(A, num_iters=5, v0: torch.Tensor | None = None):
     """
     Power iteration for top singular triplet (u, sigma, v) of A.
+
+    ``v0`` is an optional start vector (``A.shape[1]``); by default one is drawn from the global RNG on ``A``'s
+    device. Passing it lets a caller draw the vector elsewhere (another device, a private generator) while
+    reproducing the default result exactly.
     """
     n = A.shape[1]
-    v = torch.randn(n, device=A.device, dtype=A.dtype)
+    v = torch.randn(n, device=A.device, dtype=A.dtype) if v0 is None else v0.to(A.device, A.dtype)
     v = v / torch.norm(v)
 
     At = A.mT  # view; reuse
@@ -46,32 +53,35 @@ def power_iteration(A, num_iters=5):
 
 
 @torch.no_grad()
-def svid(W, inner_iters=5, eps=1e-12):
+def svid(W, inner_iters=5, eps=1e-12, v0: torch.Tensor | None = None):
     """
     Sign-Value-Independent Decomposition (SVID).
-    Returns u, v, Sg where Sg is sign matrix of W.
+    Returns u, v, Sg where Sg is sign matrix of W. ``v0``: start vector of the power iteration (see
+    :func:`power_iteration`).
     """
     Sg = W.sign()
     Sg[Sg == 0] = 1
-    u, s, v = power_iteration(W.abs(), inner_iters)
+    u, s, v = power_iteration(W.abs(), inner_iters, v0=v0)
     u = u * s
     return u, v, Sg
 
 
 @torch.no_grad()
-def rank1_approx(W, inner_iters=5, eps=1e-12):
+def rank1_approx(W, inner_iters=5, eps=1e-12, v0: torch.Tensor | None = None):
     """
-    Rank-1 approximation using SVID results.
+    Rank-1 approximation using SVID results. ``v0``: start vector of the power iteration (see
+    :func:`power_iteration`).
     """
-    u, v, Sg = svid(W, inner_iters, eps)
+    u, v, Sg = svid(W, inner_iters, eps, v0=v0)
     apx = torch.outer(u, v)
     return apx * Sg
 
 
 @torch.no_grad()
-def _svid_nonneg(W: torch.Tensor, inner_iters: int, eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _svid_nonneg(W: torch.Tensor, inner_iters: int, eps: float,
+                 v0: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """SVID with the rank-1 scale vectors forced to be non-negative (their product is unchanged)."""
-    u, v, Sg = svid(W, inner_iters, eps)
+    u, v, Sg = svid(W, inner_iters, eps, v0=v0)
     if u.sum() < 0:
         u, v = -u, -v
     return u.abs(), v.abs(), Sg
@@ -259,6 +269,23 @@ class CurvatureFactor:
         """True when the fast path is active."""
         return self.U is not None
 
+    def to(self, device) -> CurvatureFactor:
+        """Copy of the factor with every tensor on ``device`` (the spectrum bookkeeping is shared).
+
+        Parameters
+        ----------
+        device : str or torch.device
+            Target device.
+
+        Returns
+        -------
+        CurvatureFactor
+        """
+        other = CurvatureFactor.__new__(CurvatureFactor)
+        for k, v in self.__dict__.items():
+            setattr(other, k, v.to(device, copy=True) if torch.is_tensor(v) else v)
+        return other
+
     def left(self, X: torch.Tensor) -> torch.Tensor:
         """``Sigma @ X``."""
         if self.U is None:
@@ -390,6 +417,8 @@ def factorize_admm_nanoquant(
     eig_cache: EigCache | None = None,
     diagnostics: dict | None = None,
     structured: bool = True,
+    side_device: str | torch.device | None = None,
+    generator: torch.Generator | None = None,
 ):
     """
     Decomposes the weight matrix W into two binary matrices A and B using ADMM.
@@ -431,13 +460,20 @@ def factorize_admm_nanoquant(
         structured: With a projected ``spectrum``, run the Mahalanobis X-updates through the low-rank-plus-identity
                form of the factors (:class:`CurvatureFactor`, ``O(n r k)`` per product instead of ``O(n^2 k)``);
                ``False`` forces the dense path (same result up to floating-point error).
+        side_device: Run the B half of every iteration (its X-, Z- and U-update) on this device in a second
+               thread while the A half runs on ``W``'s device; the two halves are independent within an
+               iteration and exchange only ``A_z``/``B_z`` at the boundary. ``None`` = serial on one device.
+               Same result as the serial path (bitwise on identical hardware).
+        generator: RNG for the random initialisation and the power-iteration start vectors (must live on
+               ``W``'s device); ``None`` = the global RNG. A fresh generator seeded like ``torch.manual_seed`` gives
+               the same result as the global path and does not touch the global state (thread-safe callers).
     """
     if is_transpose:
         results = factorize_admm_nanoquant(W.mT, o_norm, i_norm, mid_rank, outer_iters, inner_iters, reg, False, eps,
                                            rho_scheduler, print_admm_steps, i_cov=o_cov, o_cov=i_cov,
                                            eigh_dtype=eigh_dtype, mid_scale=mid_scale,
                                            spectrum=spectrum, eig_cache=eig_cache, diagnostics=diagnostics,
-                                           structured=structured)
+                                           structured=structured, side_device=side_device, generator=generator)
         if diagnostics is not None and {"L", "R"} <= set(diagnostics):
             diagnostics["L"], diagnostics["R"] = diagnostics["R"], diagnostics["L"]
         swapped = {
@@ -489,14 +525,18 @@ def factorize_admm_nanoquant(
             print(f"\t\t[curvature] structured fast path: L {Lf.structured} | R {Rf.structured}")
             maha_ref = maha_loss(W_norm32).clamp(eps)
 
+    def _draw(*shape, dtype=None) -> torch.Tensor:
+        """Normal draw on the primary device, in the order the serial algorithm consumes the RNG."""
+        return torch.randn(*shape, device=device, dtype=W.dtype if dtype is None else dtype, generator=generator)
+
     # we remove SVD-based init, since random init is (1) faster (2) shows on-par or better performance
-    A_ls = torch.randn((out_features, mid_rank), device=device, dtype=W.dtype)
-    B_ls = torch.randn((mid_rank, in_features), device=device, dtype=W.dtype)
+    A_ls = _draw(out_features, mid_rank)
+    B_ls = _draw(mid_rank, in_features)
 
     A_z, B_z = A_ls, B_ls
     if outer_iters > 0:
-        A_z = rank1_approx(A_ls, inner_iters, eps)
-        B_z = rank1_approx(B_ls, inner_iters, eps)
+        A_z = rank1_approx(A_ls, inner_iters, eps, v0=_draw(mid_rank))
+        B_z = rank1_approx(B_ls, inner_iters, eps, v0=_draw(in_features))
 
     if print_admm_steps:
         A_z_old = A_z.clone()
@@ -507,70 +547,117 @@ def factorize_admm_nanoquant(
 
     rho_scheduler_func = RHO_SCHEDULER_REGISTRY[rho_scheduler]
 
-    for itt in range(outer_iters):
-        rho = rho_scheduler_func(itt / outer_iters)
+    # --- the two halves of an iteration -------------------------------------------------------------------------
+    # The A-update reads (B_z, A_z, A_u) and the B-update reads (A_z, B_z, B_u) of the *previous* iteration (Jacobi
+    # sweep), so the halves are independent: with ``side_device`` the B half runs on that device in a second
+    # thread and only A_z / B_z cross over at the iteration boundary. The op order inside each half is the serial
+    # one, so both paths give the same numbers (bitwise on identical hardware).
+    split = side_device is not None
+    dev_b = torch.device(side_device) if split else torch.device(device)
+    if use_maha:
+        Lf_b, Rf_b, P_b = (Lf.to(dev_b), Rf.to(dev_b), P.to(dev_b)) if split else (Lf, Rf, P)
+    W_norm_b = W_norm.to(dev_b)
+    sa = {"ls": A_ls, "z": A_z, "u": A_u}
+    sb = {"ls": B_ls.to(dev_b), "z": B_z.to(dev_b), "u": B_u.to(dev_b)}
 
-        # 1) X-update
-        mid_norm_b = B_z.norm(dim=1).clamp(eps)
-        B_bar = B_z / mid_norm_b.unsqueeze(1)  # (mid, in), unit-norm rows
-        if use_maha:
-            B_bar32 = B_bar.to(torch.float32)
-            M = B_bar32 @ Rf.left(B_bar32.mT)  # B R B^T, (mid, mid)
-            C = P @ B_bar32.mT + rho * (A_z - A_u).to(torch.float32)  # (out, mid)
-            A_ls = Lf.sylvester(M, C, rho, reg, eps).to(W.dtype)
-        else:
-            # W_norm.T uses view; keep it
-            A_ls = _admm_solve_step(B_bar.mT, W_norm.mT, A_z.mT, A_u.mT, rho, reg, eps).mT
+    def a_step(rho: float, B_z_here: torch.Tensor, v: torch.Tensor) -> None:
+        """X-, Z- and U-update of the A side (primary device); ``B_z_here`` is the previous B_z."""
+        with torch.no_grad():
+            A_z_prev, A_u_ = sa["z"], sa["u"]
+            mid_norm_b = B_z_here.norm(dim=1).clamp(eps)
+            B_bar = B_z_here / mid_norm_b.unsqueeze(1)  # (mid, in), unit-norm rows
+            if use_maha:
+                B_bar32 = B_bar.to(torch.float32)
+                M = B_bar32 @ Rf.left(B_bar32.mT)  # B R B^T, (mid, mid)
+                C = P @ B_bar32.mT + rho * (A_z_prev - A_u_).to(torch.float32)  # (out, mid)
+                A_ls_ = Lf.sylvester(M, C, rho, reg, eps).to(W.dtype)
+            else:
+                # W_norm.T uses view; keep it
+                A_ls_ = _admm_solve_step(B_bar.mT, W_norm.mT, A_z_prev.mT, A_u_.mT, rho, reg, eps).mT
+            A_z_ = rank1_approx(A_ls_ + A_u_, inner_iters, eps, v0=v)
+            A_u_.add_(A_ls_ - A_z_)
+            sa["ls"], sa["z"] = A_ls_, A_z_
 
-        mid_norm_a = A_z.norm(dim=0).clamp(eps)
-        A_bar = A_z / mid_norm_a  # (out, mid), unit-norm columns
-        if use_maha:
-            A_bar32 = A_bar.to(torch.float32)
-            N = A_bar32.mT @ Lf.left(A_bar32)  # A^T L A, (mid, mid)
-            C = (A_bar32.mT @ P + rho * (B_z - B_u).to(torch.float32)).mT  # (in, mid)
-            B_ls = Rf.sylvester(N, C, rho, reg, eps).mT.to(W.dtype)
-        else:
-            B_ls = _admm_solve_step(A_bar, W_norm, B_z, B_u, rho, reg, eps)
+    def b_step(rho: float, A_z_here: torch.Tensor, v: torch.Tensor) -> None:
+        """X-, Z- and U-update of the B side (``dev_b``); ``A_z_here`` is the previous A_z on that device."""
+        with torch.no_grad(), device_context(dev_b):
+            B_z_prev, B_u_ = sb["z"], sb["u"]
+            mid_norm_a = A_z_here.norm(dim=0).clamp(eps)
+            A_bar = A_z_here / mid_norm_a  # (out, mid), unit-norm columns
+            if use_maha:
+                A_bar32 = A_bar.to(torch.float32)
+                N = A_bar32.mT @ Lf_b.left(A_bar32)  # A^T L A, (mid, mid)
+                C = (A_bar32.mT @ P_b + rho * (B_z_prev - B_u_).to(torch.float32)).mT  # (in, mid)
+                B_ls_ = Rf_b.sylvester(N, C, rho, reg, eps).mT.to(W.dtype)
+            else:
+                B_ls_ = _admm_solve_step(A_bar, W_norm_b, B_z_prev, B_u_, rho, reg, eps)
+            B_z_ = rank1_approx(B_ls_ + B_u_, inner_iters, eps, v0=v)
+            B_u_.add_(B_ls_ - B_z_)
+            sb["ls"], sb["z"] = B_ls_, B_z_
 
-        # 2) Z-update
-        target_A = A_ls + A_u
-        target_B = B_ls + B_u
-        A_z = rank1_approx(target_A, inner_iters, eps)
-        B_z = rank1_approx(target_B, inner_iters, eps)
+    pool = ThreadPoolExecutor(max_workers=2) if split else None
+    A_z_for_b = sa["z"].to(dev_b)  # previous A_z on the B device
+    B_z_for_a = sb["z"].to(device)  # previous B_z on the A device
+    try:
+        for itt in range(outer_iters):
+            rho = rho_scheduler_func(itt / outer_iters)
+            # start vectors of both rank-1 projections, drawn in the serial order (A then B)
+            v_a = _draw(mid_rank)
+            v_b = _draw(in_features)
 
-        # 3) U-update
-        A_u.add_(A_ls - A_z)
-        B_u.add_(B_ls - B_z)
+            if split:
+                fa = pool.submit(a_step, rho, B_z_for_a, v_a)
+                fb = pool.submit(b_step, rho, A_z_for_b, v_b.to(dev_b))
+                fa.result()
+                fb.result()
+                A_z_for_b = sa["z"].to(dev_b, non_blocking=True)
+                B_z_for_a = sb["z"].to(device, non_blocking=True)
+            else:
+                a_step(rho, B_z_for_a, v_a)  # B_z_for_a is still the previous B_z
+                b_step(rho, A_z_for_b, v_b)  # A_z_for_b is still the previous A_z
+                A_z_for_b, B_z_for_a = sa["z"], sb["z"]
 
-        if print_admm_steps:
-            if (itt == 0 or (itt + 1) % 100 == 0 or itt == outer_iters - 1):
-                r_A = torch.norm(A_ls - A_z).item()
-                r_B = torch.norm(B_ls - B_z).item()
-                primal_res = r_A + r_B
+            if print_admm_steps:
+                if (itt == 0 or (itt + 1) % 100 == 0 or itt == outer_iters - 1):
+                    A_ls, A_z = sa["ls"], sa["z"]
+                    B_ls, B_z = sb["ls"].to(device), sb["z"].to(device)
+                    r_A = torch.norm(A_ls - A_z).item()
+                    r_B = torch.norm(B_ls - B_z).item()
+                    primal_res = r_A + r_B
 
-                s_A = torch.norm(rho * (A_z - A_z_old)).item()
-                s_B = torch.norm(rho * (B_z - B_z_old)).item()
-                dual_res = s_A + s_B
+                    s_A = torch.norm(rho * (A_z - A_z_old)).item()
+                    s_B = torch.norm(rho * (B_z - B_z_old)).item()
+                    dual_res = s_A + s_B
 
-                mid = B_z.norm(dim=1).clamp(eps)
-                # (A_z / mid) @ B_z  ->  F.linear(A_z / mid, B_z.T)
-                pred = F.linear(A_z / mid, B_z.mT)
-                curr_loss = (W_norm - pred).norm().item()
-                normalized_err = (curr_loss**2) / (W_norm.norm()**2).clamp(eps)
+                    mid = B_z.norm(dim=1).clamp(eps)
+                    # (A_z / mid) @ B_z  ->  F.linear(A_z / mid, B_z.T)
+                    pred = F.linear(A_z / mid, B_z.mT)
+                    curr_loss = (W_norm - pred).norm().item()
+                    normalized_err = (curr_loss**2) / (W_norm.norm()**2).clamp(eps)
 
-                msg = (f"\t\t[ADMM Step {itt+1:04d}/{outer_iters:04d}] Loss: {normalized_err:.5e} | "
-                       f"Primal(r): {primal_res:.5e} | Dual(s): {dual_res:.5e} | Rho: {rho:.4f}")
-                if use_maha:
-                    E = (W_norm - pred).to(torch.float32)
-                    maha = (maha_loss(E) / maha_ref).item()
-                    # the same loss for the un-projected X-variables (A_bar @ B_ls)
-                    E_x = (W_norm - F.linear(A_bar, B_ls.mT)).to(torch.float32)
-                    maha_x = (maha_loss(E_x) / maha_ref).item()
-                    msg += f" | Mahalanobis(Z): {maha:.5e} | Mahalanobis(X): {maha_x:.5e}"
-                print(msg)
+                    msg = (f"\t\t[ADMM Step {itt+1:04d}/{outer_iters:04d}] Loss: {normalized_err:.5e} | "
+                           f"Primal(r): {primal_res:.5e} | Dual(s): {dual_res:.5e} | Rho: {rho:.4f}")
+                    if use_maha:
+                        E = (W_norm - pred).to(torch.float32)
+                        maha = (maha_loss(E) / maha_ref).item()
+                        # the same loss for the un-projected X-variables (A_bar @ B_ls), A_bar from the previous A_z
+                        A_bar = A_z_old / A_z_old.norm(dim=0).clamp(eps)
+                        E_x = (W_norm - F.linear(A_bar, B_ls.mT)).to(torch.float32)
+                        maha_x = (maha_loss(E_x) / maha_ref).item()
+                        msg += f" | Mahalanobis(Z): {maha:.5e} | Mahalanobis(X): {maha_x:.5e}"
+                    print(msg)
 
-            A_z_old.copy_(A_z)
-            B_z_old.copy_(B_z)
+                A_z_old.copy_(sa["z"])
+                B_z_old.copy_(sb["z"].to(device))
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
+
+    A_ls, A_z, A_u = sa["ls"], sa["z"], sa["u"]
+    B_ls, B_z, B_u = (t.to(device) for t in (sb["ls"], sb["z"], sb["u"]))
+    sa.clear()
+    sb.clear()
+    del A_z_for_b, B_z_for_a
 
     # Final export
     A_latent = (A_ls + A_u) / norm_o
@@ -600,8 +687,10 @@ def factorize_admm_nanoquant(
         # Exact Scale-Binary-Scale-Binary-Scale export: both factors have rank-1 magnitude by construction
         # (SVID projection), so their SVID triples recover them exactly.
         mid = scale_factor if torch.is_tensor(scale_factor) else torch.ones(mid_rank, device=device)
-        u_A, v_A, S_A = _svid_nonneg(A_final.to(torch.float32), inner_iters, eps)  # (out,), (mid,), (out, mid)
-        u_B, v_B, S_B = _svid_nonneg(B_final.to(torch.float32), inner_iters, eps)  # (mid,), (in,), (mid, in)
+        u_A, v_A, S_A = _svid_nonneg(A_final.to(torch.float32), inner_iters, eps,
+                                     v0=_draw(mid_rank, dtype=torch.float32))  # (out,), (mid,), (out, mid)
+        u_B, v_B, S_B = _svid_nonneg(B_final.to(torch.float32), inner_iters, eps,
+                                     v0=_draw(in_features, dtype=torch.float32))  # (mid,), (in,), (mid, in)
 
         scale_post = u_A.view(1, -1)
         scale_mid = (v_A * mid.to(torch.float32) * u_B).view(1, -1)

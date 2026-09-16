@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Samsung Electronics Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import gc
 import inspect
 import os
@@ -56,6 +57,82 @@ def cleanup_memory(verbose=False) -> None:
         if verbose:
             print(f"GPU memory{caller_name}: {memory_before / (1024 ** 3):.2f} -> {memory_after / (1024 ** 3):.2f} GiB"
                   f" ({(memory_after - memory_before) / (1024 ** 3):.2f} GiB)")
+
+
+def stage_devices(quant_config: dict, dev) -> list[str]:
+    """Devices for the layer-sharded stages (rank probe, calibration layer groups).
+
+    Parameters
+    ----------
+    quant_config : dict
+        ``parallel_devices``: number of GPUs to use; ``0`` = every visible one, ``1`` = the single ``dev``.
+    dev : str or torch.device
+        The pipeline's compute device.
+
+    Returns
+    -------
+    list of str
+        ``[dev]`` on CPU or with one usable device, else ``["cuda:0", ..., "cuda:G-1"]``.
+    """
+    dev = str(dev)
+    if torch.device(dev).type != "cuda":
+        return [dev]
+    want = int(quant_config.get("parallel_devices", 0) or 0)
+    avail = torch.cuda.device_count()
+    n = avail if want <= 0 else min(want, avail)
+    if n <= 1:
+        return [dev]
+    return [f"cuda:{i}" for i in range(n)]
+
+
+def device_context(device):
+    """Context manager making ``device`` the thread-local current CUDA device (a no-op for CPU devices).
+
+    Worker threads start with device 0 as their current device; kernels that pick the device from that thread-local
+    state (Triton launchers, RNG forks in checkpoint recompute) must run under this context when their tensors live
+    on another GPU.
+
+    Parameters
+    ----------
+    device : str or torch.device
+        Device the thread works on.
+
+    Returns
+    -------
+    context manager
+    """
+    d = torch.device(str(device))
+    if d.type != "cuda":
+        return contextlib.nullcontext()
+    return torch.cuda.device(d.index if d.index is not None else torch.cuda.current_device())
+
+
+def admm_side_device(quant_config: dict, device) -> str | None:
+    """Second device for the B side of the two-device ADMM (``admm_parallel_sides``), or ``None`` for the serial path.
+
+    Parameters
+    ----------
+    quant_config : dict
+        ``admm_parallel_sides``: run each ADMM iteration's B-update on another GPU.
+    device : str or torch.device
+        Device of the A side (the weight's device).
+
+    Returns
+    -------
+    str or None
+        The neighbouring CUDA device (``cuda:1`` for ``cuda:0``) when the knob is on and at least two devices are
+        visible; ``None`` otherwise (CPU, single GPU, or knob off).
+    """
+    if not quant_config.get("admm_parallel_sides", False):
+        return None
+    d = torch.device(str(device))
+    if d.type != "cuda" or torch.cuda.device_count() < 2:
+        return None
+    if d.index is not None:
+        idx = d.index
+    else:
+        idx = torch.cuda.current_device() if torch.cuda.is_initialized() else 0
+    return f"cuda:{(idx + 1) % torch.cuda.device_count()}"
 
 
 def find_layers(module, layers=None, name=''):

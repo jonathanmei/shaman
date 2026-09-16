@@ -32,6 +32,10 @@ def NanoQuantConfig(
     kron_eigh_dtype: str = "float64",
     # >0: accumulate the dense factors on the GPU for groups of layers fitting this budget (one pass per group)
     kron_gpu_budget_gb: float = 0.0,
+    # GPUs for the layer-sharded stages (rank probe, calibration layer groups): 0 = every visible one, 1 = serial
+    parallel_devices: int = 0,
+    # run the B half of every ADMM iteration on a second GPU (same result as the serial path; needs >= 2 GPUs)
+    admm_parallel_sides: bool = False,
     seqlen: int = 2048,
     device_map: str = "cpu",
     # stage-level artifact cache / resume ("" disables)
@@ -123,6 +127,8 @@ def NanoQuantConfig(
         "kron_stats_device": kron_stats_device,
         "kron_eigh_dtype": kron_eigh_dtype,
         "kron_gpu_budget_gb": kron_gpu_budget_gb,
+        "parallel_devices": parallel_devices,
+        "admm_parallel_sides": admm_parallel_sides,
         "seqlen": seqlen,
         "device_map": device_map,
         # cache / resume
