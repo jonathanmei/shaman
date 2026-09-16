@@ -716,3 +716,42 @@ pinned checkout `ob:~/code/shaman-14b` @ af857a1, log `.objob/logs/nq-14b-best-5
 `kron_gpu_budget_gb: 80` (28 GB bf16 model on the 141 GB card). Sizing: Kronecker stats scale as the per-block
 sum of in² + out² (8B 606 M elements × 36 blocks = 87 GB fp32, matching the cache file; 14B 1147 M × 40 ≈ 184 GB),
 peak RSS was ~3.2× the stats file at 4B, hence 800G. Readout pending as for 8B.
+
+## Multi-GPU: two-device ADMM and layer-sharded probe / calibration (2026-09-16, branch `multi-gpu-admm-probe` @ b8a0bda)
+
+Motivation: after the efficiency fixes the block chain is 60 % (4B) to 85 % (14B) ADMM, and the rank probe (41 / 54 /
+105 min at 4B / 8B / 14B, jobs 5713834 / 5721334 / 5723553) is ADMM too. Two knobs, both off by default and in no
+cache key (same math): `admm_parallel_sides` runs the B half of every ADMM iteration on a second GPU (the A- and
+B-updates of one iteration read only the previous iterate, a Jacobi sweep, so they are independent and exchange only
+`A_z`/`B_z`; the power-iteration start vectors are drawn on the primary device in the serial order, so the split is
+bitwise the serial result); `parallel_devices` (0 = all visible GPUs) shards the rank probe by layer over worker
+threads and runs the calibration layer groups of a pass concurrently on model replicas. Worker threads must set their
+current CUDA device (`device_context`): the first 4-GPU attempt (5733178) died with an illegal memory access when the
+Triton cross-entropy / checkpoint recompute of a cuda:1 replica launched on cuda:0.
+
+0.6B 4-block screen (`qwen3_0p6b_proj_ctrl_s02` recipe, `block_diagnostics`, A100 nodes):
+
+| arm | job | GPUs | calibration + startup | probe | blocks 0-3 (s) | per-layer ADMM, block 0 (s) | block-3 PPL | wall |
+|---|---|---|---|---|---|---|---|---|
+| control (fixes only) | 5713182 | 1 | ~3 min 56 | 677 s | 147 / 145 / 150 / 148 | 13.2 10.9 11.0 5.7 7.8 9.1 10.6 | 14.149 | 25 min 05 |
+| `admm_parallel_sides` | 5733177 | 2 | ~3 min 43 | 338 s (probe sharded over 2) | 115 / 112 / 117 / 115 | 7.1 5.8 5.8 3.2 4.2 4.9 5.7 | 14.296 | 17 min 00 |
+| + `parallel_devices` 4, `kron_gpu_budget_gb` 3 (3 groups), own `cache_parallel` | 5733180 | 4 | ~4 min 11 | 177 s | 104 / 100 / 106 / 104 | 7.4 6.1 6.1 3.5 4.5 5.2 6.0 | 14.149 | 14 min 02 |
+
+- **ADMM per layer 0.53-0.55×** with the split, every layer and block; block time −22 % at 0.6B where ADMM is under
+  half the block (with the per-block eval and diagnostics of the screen). At 4B-14B, where ADMM is 60-85 % of the
+  block, the expected block saving is 30-43 %.
+- **Probe scales linearly with devices**: 677 → 338 → 177 s on 1 / 2 / 4 GPUs (worker threads pulling from one
+  queue). At 14B this is 105 min → ~26 min on four H200s.
+- **Calibration sharding buys nothing at 0.6B** (one layer group fits a GPU; the 3-group arm ran its groups
+  concurrently on 3 GPUs in the same ~4 min as the single group). It pays where the factor budget forces several
+  groups: 4B 2 groups, 8B 2, 14B 4 (12 model passes → 3 concurrent).
+- **Equivalence**: `tests/test_admm_split_cuda.py` (job 5733181, two A100s) shows the two-device ADMM is bitwise
+  the serial result and deterministic, and that the probe's private generator reproduces `manual_seed`. The
+  pipeline itself is not run-to-run bitwise on GPU: block 0's first ADMM (identical FP weights) already differs by
+  4e-4 relative between 5733177 and the control (calibration backward is nondeterministic), and the block-3 PPLs
+  14.149 / 14.296 / 14.149 sit inside the ≈0.2 screen noise.
+- Submit with `--gres gpu:a100:2` (split) or `gpu:a100:4` (both); GPU-hours rise ~1.3-1.5× (the second GPU idles
+  during the tuning stages). The A100 nodes are NVLink (NV12), so the per-iteration exchange (40-150 MB) is
+  negligible against 60-150 ms iterations.
+- Next: a 4B best run with both knobs on four GPUs (expected to fit one 4 h job again: chain ~2 h 35 → ~1 h 45,
+  probe 41 → ~10 min, calibration 17 → ~9 min).
