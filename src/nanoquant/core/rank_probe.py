@@ -29,6 +29,7 @@ from ..utils.utils import (
     RANK_STEP,
     admm_side_device,
     cleanup_memory,
+    device_context,
     find_layers,
     fit_power_law,
     get_decoder_layers,
@@ -263,14 +264,15 @@ def measure_sensitivity(model, layers_to_factorize, quant_config: dict, dev: str
         lock = threading.Lock()
 
         def worker(device: str) -> None:
-            while True:
-                try:
-                    key, lx, ranks = todo.get_nowait()
-                except queue.Empty:
-                    return
-                out = probe_layer(lx, ranks, quant_config, device)
-                with lock:
-                    results[key] = out
+            with device_context(device):
+                while True:
+                    try:
+                        key, lx, ranks = todo.get_nowait()
+                    except queue.Empty:
+                        return
+                    out = probe_layer(lx, ranks, quant_config, device)
+                    with lock:
+                        results[key] = out
 
         with ThreadPoolExecutor(max_workers=len(devices)) as pool:
             for future in [pool.submit(worker, d) for d in devices]:

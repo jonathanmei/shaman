@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Samsung Electronics Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import gc
 import inspect
 import os
@@ -82,6 +83,28 @@ def stage_devices(quant_config: dict, dev) -> list[str]:
     if n <= 1:
         return [dev]
     return [f"cuda:{i}" for i in range(n)]
+
+
+def device_context(device):
+    """Context manager making ``device`` the thread-local current CUDA device (a no-op for CPU devices).
+
+    Worker threads start with device 0 as their current device; kernels that pick the device from that thread-local
+    state (Triton launchers, RNG forks in checkpoint recompute) must run under this context when their tensors live
+    on another GPU.
+
+    Parameters
+    ----------
+    device : str or torch.device
+        Device the thread works on.
+
+    Returns
+    -------
+    context manager
+    """
+    d = torch.device(str(device))
+    if d.type != "cuda":
+        return contextlib.nullcontext()
+    return torch.cuda.device(d.index if d.index is not None else torch.cuda.current_device())
 
 
 def admm_side_device(quant_config: dict, device) -> str | None:

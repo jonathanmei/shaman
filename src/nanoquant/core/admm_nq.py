@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from ..utils.utils import device_context
 from .curvature import IDENTITY_SPECTRUM, SpectrumSpec
 
 if torch.cuda.is_available():
@@ -579,7 +580,7 @@ def factorize_admm_nanoquant(
 
     def b_step(rho: float, A_z_here: torch.Tensor, v: torch.Tensor) -> None:
         """X-, Z- and U-update of the B side (``dev_b``); ``A_z_here`` is the previous A_z on that device."""
-        with torch.no_grad():
+        with torch.no_grad(), device_context(dev_b):
             B_z_prev, B_u_ = sb["z"], sb["u"]
             mid_norm_a = A_z_here.norm(dim=0).clamp(eps)
             A_bar = A_z_here / mid_norm_a  # (out, mid), unit-norm columns
@@ -654,7 +655,9 @@ def factorize_admm_nanoquant(
 
     A_ls, A_z, A_u = sa["ls"], sa["z"], sa["u"]
     B_ls, B_z, B_u = (t.to(device) for t in (sb["ls"], sb["z"], sb["u"]))
-    del sa, sb, A_z_for_b, B_z_for_a
+    sa.clear()
+    sb.clear()
+    del A_z_for_b, B_z_for_a
 
     # Final export
     A_latent = (A_ls + A_u) / norm_o

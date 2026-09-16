@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 
-from ..utils.utils import cleanup_memory
+from ..utils.utils import cleanup_memory, device_context
 
 # Gradient Scaling Factor to prevent underflow (Numerical Stability)
 GRAD_SCALE_FACTOR = 1e6
@@ -471,6 +471,10 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
 
     def run_group(it: int, g: int, names: list[str], model_g, dev_g: str, acc_dev: str, new: dict, sq_sums) -> None:
         """One calibration pass over ``dataloader`` accumulating the factors of ``names`` on ``model_g``."""
+        with device_context(dev_g):
+            _run_group(it, g, names, model_g, dev_g, acc_dev, new, sq_sums)
+
+    def _run_group(it: int, g: int, names: list[str], model_g, dev_g: str, acc_dev: str, new: dict, sq_sums) -> None:
         modules = linear_layers if model_g is model else dict(model_g.named_modules())
         group_bytes = sum(_factor_bytes(linear_layers[n]) for n in names)
         print(f">>> Kronecker curvature: NKP pass {it + 1}/{nkp_iters}, layer group {g + 1}/{len(groups)} "
