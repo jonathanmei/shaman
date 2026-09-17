@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=800G
-#SBATCH --gres=gpu:a100:4
+#SBATCH --gres=gpu:a100:2
 #SBATCH --requeue
 #SBATCH --output=/home/jonathan.mei/code/shaman/.objob/logs/%x-%j.out
 
