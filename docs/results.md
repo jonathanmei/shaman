@@ -837,7 +837,11 @@ Arms (each = the size's best config + `admm_parallel_sides` + `parallel_devices:
   node). Both are cheap to resubmit: the 8B statistics and probe are cached by 5733280 (9defe2bc1dae /
   7f75f8d873d4), the 14B statistics by 5733277 itself.
 - Fix for the h100 OOM: `kron_gpu_budget_gb: 24` in `qwen3_14b_best_typeprior.json` (not in any cache key; the run
-  resumes at block 10). A CPU retry for the KL-fit eigen fallback would harden the 14B calibration but lives in
+  resumes at block 10).
+- Resubmissions (2026-09-17 01:20, code 6c5604e): 5758606 8B stats512 + typeprior (a100; cached stats + probe,
+  straight to blocks), 5758607 14B typeprior (h100; resumed at block 10), 5758604 14B stats512 and 5758605 14B
+  stats512 + typeprior (h200; cached statistics, start at the probe; queued while the killed 5733277 sat in
+  COMPLETING on obsidian-10). A CPU retry for the KL-fit eigen fallback would harden the 14B calibration but lives in
   the stats fingerprint group (would re-key the cached statistics), so it is deferred.
 
 Smoke of the new paths: job 5733275 (`qwen3_0p6b_smoke_sweep.json`, 4 blocks, stats 32 vs 16, refresh at block
