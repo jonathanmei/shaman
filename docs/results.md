@@ -818,6 +818,28 @@ Arms (each = the size's best config + `admm_parallel_sides` + `parallel_devices:
 | `qwen3_14b_best_typeprior` | – | 4B table | 4 × h100 | 14B stats + probe | 5733284 (5733279 failed on the alias check) |
 | `qwen3_14b_best_stats512_typeprior` | 512 | 4B table | 4 × h200 | – | 5733277 |
 
+**Readout, first pass (2026-09-16 22:50):**
+
+| arm | job | outcome | PPL | zero-shot |
+|---|---|---|---|---|
+| 8B stats512 | 5733280 | COMPLETED, 5 h 27 on 4 × a100 (blocks 3 h 55 at ~392 s; 512-sample refreshes 838 / 689 s) | **11.82** | **0.497** |
+| 8B typeprior | 5733283 | COMPLETED, 3 h 57 on 4 × h100 (blocks 3 h 30 at ~349 s) | 12.50 | 0.485 |
+| 8B stats512 + typeprior | 5733281 | stalled: silent from 16:43 (right after `[cache] miss rank_probe`), 7 h 50 CPU with no output | – | – |
+| 14B stats512 | 5733276 | dead: KL-fit `_damped_inverse` Cholesky failed on one factor and the fp64 GPU `eigh` fallback did not converge inside a sharded calibration worker; the main thread raised, the worker threads kept the process alive | – | – |
+| 14B stats512 + typeprior | 5733277 | stalled: statistics saved (key 80831d36aeb6) and registered at 16:38, then silence before the probe's cache line | – | – |
+| 14B typeprior | 5733284 | FAILED: CUDA OOM in the block-10 curvature refresh on the 80 GB h100 (28 GB model + 48 GB factor budget); blocks 0-9 ran at 285-335 s and are checkpointed | – | – |
+
+- **Hypothesis 1 confirmed at 8B:** 512 statistics samples, nothing else changed: −0.56 PPL (12.38 → 11.82,
+  −4.5 %) and +0.023 zero-shot; 8B is now 5.2 % below the paper's 12.47, back on the small-model trend.
+- **Type prior alone is neutral at 8B:** +0.12 PPL (inside single-run noise), +0.011 zero-shot.
+- The two arms that stalled are the ones whose statistics were computed concurrently with a sibling job writing
+  the same cache key; the cached-probe arms did not stall. Cause not yet inspected (no thread dump from the login
+  node). Both are cheap to resubmit: the 8B statistics and probe are cached by 5733280 (9defe2bc1dae /
+  7f75f8d873d4), the 14B statistics by 5733277 itself.
+- Fix for the h100 OOM: `kron_gpu_budget_gb: 24` in `qwen3_14b_best_typeprior.json` (not in any cache key; the run
+  resumes at block 10). A CPU retry for the KL-fit eigen fallback would harden the 14B calibration but lives in
+  the stats fingerprint group (would re-key the cached statistics), so it is deferred.
+
 Smoke of the new paths: job 5733275 (`qwen3_0p6b_smoke_sweep.json`, 4 blocks, stats 32 vs 16, refresh at block
 2, type table, two-device ADMM) completed in 4 min 49 with the expected log lines. Code as run: 78f0d84 (512-sample
 arms) and d6c8677 (type-prior arms; adds the `ArtifactCache.load` symlink-alias acceptance after the first
