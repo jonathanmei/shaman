@@ -6,6 +6,9 @@ import gc
 import inspect
 import os
 import random
+import threading
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 
 import numpy as np
 import torch
@@ -105,6 +108,98 @@ def device_context(device):
     if d.type != "cuda":
         return contextlib.nullcontext()
     return torch.cuda.device(d.index if d.index is not None else torch.cuda.current_device())
+
+
+# PyTorch loads its CUDA linear-algebra backend (libtorch_cuda_linalg: eigh, cholesky, svd, ...) lazily on the first
+# ``torch.linalg`` call of the process; concurrent first calls from several threads race that load ("lazy wrapper
+# should be called at most once", corrupted solves, deadlocks; docs/issues/threaded_gpu_stages_14b.md). The warm-up
+# below issues the ops the sharded stages use from one thread at a time, and every thread records what it warmed.
+_LINALG_LOCK = threading.Lock()
+_LINALG_TLS = threading.local()
+
+
+@torch.no_grad()
+def _warm_up_linalg_ops(device: torch.device, dtype: torch.dtype, n: int = 8) -> None:
+    """Issue the linear-algebra kernels used by the sharded stages on a tiny SPD matrix and wait for them.
+
+    Parameters
+    ----------
+    device : torch.device
+        CUDA device to warm.
+    dtype : torch.dtype
+        Working precision of the calls (``float32`` for the probe / Sylvester steps, ``float64`` for the KL fit).
+    n : int
+        Matrix size; deterministic ``I + 1/n`` (no RNG use).
+    """
+    A = torch.eye(n, dtype=dtype, device=device) + torch.full((n, n), 1.0 / n, dtype=dtype, device=device)
+    torch.linalg.eigh(A)
+    chol, _ = torch.linalg.cholesky_ex(A)
+    torch.cholesky_inverse(chol)
+    torch.linalg.svdvals(A)
+    torch.cuda.synchronize(device)
+
+
+def warm_up_linalg(devices: Iterable[str | torch.device],
+                   dtypes: Sequence[torch.dtype] = (torch.float32, torch.float64)) -> None:
+    """Load the lazily initialised CUDA linear-algebra backend from the calling thread, one warm-up at a time.
+
+    Call it on the main thread before starting worker threads that call ``torch.linalg`` (rank probe, calibration
+    layer groups), and at the start of each worker for its own device: the first linalg call of every thread is
+    then the serialised warm-up, so the large eigendecompositions that follow never hit the lazy loader
+    concurrently. A no-op for CPU devices and when CUDA is unavailable; idempotent per (thread, device, dtype).
+
+    Parameters
+    ----------
+    devices : iterable of str or torch.device
+        Devices to warm; non-CUDA entries are skipped, a bare ``"cuda"`` means the current device.
+    dtypes : sequence of torch.dtype
+        Precisions to warm on each device.
+    """
+    if not torch.cuda.is_available():
+        return
+    warm = getattr(_LINALG_TLS, "warm", None)
+    if warm is None:
+        warm = _LINALG_TLS.warm = set()
+    for device in devices:
+        d = torch.device(str(device))
+        if d.type != "cuda":
+            continue
+        index = d.index if d.index is not None else torch.cuda.current_device()
+        d = torch.device(f"cuda:{index}")
+        for dtype in dtypes:
+            key = (str(d), dtype)
+            if key in warm:
+                continue
+            with _LINALG_LOCK:
+                _warm_up_linalg_ops(d, dtype)
+            warm.add(key)
+
+
+def run_in_threads(fns: Sequence[Callable[[], None]], stop: threading.Event | None = None) -> None:
+    """Run ``fns`` concurrently, one thread each, and fail fast on the first exception.
+
+    On the first failure ``stop`` (if given) is set so that cooperating workers leave their loops, the functions that
+    have not started yet are cancelled, the running ones are joined, and the first exception (in submission order)
+    is re-raised. A raised worker therefore terminates the process instead of leaving it alive with idle siblings.
+
+    Parameters
+    ----------
+    fns : sequence of callables
+        Work items; each runs in its own thread and returns ``None``.
+    stop : threading.Event, optional
+        Flag the callables poll between units of work.
+    """
+    with ThreadPoolExecutor(max_workers=len(fns)) as pool:
+        futures = [pool.submit(fn) for fn in fns]
+        done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+        if any(f.exception() is not None for f in done):
+            if stop is not None:
+                stop.set()
+            for f in futures:
+                f.cancel()
+    for f in futures:
+        if not f.cancelled():
+            f.result()
 
 
 def admm_side_device(quant_config: dict, device) -> str | None:

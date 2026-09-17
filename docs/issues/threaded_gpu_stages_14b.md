@@ -1,7 +1,9 @@
 # Threaded multi-GPU stages fail at 14B: `lazy wrapper should be called at most once`
 
-Status 2026-09-17: open. Workaround in use: `parallel_devices: 1` for the 14B runs (serial probe / calibration);
-`admm_parallel_sides` (two-GPU ADMM) is unaffected.
+Status 2026-09-17: fix implemented on branch `threaded-linalg-warmup` (`warm_up_linalg` / `run_in_threads` in
+`utils/utils.py`, see "Fix" below); 14B verification on 4 a100 pending (job ids below once submitted). Until it
+passes the 14B configs keep the workaround `parallel_devices: 1` (serial probe / calibration); `admm_parallel_sides`
+(two-GPU ADMM) is unaffected.
 
 ## Symptom
 
@@ -39,21 +41,40 @@ timing the race raises (5761695 / 5761696), corrupts a call into a non-convergin
 why 0.6B and 8B mostly slipped through. The refresh path (`refresh_block_curvature`) uses the same sharded
 collector and is exposed too.
 
-## Proposed fix (not yet implemented)
+## Fix (branch `threaded-linalg-warmup`)
 
-1. Warm up the lazy state on the main thread before any pool starts: one small `torch.linalg.eigh` (and
-   `cholesky_ex`, `svdvals`) per device and per dtype in use (`float32`, `float64`), e.g. a
-   `warm_up_linalg(devices)` helper in `utils/utils.py` called from `measure_sensitivity` and `_collect_kron_stats`.
-2. Serialise each worker's first eigh behind a module-level `threading.Lock` (belt and braces; steady-state
-   parallelism is unaffected).
-3. Fail fast in the pools: `concurrent.futures.wait(..., return_when=FIRST_EXCEPTION)` and cancel the remaining
-   futures, or daemon worker threads, so a raised worker cannot leave a job RUNNING with nothing to do (5733276)
-   or unkillable (5733277).
-4. Cache keys: `rank_probe.py` is in the `blocks` and `rank_probe` fingerprint groups and `importance.py` in
-   `stats`, so the fix re-keys probes, blocks and statistics. Land it between runs and alias the cached artifacts
-   (symlink `<new key>.pt -> <old key>.pt`, accepted by `ArtifactCache.load`) where recomputation is not wanted.
-5. Verify with the 14B probe on 4 GPUs (the failing case) before re-enabling `parallel_devices > 1` at 14B; the
-   0.6B screen (`configs/qwen3_0p6b_screen_parallel4.json`) does not reproduce the race.
+1. **Warm-up on the main thread.** `utils/utils.py` `warm_up_linalg(devices, dtypes=(float32, float64))` issues a
+   tiny `eigh`, `cholesky_ex` + `cholesky_inverse` and `svdvals` per device and dtype and synchronises. PyTorch's
+   CUDA linalg backend (`libtorch_cuda_linalg`) is loaded by the first `torch.linalg` call of the process and stays
+   loaded (`cleanup_memory` only clears cuBLAS workspaces), so one main-thread call before a pool removes the race.
+   Called at the top of the threaded branch of `measure_sensitivity` and, when sharding, in `_collect_kron_stats`
+   (which `refresh_block_curvature` and the pipeline's statistics call share).
+2. **Serialised first call per worker.** The warm-up runs under a module-level `threading.Lock` and remembers what
+   it warmed per thread (`threading.local`); every worker (`worker` in the probe, `run_group` in the collector)
+   calls `warm_up_linalg([device])` first, so its first linalg call is the locked warm-up and the large
+   eigendecompositions run unlocked afterwards (steady-state parallelism unchanged). `core/admm_nq.py` is untouched.
+3. **Fail fast.** `run_in_threads(fns, stop)` replaces the two `ThreadPoolExecutor` blocks: it waits with
+   `FIRST_EXCEPTION`, sets the `stop` event (the probe worker checks it between layers), cancels the not-yet-started
+   functions, joins the running ones and re-raises the first exception, so a raised worker terminates the job
+   instead of leaving it RUNNING with idle siblings (5733276) or with orphaned threads (5733277).
+4. **Cache keys.** `core/rank_probe.py` (`blocks`, `rank_probe` groups) and `core/importance.py` (`stats`) changed,
+   so statistics, probes, blocks and KD are re-keyed. `scripts/alias_cache_keys.py <config> --kind stats|rank_probe
+   --old <old key prefix>` creates the symlink alias `ArtifactCache.load` accepts; `utils/utils.py`, `scripts/`,
+   configs and tests are not fingerprinted.
+5. **Tests.** `tests/test_thread_pools.py` (warm-up no-op / idempotence / lock, `run_in_threads` fail-fast),
+   `test_measure_sensitivity_fails_fast`, `test_sharded_collector_fails_fast` (CPU), and the GPU-gated
+   `tests/test_linalg_threads_cuda.py` (needs two CUDA devices).
+
+### Verification (cluster, pinned checkout `ob:~/code/shaman-linalg`)
+
+- `scripts/linalg_verify/job-linalg_repro.sh` (short, 4 a100): `scripts/linalg_verify/linalg_race_repro.py` runs
+  5 fresh processes per mode, each with one thread per GPU doing a 5120² float32 eigh, without and with the warm-up
+  (the no-warm-up counts are timing dependent; all warm-up runs must pass), then the two GPU test modules.
+- `scripts/linalg_verify/job-qwen3_14b_probe_verify.sh` (lgpus, 4 a100, 800G): `configs/qwen3_14b_probe_verify_parallel4.json`
+  = the 14B 512-sample config with `parallel_devices: 4`, `cache_dir: cache_verify` (only the statistics aliased
+  in, so the probe recomputes threaded) and `max_blocks: 1`. Expect `[cache] alias stats ... -> 80831d36aeb6`,
+  `[cache] miss rank_probe`, 40 `[rank probe] block` lines and `... on 4 device(s)`; compare `probes` / `curves` with
+  the serial artifact `f9df6a548b74` of job 5768981.
 
 ## Workaround used
 

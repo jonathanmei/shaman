@@ -20,7 +20,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 import torch
 from torch import nn
@@ -36,8 +36,10 @@ from ..utils.utils import (
     has_mid_scale,
     parse_probe_ranks,
     rank_ceiling,
+    run_in_threads,
     stage_devices,
     uniform_rank,
+    warm_up_linalg,
 )
 from .admm_nq import EigCache, factorize_admm_nanoquant
 from .compress_block import mahalanobis_weight_error
@@ -262,10 +264,14 @@ def measure_sensitivity(model, layers_to_factorize, quant_config: dict, dev: str
                 todo.put(task)
         results: dict[str, dict[int, float]] = {}
         lock = threading.Lock()
+        stop = threading.Event()
+        # load the lazily initialised CUDA linalg backend before any worker thread touches it (see warm_up_linalg)
+        warm_up_linalg(devices)
 
         def worker(device: str) -> None:
             with device_context(device):
-                while True:
+                warm_up_linalg([device])
+                while not stop.is_set():
                     try:
                         key, lx, ranks = todo.get_nowait()
                     except queue.Empty:
@@ -274,9 +280,7 @@ def measure_sensitivity(model, layers_to_factorize, quant_config: dict, dev: str
                     with lock:
                         results[key] = out
 
-        with ThreadPoolExecutor(max_workers=len(devices)) as pool:
-            for future in [pool.submit(worker, d) for d in devices]:
-                future.result()
+        run_in_threads([partial(worker, d) for d in devices], stop=stop)
         for i, items in by_block.items():
             for key, _, _ in items:
                 probes[key] = results[key]

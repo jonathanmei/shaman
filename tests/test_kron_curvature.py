@@ -319,6 +319,31 @@ def test_sharded_group_accumulation_matches_serial(monkeypatch, strategy):
         assert torch.equal(p, before)
 
 
+def test_sharded_collector_fails_fast(monkeypatch):
+    """A raising group worker propagates its exception; the second NKP pass never starts."""
+    import threading
+    import time
+
+    dataloader = [torch.randn(2, 7, 6) for _ in range(3)]
+    calls = {"n": 0}
+    lock = threading.Lock()
+
+    def raising_loop(dataloader_, model_, dev_, *a, **k):
+        with lock:
+            calls["n"] += 1
+            first = calls["n"] == 1
+        if first:
+            raise RuntimeError("boom")
+        time.sleep(0.05)
+        _fake_loop(dataloader_, model_, dev_, *a, **k)
+
+    monkeypatch.setattr(imp, "_run_calibration_loop", raising_loop)
+    with pytest.raises(RuntimeError, match="boom"):
+        imp.collect_stats(_TinyMLP(), dataloader, "cpu", strategy="dbf", curvature="kron", nkp_iters=2,
+                          gpu_budget_gb=500e-9, devices=["cpu", "cpu"])
+    assert 1 <= calls["n"] <= 2  # the raise plus at most the sibling group of the same wave
+
+
 def test_sharded_accumulation_without_groups_falls_back_to_serial(monkeypatch):
     torch.manual_seed(6)
     dataloader = [torch.randn(2, 7, 6) for _ in range(2)]
