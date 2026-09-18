@@ -18,8 +18,8 @@ is derived in `rank_allocation_note.html`.
 | Qwen3-1.7B-Base | `configs/qwen3_1p7b_best.json` | same recipe with measured × ramp ranks (not yet run; 16.72 with uniform ranks) | 0.9863 | – | 19.21 |
 | Qwen3-4B-Base | `configs/qwen3_4b_best.json` | same recipe, refresh/9, measured × ramp 0.6 ranks (probe 0.6/1.0/1.4; jobs 5663775 → 5666862 from `26d8fd4`); zero-shot mean 0.463 | 0.9864 | 13.80 | 14.29 |
 | Qwen3-4B-Base | commit `26d8fd4`, `configs/qwen3_4b_kl_ra_both.json` | KL factors, p = ½, fresh R, refresh/9, **hand-table ranks (ramp 0.6 + type weights), parity**; recorded best, code removed | 0.9864 | **13.55** | 14.29 |
-| Qwen3-8B-Base | `configs/qwen3_8b_best.json` | same recipe as 4B (refresh/9, probe 0.6/1.0/1.4) plus the efficiency fixes and `tune_epoch_weights: type`; 2 scales, no KD middle scale (job 5721334, one h200 on `lgpus`, 4 h 35 wall); zero-shot mean 0.474 | 0.9944 | **12.38** | – |
-| Qwen3-14B-Base | `configs/qwen3_14b_best.json` | same as 8B with refresh/10 (40 blocks) and an 80 GB GPU factor budget (job 5723553, second h200, 8 h 45 wall to the saved model; zero-shot from the eval-only rerun 5733176 after the lm-eval per-task model copy OOM); zero-shot mean 0.491 | 0.9979 | **11.13** | – |
+| Qwen3-8B-Base | `configs/qwen3_8b_best.json` | same recipe as 4B (refresh/9, probe 0.6/1.0/1.4) plus the efficiency fixes and `tune_epoch_weights: type`; 2 scales, no KD middle scale (job 5721334, one h200 on `lgpus`, 4 h 35 wall); zero-shot mean 0.474. **With `num_stats_samples: 512` (job 5733280): 11.82 / 0.497** | 0.9944 | **11.82** (12.38 at 128 samples) | 12.47 |
+| Qwen3-14B-Base | `configs/qwen3_14b_best.json` | same as 8B with refresh/10 (40 blocks) and an 80 GB GPU factor budget (job 5723553, second h200, 8 h 45 wall to the saved model; zero-shot from the eval-only rerun 5733176 after the lm-eval per-task model copy OOM); zero-shot mean 0.491. **With `num_stats_samples: 512` (job 5768981): 10.91 / 0.506** | 0.9979 | **10.91** (11.13 at 128 samples) | 10.92 |
 
 Every recipe keeps the paper's protocol: 128 × 2048 WikiText-2 calibration samples, seed 0, 2 scales, 8/8/8 epochs,
 scale-only KD, and the same total bits as the uniform rank rule (parity).
@@ -32,6 +32,14 @@ fixes (fp32 Sylvester eigh, gated per-block eval, probe eigen cache, MLP-only tu
 Not adopted after measurement: the spike-plus-flat / structured ADMM (5-8 % of 4B ADMM time, 1-2 % of block time),
 plateau stopping (dominated by the type table), measured epoch weights (no better than the table), non-factorized
 retuning per input group (+0.28 PPL: every round matters).
+
+Recipe addition of 2026-09-18 (branch `scale-sweep-calib-typeprior`, `results.md` "Scale sweep"):
+**`num_stats_samples: 512`** for 8B and 14B — the curvature statistics and refreshes on 512 distinct calibration
+sequences while block reconstruction and KD keep 128: 8B 12.38 → **11.82** (zero-shot 0.474 → 0.497), 14B 11.13 →
+**10.91** (0.491 → 0.506), i.e. the Kronecker factors were sample-starved at large width. The gain shrinks with
+size (−4.5 % at 8B, −2.0 % at 14B, which only ties the paper's 10.92), so the sample count should scale with width;
+cost ~4× on statistics and on every refresh (3.7 h of the 12 h 50 at 14B). Null after measurement: the 26d8fd4
+type-weight table as a prior on the measured curves (`rank_type_weights`; ±0.1 PPL at both sizes).
 
 ## Three things to keep
 

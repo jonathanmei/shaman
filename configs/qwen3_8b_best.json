@@ -10,6 +10,7 @@
   "rank_depth_ramp": 0.6,
   "seed": 0,
   "num_calib_samples": 128,
+  "num_stats_samples": 512,
   "calib_dataset": "wikitext2",
   "calib_shrinkage": 0.2,
   "calib_strategy": "online",

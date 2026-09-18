@@ -841,7 +841,40 @@ Arms (each = the size's best config + `admm_parallel_sides` + `parallel_devices:
 - Resubmissions (2026-09-17 01:20, code 6c5604e): 5758606 8B stats512 + typeprior (a100; cached stats + probe,
   straight to blocks), 5758607 14B typeprior (h100; resumed at block 10), 5758604 14B stats512 and 5758605 14B
   stats512 + typeprior (h200; cached statistics, start at the probe; queued while the killed 5733277 sat in
-  COMPLETING on obsidian-10). A CPU retry for the KL-fit eigen fallback would harden the 14B calibration but lives in
+  COMPLETING on obsidian-10). The h200 node was then drained by Slurm (unkillable tasks of another user's jobs),
+  so the two 14B 512-sample arms moved to a100 (c7539dd), crashed in the threaded probe (see
+  `docs/issues/threaded_gpu_stages_14b.md`) and finally ran with `parallel_devices: 1` (2ab4906, jobs 5768981 /
+  5768982).
+
+**Final readout (2026-09-18):**
+
+| arm | job | PPL | zero-shot | wall |
+|---|---|---|---|---|
+| 8B baseline (128 samples, measured × ramp) | 5721334 | 12.38 | 0.474 | 4 h 35 (1 × h200) |
+| 8B stats512 | 5733280 | **11.82** | **0.497** | 5 h 27 (4 × a100) |
+| 8B typeprior | 5733283 | 12.50 | 0.485 | 3 h 57 (4 × h100) |
+| 8B stats512 + typeprior | 5758606 | **11.75** | 0.488 | 4 h 35 (4 × a100) |
+| 14B baseline | 5723553 | 11.13 | 0.491 | 8 h 45 (1 × h200) |
+| 14B stats512 | 5768981 | **10.91** | **0.506** | 12 h 50 (2 × a100, serial probe) |
+| 14B typeprior | 5758607 | 11.05 | 0.486 | 6 h 35 (4 × h100, from block 10) |
+| 14B stats512 + typeprior | 5768982 | 10.95 | 0.491 | 13 h 04 (2 × a100, serial probe) |
+
+Per-task zero-shot: 14B stats512 boolq 0.649, piqa 0.629, hellaswag 0.364, winogrande 0.624, arc_easy 0.506,
+arc_challenge 0.261; 14B stats512 + typeprior 0.633 / 0.632 / 0.365 / 0.633 / 0.428 / 0.253.
+
+- **Hypothesis 1 holds at both sizes.** 512 statistics samples, nothing else changed: 8B −0.56 PPL (−4.5 %) and
+  +0.023 zero-shot; 14B −0.22 PPL (−2.0 %) and +0.015 zero-shot. Against the paper: 8B 11.82 vs 12.47 (−5.2 %),
+  14B 10.91 vs 10.92 (parity, from +1.9 % above). The gain shrinks with size, so 512 does not fully restore the
+  small-model margin at 14B; the sample count should scale with width (1024 at 14B is the next arm), and the
+  remaining hypotheses (activation outliers, small-scale-tuned hyperparameters) stay open there.
+- **Hypothesis 2 (type prior) is null.** Alone: +0.12 PPL at 8B, −0.08 at 14B; on top of 512 samples: −0.07 at 8B,
+  +0.04 at 14B; zero-shot within ±0.015 everywhere. Not adopted; `rank_type_weights` stays available.
+- **Cost of 512 statistics samples.** Statistics ~4× (8B a100 ~1 h 20 with 4-way sharding; 14B serial ~3 h) and
+  every curvature refresh ~4× as well: at 14B the three refreshes took 6487 / 4606 / 2380 s (3.7 h of the 12 h 50).
+  A separate refresh sample count (`num_refresh_samples`, e.g. 128 or 256) is the obvious next efficiency knob;
+  whether the refreshes need the full 512 is untested.
+- Adopted into the recipe for 8B and 14B: `num_stats_samples: 512` (`qwen3_8b_best.json`, `qwen3_14b_best.json`
+  to be updated; the 0.6B–4B bests were not re-run with it). Pending: seed-1 twins; a 1024-sample arm at 14B. A CPU retry for the KL-fit eigen fallback would harden the 14B calibration but lives in
   the stats fingerprint group (would re-key the cached statistics), so it is deferred.
 
 Smoke of the new paths: job 5733275 (`qwen3_0p6b_smoke_sweep.json`, 4 blocks, stats 32 vs 16, refresh at block
