@@ -874,7 +874,44 @@ arc_challenge 0.261; 14B stats512 + typeprior 0.633 / 0.632 / 0.365 / 0.633 / 0.
   A separate refresh sample count (`num_refresh_samples`, e.g. 128 or 256) is the obvious next efficiency knob;
   whether the refreshes need the full 512 is untested.
 - Adopted into the recipe for 8B and 14B: `num_stats_samples: 512` (`qwen3_8b_best.json`, `qwen3_14b_best.json`
-  to be updated; the 0.6B–4B bests were not re-run with it). Pending: seed-1 twins; a 1024-sample arm at 14B. A CPU retry for the KL-fit eigen fallback would harden the 14B calibration but lives in
+  to be updated; the 0.6B–4B bests were not re-run with it). Pending: seed-1 twins; a 1024-sample arm at 14B.
+
+## Are the tuning stages converged? Factor-tuning screen (2026-09-18, Qwen3-0.6B, 4 blocks)
+
+Question (before spending more 14B time): would more block-tuning or KD iterations lower the 14B perplexity?
+Evidence from the 14B 512-sample run (job 5768981, per-epoch `Block Loss` lines):
+
+| stage | measurement | verdict |
+|---|---|---|
+| non-factorized tuning (8 epochs, the 80 up/down layers) | loss at epoch 8 = 0.864 × epoch 1; the last epoch still improves it by a median 0.22 % (p90 0.36 %, max 1.5 %), decaying geometrically | converged: doubling the epochs buys well under 1 % of block loss |
+| factorized tuning (8 epochs, STE, lr 1e-5, cosine to 1e-4 × lr) | loss at epoch 8 = 0.971 × epoch 1 on average, but in 30 of 80 layers it ends *above* epoch 1, with ~3 % epoch-to-epoch swings | not converging: oscillates; more epochs will not help, the schedule or the selection might |
+| KD (8 epochs, lr 1e-6) | 1.9451 → 1.9271; per-epoch gains 0.009, 0.004, 0.0016, 0.0015, 0.0009, 0.0008, 0.0002 (8B: last two epochs identical) | converged |
+| ADMM (400 outer iterations) | no per-iteration trace; the inexact fast Sylvester solve was lossless at 1.7B | unmeasured; unlikely to be the bottleneck |
+
+So iteration counts were **not** raised for the 1024-sample arm. The one stage with headroom is the factorized
+tuning, and the lever is the schedule / selection, not the count. Note that a cosine decay is already in place
+(`CosineAnnealingLR` to `1e-4 × lr` over all steps in `tune_fact`), so the "decaying learning rate" arm is a lower
+peak (×0.3) rather than a new schedule.
+
+New knob `fact_keep_best` (`core/compress_block.py` `_tune_loop`): evaluates the block loss of the current
+parameters after every factorized-tuning epoch (one extra no-grad pass over the samples), counts the ADMM
+initialisation as a candidate, and restores the best state at the end (`keep best: epoch k ... restored | = last`
+in the log). In `BLOCK_FIELDS`. Test `test_tune_loop_keep_best_restores_the_best_state`.
+
+Screen on the current recipe (`qwen3_0p6b_tune_type.json` base, 4 blocks, block-3 PPL reference 14.16 / 14.15 from
+the tuning-budget screen; single a100, `gpus` partition):
+
+| arm | config | knobs |
+|---|---|---|
+| control | `qwen3_0p6b_fact_ctrl.json` | – (re-run on the merged code) |
+| keep-best | `qwen3_0p6b_fact_best.json` | `fact_keep_best: true` |
+| lr ×0.3 | `qwen3_0p6b_fact_lr03.json` | `fact_{binary,scale,bias}_lr: 3e-6` |
+| both | `qwen3_0p6b_fact_best_lr03.json` | keep-best + lr ×0.3 |
+| ADMM 800 | `qwen3_0p6b_fact_admm800.json` | `admm_outer_iters: 800` (ADMM convergence check) |
+
+Read-out: block 0-3 PPL from the block diagnostics, the `keep best:` lines (how often the last epoch is not the best,
+how often the ADMM init wins) and the per-layer ADMM times for the 800 arm. Adopt at 14B (1024-sample run) only
+what is at least within noise at block 3 (±0.2) and reduces the factor-tuning loss regressions. A CPU retry for the KL-fit eigen fallback would harden the 14B calibration but lives in
   the stats fingerprint group (would re-key the cached statistics), so it is deferred.
 
 Smoke of the new paths: job 5733275 (`qwen3_0p6b_smoke_sweep.json`, 4 blocks, stats 32 vs 16, refresh at block

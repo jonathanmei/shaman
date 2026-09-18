@@ -97,6 +97,8 @@ def NanoQuantConfig(
     fact_bias_lr: float = 1e-5,
     fact_batch_size: int = 1,
     fact_epochs: int = 8,
+    # keep the best factorized-tuning state (eval after every epoch; ADMM init is a candidate)
+    fact_keep_best: bool = False,
     # tune_model (scale-only KD)
     tune_model: bool = True,
     model_kd_lr: float = 1e-5,
@@ -175,6 +177,7 @@ def NanoQuantConfig(
         "fact_bias_lr": fact_bias_lr,
         "fact_batch_size": fact_batch_size,
         "fact_epochs": fact_epochs,
+        "fact_keep_best": fact_keep_best,
         # tune_model
         "tune_model": tune_model,
         "model_kd_lr": model_kd_lr,

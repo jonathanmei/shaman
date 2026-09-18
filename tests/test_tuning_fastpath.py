@@ -85,6 +85,45 @@ NAMES = ['self_attn.q_proj', 'self_attn.v_proj', 'self_attn.o_proj', 'self_attn.
          'mlp.up_proj', 'mlp.down_proj']
 
 
+def _eval_loss(block, x, y):
+    with torch.no_grad():
+        return sum(cb.fused_weighted_mse(block(x[j:j + 1])[0], y[j:j + 1], torch.ones(D)).item() for j in range(N))
+
+
+def _run_keep_best(lr, keep_best, epochs=4):
+    torch.manual_seed(3)
+    block = _Block()
+    x, y = _data(1)
+    params = list(block.mlp.parameters())
+    for p in params:
+        p.requires_grad_(True)
+    init = [p.detach().clone() for p in params]
+    opt = torch.optim.SGD(params, lr=lr)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda _: 1.0)
+    torch.manual_seed(0)
+    with torch.enable_grad():
+        run = cb._tune_loop(block, opt, sched, x, y, torch.ones(D), {}, batch_size=1, epochs=epochs, num_samples=N,
+                            keep_best=keep_best)
+    return block, x, y, params, init, run
+
+
+def test_tune_loop_keep_best_restores_the_best_state():
+    """With a diverging learning rate the pre-tuning state wins and is restored; a sane run keeps its last epoch."""
+    block, x, y, params, init, run = _run_keep_best(lr=50.0, keep_best=True)
+    assert run == 4
+    for p, p0 in zip(params, init):
+        assert torch.equal(p.detach(), p0)  # the initial (ADMM) state was the best candidate
+    block_plain, x, y, params_plain, init_plain, _ = _run_keep_best(lr=50.0, keep_best=False)
+    assert not all(torch.equal(p.detach(), p0) for p, p0 in zip(params_plain, init_plain))
+    plain_loss = _eval_loss(block_plain, x, y)
+    assert math.isnan(plain_loss) or _eval_loss(block, x, y) < plain_loss  # the diverged run may be NaN
+    # a well-behaved run: keep_best selects the last epoch and changes nothing
+    block_a, x, y, pa, _, _ = _run_keep_best(lr=1e-2, keep_best=True)
+    block_b, _, _, pb, _, _ = _run_keep_best(lr=1e-2, keep_best=False)
+    for p, q in zip(pa, pb):
+        assert torch.allclose(p.detach(), q.detach())
+
+
 def test_scaled_epochs():
     assert cb.scaled_epochs(8, 1.0) == 8 and cb.scaled_epochs(8, 0.25) == 2 and cb.scaled_epochs(8, 0.05) == 1
     assert cb.scaled_epochs(8, 0.75) == 6

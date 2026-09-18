@@ -113,6 +113,7 @@ class NanoQuantConfigDataclass:
     fact_bias_lr: float = 1e-5
     fact_batch_size: int = 1
     fact_epochs: int = 8
+    fact_keep_best: bool = False
     # tune_model (scale-only KD)
     tune_model: bool = True
     model_kd_lr: float = 1e-5

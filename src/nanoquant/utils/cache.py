@@ -49,7 +49,7 @@ BLOCK_FIELDS: tuple[str, ...] = ("calib_shrinkage", "bits", "rank_budget", "rank
     "admm_input_factor", "curvature_refresh_every", "curvature_refresh_iters",
     "tune_nonfact", "nonfact_lr", "nonfact_batch_size", "nonfact_epochs", "nonfact_per_group",
     "tune_epoch_weights", "tune_epoch_min_frac", "tune_plateau_tol", "tune_fact", "fact_binary_lr",
-    "fact_scale_lr", "fact_bias_lr", "fact_batch_size", "fact_epochs")
+    "fact_scale_lr", "fact_bias_lr", "fact_batch_size", "fact_epochs", "fact_keep_best")
 KD_FIELDS: tuple[str, ...] = ("model_kd_lr", "model_kd_batch_size", "model_kd_epochs", "pre_kd_checkpoint",
                               "model_kd_mid_scale")
 TEACHER_FIELDS: tuple[str, ...] = ("model_id", "seqlen", "calib_dataset", "num_calib_samples", "seed")

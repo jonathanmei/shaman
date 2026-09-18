@@ -475,14 +475,31 @@ def nonfact_rounds(names: list[str], groups: dict[str, str], per_group: bool) ->
     return {n: groups.get(n, n) == n for n in names}
 
 
+def _eval_block_loss(block, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs, num_samples: int,
+                     forward_fn=None) -> float:
+    """Per-element weighted block loss of the current parameters over all samples (no gradients)."""
+    total = torch.zeros((), device=block_target_outputs.device)
+    with torch.no_grad():
+        for idx in range(num_samples):
+            y = forward_fn(idx) if forward_fn is not None else block(block_inputs[idx:idx + 1], **kwargs)[0]
+            total += fused_weighted_mse(y, block_target_outputs[idx:idx + 1], importance)
+    return (total / block_target_outputs.numel()).item()
+
+
 def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, importance: torch.Tensor, kwargs,
-               batch_size: int, epochs: int, num_samples: int, forward_fn=None, plateau_tol: float = 0.0) -> int:
+               batch_size: int, epochs: int, num_samples: int, forward_fn=None, plateau_tol: float = 0.0,
+               keep_best: bool = False) -> int:
     """Shared epoch loop of :func:`tune_nonfact` and :func:`tune_fact`.
 
     Minimises the weighted block reconstruction loss with gradient accumulation over ``batch_size`` samples and
     logs the per-element loss every epoch. ``forward_fn(idx)`` replaces the full block forward when given
     (:func:`mlp_only_forward`). With ``plateau_tol > 0`` the loop stops once an epoch improves the loss by less
     than that fraction (the cosine schedule keeps its full length and is simply truncated).
+
+    With ``keep_best`` the loss of the current parameters is evaluated after every epoch (one extra forward pass
+    over the samples, no gradients), the pre-tuning state counts as a candidate too, and the best state seen is
+    restored at the end: the STE factor tuning does not converge monotonically, so the last epoch is not
+    necessarily the best one.
 
     Returns
     -------
@@ -494,6 +511,13 @@ def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, 
     t0 = time.time()
     prev = None
     run = 0
+    params = [p for group in optimizer.param_groups for p in group["params"]] if keep_best else []
+    best_loss = best_epoch = None
+    best_state: list[torch.Tensor] = []
+    if keep_best:
+        best_loss, best_epoch = _eval_block_loss(block, block_inputs, block_target_outputs, importance, kwargs,
+                                                 num_samples, forward_fn), 0
+        best_state = [p.detach().clone() for p in params]
     for epoch in range(epochs):
         data_idx = torch.randperm(num_samples, device="cpu", dtype=torch.long)
         epoch_loss = torch.zeros(1, device=device)
@@ -511,6 +535,14 @@ def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, 
         cur = (epoch_loss / numel).item()
         plateau = plateau_tol > 0 and prev is not None and (prev - cur) / max(abs(prev), 1e-30) < plateau_tol
         msg = f"\t\t(Epoch {epoch+1:02d}/{epochs:02d}) Block Loss: {cur:.4e}"
+        if keep_best:
+            ev = _eval_block_loss(block, block_inputs, block_target_outputs, importance, kwargs, num_samples,
+                                  forward_fn)
+            msg += f" | eval {ev:.4e}"
+            if ev < best_loss:
+                best_loss, best_epoch = ev, epoch + 1
+                for s, p in zip(best_state, params):
+                    s.copy_(p.detach())
         if plateau:
             msg += " | plateau: stop"
         if epoch == epochs - 1 or plateau:
@@ -519,6 +551,13 @@ def _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, 
         if plateau:
             break
         prev = cur
+    if keep_best:
+        if best_epoch != run:
+            with torch.no_grad():
+                for p, s in zip(params, best_state):
+                    p.copy_(s)
+        print(f"\t\tkeep best: epoch {best_epoch} (eval {best_loss:.4e})"
+              + (" restored" if best_epoch != run else " = last"))
     return run
 
 
@@ -721,7 +760,8 @@ def tune_fact(block, target_linear, block_inputs, block_target_outputs, importan
     with torch.no_grad():
         init_signs = {n: _hard_sign(p.detach()) for n, p in target_linear.named_parameters() if "latent" in n}
     _tune_loop(block, optimizer, scheduler, block_inputs, block_target_outputs, importance, kwargs, batch_size, epochs,
-               num_samples, forward_fn=forward_fn, plateau_tol=float(quant_config.get('tune_plateau_tol', 0.0) or 0.0))
+               num_samples, forward_fn=forward_fn, plateau_tol=float(quant_config.get('tune_plateau_tol', 0.0) or 0.0),
+               keep_best=bool(quant_config.get('fact_keep_best', False)))
     del forward_fn
     with torch.no_grad():
         flips = sum(int((_hard_sign(getattr(target_linear, n).detach()) != s).sum().item())

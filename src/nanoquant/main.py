@@ -214,6 +214,9 @@ class TuneArguments:
     fact_bias_lr: float = field(default=1e-5, metadata={"help": "LR for factorized bias parameters"})
     fact_batch_size: int = field(default=1, metadata={"help": "Batch size for factorized tuning"})
     fact_epochs: int = field(default=8, metadata={"help": "Epochs for factorized tuning"})
+    fact_keep_best: bool = field(
+        default=False, metadata={"help": "Evaluate the block loss after every factorized-tuning epoch and keep the "
+                                         "best state seen (the ADMM initialisation counts as a candidate)"})
     tune_model: bool = field(default=True, metadata={"help": "Perform model-level KD tuning (scales only)"})
     model_kd_lr: float = field(default=1e-5, metadata={"help": "LR for model knowledge distillation"})
     model_kd_eval_every_epoch: bool = field(default=False,
@@ -360,6 +363,7 @@ def build_quant_config(model_args: ModelArguments, quant_args: QuantArguments,
         fact_bias_lr=tune_args.fact_bias_lr,
         fact_batch_size=tune_args.fact_batch_size,
         fact_epochs=tune_args.fact_epochs,
+        fact_keep_best=tune_args.fact_keep_best,
         tune_model=tune_args.tune_model,
         model_kd_lr=tune_args.model_kd_lr,
         model_kd_eval_every_epoch=tune_args.model_kd_eval_every_epoch,
