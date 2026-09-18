@@ -1,9 +1,13 @@
 # Threaded multi-GPU stages fail at 14B: `lazy wrapper should be called at most once`
 
-Status 2026-09-17: fix implemented on branch `threaded-linalg-warmup` (`warm_up_linalg` / `run_in_threads` in
-`utils/utils.py`, see "Fix" below); 14B verification on 4 a100 pending (job ids below once submitted). Until it
-passes the 14B configs keep the workaround `parallel_devices: 1` (serial probe / calibration); `admm_parallel_sides`
-(two-GPU ADMM) is unaffected.
+Status 2026-09-18: **fixed and merged** (`threaded-linalg-warmup` 7c1c108 → `scale-sweep-calib-typeprior`
+a14821f). `warm_up_linalg` / `run_in_threads` in `utils/utils.py`, see "Fix" below. Verification job 5771120 (14B,
+4 × a100, `configs/qwen3_14b_probe_verify_parallel4.json`): the threaded probe completed on four devices in under
+an hour (`Initial input caching finished`, rank allocation printed); the job then OOMed on the 80 GB card in the
+screen's final evaluation step (`main.py`, after `max_blocks: 1`), which is unrelated to the fix. Reproducer job
+5770906: 1 of 5 fresh processes hit the exact `lazy wrapper` error without the warm-up, 5 of 5 passed with it.
+The first run with `parallel_devices: 4` at 14B on production is `qwen3_14b_best_stats1024.json` (h200). The
+14B 512-sample configs still carry the `parallel_devices: 1` workaround from their last run and can be flipped back.
 
 ## Symptom
 
