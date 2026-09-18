@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import copy
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import torch
@@ -13,7 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 
-from ..utils.utils import cleanup_memory, device_context
+from ..utils.utils import cleanup_memory, device_context, run_in_threads, warm_up_linalg
 
 # Gradient Scaling Factor to prevent underflow (Numerical Stability)
 GRAD_SCALE_FACTOR = 1e6
@@ -466,12 +465,15 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
     shard = len(devices) > 1 and len(groups) > 1 and gpu_budget_gb > 0
     replicas: list = [model]
     if shard:
+        # load the lazily initialised CUDA linalg backend before any group worker thread touches it
+        warm_up_linalg(devices)
         for d in devices[1:]:
             replicas.append(copy.deepcopy(model).to(d))
 
     def run_group(it: int, g: int, names: list[str], model_g, dev_g: str, acc_dev: str, new: dict, sq_sums) -> None:
         """One calibration pass over ``dataloader`` accumulating the factors of ``names`` on ``model_g``."""
         with device_context(dev_g):
+            warm_up_linalg([dev_g])
             _run_group(it, g, names, model_g, dev_g, acc_dev, new, sq_sums)
 
     def _run_group(it: int, g: int, names: list[str], model_g, dev_g: str, acc_dev: str, new: dict, sq_sums) -> None:
@@ -535,11 +537,8 @@ def _collect_kron_stats(model, dataloader, dev, linear_layers: dict[str, nn.Line
         else:
             for start in range(0, len(groups), len(devices)):
                 wave = list(enumerate(groups))[start:start + len(devices)]
-                with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                    futures = [pool.submit(run_group, it, g, names, replicas[j], devices[j], devices[j], new, sq_sums)
-                               for j, (g, names) in enumerate(wave)]
-                    for f in futures:
-                        f.result()
+                run_in_threads([partial(run_group, it, g, names, replicas[j], devices[j], devices[j], new, sq_sums)
+                                for j, (g, names) in enumerate(wave)])
                 if torch.cuda.is_available():
                     cleanup_memory()
 

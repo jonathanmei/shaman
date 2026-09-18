@@ -366,6 +366,33 @@ def test_measure_sensitivity_sharded_matches_serial(monkeypatch, capsys):
     assert "[rank probe] block 0:" in out and "[rank probe] block 1:" in out
 
 
+def test_measure_sensitivity_fails_fast(monkeypatch):
+    """A raising worker propagates its exception promptly instead of letting the other worker drain the queue."""
+    import threading
+    import time
+
+    model = _model(2, TINY)
+    _attach_stats(model, dense=True)
+    monkeypatch.setattr(rank_probe, "stage_devices", lambda quant_config, dev: ["cpu", "cpu"])
+    calls = {"n": 0}
+    lock = threading.Lock()
+
+    def fake_probe_layer(lx, ranks, quant_config, dev, side_device=None):
+        with lock:
+            calls["n"] += 1
+            first = calls["n"] == 1
+        if first:
+            raise RuntimeError("boom")
+        time.sleep(0.1)
+        return {r: 1.0 / r for r in ranks}
+
+    monkeypatch.setattr(rank_probe, "probe_layer", fake_probe_layer)
+    with pytest.raises(RuntimeError, match="boom"):
+        rank_probe.measure_sensitivity(model, NAMES, _probe_cfg(), dev="cpu")
+    # the raise plus at most the other worker's in-flight layer, out of 2 blocks x 7 layers
+    assert 1 <= calls["n"] <= 2
+
+
 def test_probe_layer_does_not_touch_global_rng():
     torch.manual_seed(0)
     model = _model(1, TINY)

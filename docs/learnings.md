@@ -117,3 +117,12 @@ settles.
   they were symlinked under the new keys in `cache/stats` and `cache/rank_probe` (2026-09-16) rather than
   recomputed; `ArtifactCache.load` accepts such a symlink alias (the payload carries the old key) and logs
   `[cache] alias`. Check `[cache] hit`/`alias stats` in the first log lines of any run that is supposed to reuse them.
+- **Threaded GPU stages need the linalg warm-up (branch `threaded-linalg-warmup`).** PyTorch loads its CUDA
+  linear-algebra backend on the first `torch.linalg` call of the process; the per-GPU worker threads of the rank
+  probe and the calibration layer groups raced that load at 14B (`lazy wrapper should be called at most once`,
+  non-converging eigh, silent stalls; `docs/issues/threaded_gpu_stages_14b.md`). `utils.warm_up_linalg(devices)` runs
+  on the main thread before each pool and (locked, per thread) at the start of each worker; `utils.run_in_threads`
+  fails fast on the first worker exception. Both live in the unfingerprinted `utils/utils.py`, but the call sites in
+  `core/importance.py` / `core/rank_probe.py` re-key stats/probes/blocks/KD: alias with
+  `scripts/alias_cache_keys.py <config> --kind stats|rank_probe --old <old key prefix>` and deploy to a pinned
+  checkout only between runs (a RUNNING job may lazily import the new code).
