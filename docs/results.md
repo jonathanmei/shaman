@@ -911,7 +911,28 @@ the tuning-budget screen; single a100, `gpus` partition):
 
 Read-out: block 0-3 PPL from the block diagnostics, the `keep best:` lines (how often the last epoch is not the best,
 how often the ADMM init wins) and the per-layer ADMM times for the 800 arm. Adopt at 14B (1024-sample run) only
-what is at least within noise at block 3 (±0.2) and reduces the factor-tuning loss regressions. A CPU retry for the KL-fit eigen fallback would harden the 14B calibration but lives in
+what is at least within noise at block 3 (±0.2) and reduces the factor-tuning loss regressions.
+
+**Result (2026-09-18, jobs 5845120-5845124, one a100 each, 10-24 min):**
+
+| arm | block 1 | block 2 | **block 3** | keep-best: restored / last / ADMM-init wins (of 28 layers) | ADMM per layer, block 3 |
+|---|---|---|---|---|---|
+| control | 13.672 | 14.044 | **14.331** | – | 6-14 s |
+| keep-best | 13.619 | 14.010 | 14.260 | 4 / 24 / 3 | same |
+| lr ×0.3 | 13.537 | 13.894 | **14.168** | – | same |
+| keep-best + lr ×0.3 | 13.528 | 13.921 | **14.149** | 1 / 27 / 0 | same |
+| ADMM 800 | 13.675 | 13.980 | 14.282 | – | 12-28 s (2×) |
+
+- **Lower peak learning rate for the factorized tuning helps at every block** (−0.13 / −0.15 / −0.16 vs control),
+  and with keep-best on top only 1 of 28 layers still needed a restore: at 3e-6 the STE tuning no longer
+  oscillates. At 1e-5 keep-best restored 4 of 28 layers (3 of them back to the ADMM initialisation) for −0.07.
+  Both effects are single runs inside the ±0.2 screen noise, but they are consistent across blocks and match the
+  14B diagnosis (30 of 80 layers ended above their epoch-1 loss at 1e-5).
+- **ADMM 400 iterations is converged**: 800 changes block-3 PPL by −0.05 at twice the ADMM time.
+- The control re-run came out at 14.33 against 14.16 for the same recipe on 2026-09-15 (jobs 5713185) — a
+  reminder of the run-to-run noise on GPU (calibration backward is non-deterministic).
+- Decision: carry `fact_{binary,scale,bias}_lr: 3e-6` and `fact_keep_best: true` into the 14B 1024-sample run
+  (keep-best costs one extra forward pass per factor-tuning epoch, a few percent of block time); leave ADMM at 400. A CPU retry for the KL-fit eigen fallback would harden the 14B calibration but lives in
   the stats fingerprint group (would re-key the cached statistics), so it is deferred.
 
 Smoke of the new paths: job 5733275 (`qwen3_0p6b_smoke_sweep.json`, 4 blocks, stats 32 vs 16, refresh at block
