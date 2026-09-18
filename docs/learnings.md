@@ -14,7 +14,7 @@ is derived in `rank_allocation_note.html`.
 
 | model | config | recipe | actual bpw | PPL | paper |
 |---|---|---|---|---|---|
-| Qwen3-0.6B-Base | `configs/qwen3_0p6b_best.json` | KL factors, ADMM p = ½, fresh input factor, refresh/7, **measured ranks × ramp 0.6, parity** | 0.9728 | **22.96** | 27.56 |
+| Qwen3-0.6B-Base | `configs/qwen3_0p6b_best.json` | KL factors, ADMM p = ½, fresh input factor, refresh/7, **measured ranks × ramp 0.6, parity** (job 5617843; zero-shot mean 0.427 from the eval-only rerun 5769022 of its checkpoint, vs 0.387 for the paper-faithful diag baseline) | 0.9728 | **22.96** | 27.56 |
 | Qwen3-1.7B-Base | `configs/qwen3_1p7b_best.json` | same recipe with measured × ramp ranks (not yet run; 16.72 with uniform ranks) | 0.9863 | – | 19.21 |
 | Qwen3-4B-Base | `configs/qwen3_4b_best.json` | same recipe, refresh/9, measured × ramp 0.6 ranks (probe 0.6/1.0/1.4; jobs 5663775 → 5666862 from `26d8fd4`); zero-shot mean 0.463 | 0.9864 | 13.80 | 14.29 |
 | Qwen3-4B-Base | commit `26d8fd4`, `configs/qwen3_4b_kl_ra_both.json` | KL factors, p = ½, fresh R, refresh/9, **hand-table ranks (ramp 0.6 + type weights), parity**; recorded best, code removed | 0.9864 | **13.55** | 14.29 |

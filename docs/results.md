@@ -845,7 +845,15 @@ Arms (each = the size's best config + `admm_parallel_sides` + `parallel_devices:
   the stats fingerprint group (would re-key the cached statistics), so it is deferred.
 
 Smoke of the new paths: job 5733275 (`qwen3_0p6b_smoke_sweep.json`, 4 blocks, stats 32 vs 16, refresh at block
-2, type table, two-device ADMM) completed in 4 min 49 with the expected log lines. Code as run: 78f0d84 (512-sample
+2, type table, two-device ADMM) completed in 4 min 49 with the expected log lines.
+
+**0.6B best zero-shot, filled in (2026-09-17, job 5769022, `configs/qwen3_0p6b_best_eval.json`):** eval-only pass
+over the 22.96 run's checkpoint `checkpoints/qwen3_0p6b_kl_ms_ramp_parity.pt` (3 min 51 on one a100): PPL
+22.9458 (reproduces 22.96), zero-shot mean **0.427** (boolq 0.620, piqa 0.579, hellaswag 0.290, winogrande 0.522,
+arc_easy 0.362, arc_challenge 0.191) vs 0.387 for the paper-faithful diag baseline (job 5606323).
+
+Zero-shot means of the best recipe across sizes: 0.6B 0.427, 1.7B 0.448 (16.72 run), 4B 0.463 (13.80 run),
+8B 0.474 (0.497 with 512 statistics samples), 14B 0.491. Code as run: 78f0d84 (512-sample
 arms) and d6c8677 (type-prior arms; adds the `ArtifactCache.load` symlink-alias acceptance after the first
 submissions 5733278/5733279 hit the stored-key check).
 
